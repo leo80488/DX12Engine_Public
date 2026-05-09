@@ -1,0 +1,383 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{a1b2c3d4-0001-4001-a001-000000000001}</ProjectGuid>
+    <RootNamespace>EngineCore</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <IntDir>$(Platform)\$(Configuration)\$(ProjectName)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_LIB;JPH_DEBUG_RENDERER;JPH_PROFILE_ENABLED;JPH_OBJECT_STREAM;JPH_FLOATING_POINT_EXCEPTIONS_ENABLED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)external;$(ProjectDir)external\imgui;$(ProjectDir)external\DirectX12;$(ProjectDir)external\DirectXTex;$(ProjectDir)external\dxc\include;$(ProjectDir)external\lua;$(ProjectDir)external\sol2\include;$(ProjectDir)external\FreeType\include;$(ProjectDir)include;$(VCPKG_ROOT)\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <MinimalRebuild>false</MinimalRebuild>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+    </ClCompile>
+    <Lib>
+      <AdditionalLibraryDirectories />
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_LIB;JPH_DEBUG_RENDERER;JPH_PROFILE_ENABLED;JPH_OBJECT_STREAM;JPH_FLOATING_POINT_EXCEPTIONS_ENABLED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <AdditionalIncludeDirectories>$(ProjectDir)external;$(ProjectDir)external\imgui;$(ProjectDir)external\DirectX12;$(ProjectDir)external\DirectXTex;$(ProjectDir)external\dxc\include;$(ProjectDir)external\lua;$(ProjectDir)external\sol2\include;$(ProjectDir)external\FreeType\include;$(ProjectDir)include;$(VCPKG_ROOT)\installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 /bigobj %(AdditionalOptions)</AdditionalOptions>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <WholeProgramOptimization>false</WholeProgramOptimization>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+    </ClCompile>
+    <Lib>
+      <AdditionalLibraryDirectories />
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\ECS\Components.cpp" />
+    <ClCompile Include="src\ECS\AnimationSystem.cpp" />
+    <ClCompile Include="src\ECS\IKSystem.cpp" />
+    <ClCompile Include="src\ECS\SocketSystem.cpp" />
+    <ClCompile Include="src\ECS\FollowSystem.cpp" />
+    <ClCompile Include="src\ECS\DecalSystem.cpp" />
+    <ClCompile Include="src\ECS\DecalSpawner.cpp" />
+    <ClCompile Include="src\ECS\CommandAPI.cpp" />
+    <ClCompile Include="src\ECS\MaterialReflectionSync.cpp" />
+    <ClCompile Include="src\Physics\ChainPhysicsSystem.cpp" />
+    <ClCompile Include="src\Physics\PhysicsSystem.cpp" />
+    <ClCompile Include="src\Resoruce\WorldSerializer.cpp" />
+    <ClCompile Include="src\Resoruce\PostProcessConfig.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SceneVoxelPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SpotShadowPass.cpp" />
+    <ClCompile Include="src\Resoruce\AnimationLoader.cpp" />
+    <ClCompile Include="src\Resoruce\AnimationClipSystem.cpp" />
+    <ClCompile Include="src\Graphics\DescriptorHeapAllocator.cpp" />
+    <ClCompile Include="src\Graphics\SkinningBuffers.cpp" />
+    <ClCompile Include="src\ECS\CameraSystem.cpp" />
+    <ClCompile Include="src\ECS\ECS.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\AutoExposurePass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\BloomPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\LensFlarePass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\GBufferPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\TerrainPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\LightingPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\PickingPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SkyboxPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SkyIBLPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\ReflectionProbeCapturePass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SSRPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SSRDepthHierarchyPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SceneColorPyramidPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\VolumetricFogPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\TAAPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\XeGTAOPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\CASPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\GlassShatterPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\ToneMapPass.cpp" />
+    <ClCompile Include="src\PostProcess\PostProcessStack.cpp" />
+    <ClCompile Include="src\PostProcess\BuiltinPostProcessEffects.cpp" />
+    <ClCompile Include="src\PostProcess\VolumeSystem.cpp" />
+    <ClCompile Include="src\PostProcess\ParameterBlender.cpp" />
+    <ClCompile Include="src\PostProcess\ScriptedOverride.cpp" />
+    <ClCompile Include="src\PostProcess\EntityVolumeSource.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\SkinningPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\ParticlePasses.cpp" />
+    <ClCompile Include="src\Graphics\ParticleSystem.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\TrailPasses.cpp" />
+    <ClCompile Include="src\Graphics\TrailSystem.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\TracerPasses.cpp" />
+    <ClCompile Include="src\Graphics\TracerSystem.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\BeamSimPass.cpp" />
+    <ClCompile Include="src\Graphics\BeamSystem.cpp" />
+    <ClCompile Include="src\Graphics\ShadowSystem.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\ClusterPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\DecalPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\CullingPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\HiZPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\DebugWirePass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\UIPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\WorldUIBillboardPass.cpp" />
+    <ClCompile Include="src\UI\UIDrawList.cpp" />
+    <ClCompile Include="src\UI\Widget.cpp" />
+    <ClCompile Include="src\UI\Font.cpp" />
+    <ClCompile Include="src\UI\BasicWidgets.cpp" />
+    <ClCompile Include="src\UI\WidgetRegistry.cpp" />
+    <ClCompile Include="src\UI\UISystem.cpp" />
+    <ClCompile Include="src\UI\WorldSpaceUISystem.cpp" />
+    <ClCompile Include="src\UI\LuaUIBindings.cpp" />
+    <ClCompile Include="src\UI\Tween.cpp" />
+    <ClCompile Include="src\Graphics\MeshDescriptorHeap.cpp" />
+    <ClCompile Include="src\Graphics\SceneBVH.cpp" />
+    <ClCompile Include="src\Graphics\PSOCache.cpp" />
+    <ClCompile Include="src\Graphics\Renderer.cpp" />
+    <ClCompile Include="src\Graphics\ShaderLibrary.cpp" />
+    <ClCompile Include="src\Graphics\ShaderReflection.cpp" />
+    <ClCompile Include="src\Graphics\DxcCompiler.cpp" />
+    <ClCompile Include="src\System\FileWatcher.cpp" />
+    <ClCompile Include="src\Graphics\MaterialCBVRing.cpp" />
+    <ClCompile Include="src\Graphics\MaterialSRVRing.cpp" />
+    <ClCompile Include="src\Graphics\MeshManager.cpp" />
+    <ClCompile Include="src\Graphics\ReflectionProbeManager.cpp" />
+    <ClCompile Include="src\Graphics\Raytracing.cpp" />
+    <ClCompile Include="src\Graphics\DDGIVolumeManager.cpp" />
+    <ClCompile Include="src\Graphics\DDGISceneAS.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\DDGIPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\DDGIProbeDebugPass.cpp" />
+    <ClCompile Include="src\Graphics\SkinnedMeshSubsystem.cpp" />
+    <ClCompile Include="src\Graphics\ShadowFrustumCompute.cpp" />
+    <ClCompile Include="src\Graphics\ShadingModel.cpp" />
+    <ClCompile Include="src\Graphics\RHICommandList.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\TransparentPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\ShadowPass.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderPass\OutlinePass.cpp" />
+    <ClCompile Include="src\Resoruce\AssetFS.cpp" />
+    <ClCompile Include="src\Resoruce\BCCompressor.cpp" />
+    <ClCompile Include="src\Resoruce\ProceduralMesh.cpp" />
+    <ClCompile Include="src\Resoruce\DDSTextureLoader.cpp" />
+    <ClCompile Include="src\Resoruce\ShaderLoader.cpp" />
+    <ClCompile Include="src\System\Exception_handle.cpp" />
+    <ClCompile Include="src\Graphics\Graphics.cpp" />
+    <ClCompile Include="src\Graphics\GraphicsDX12.cpp" />
+    <ClCompile Include="src\Graphics\GPUProfiler.cpp" />
+    <ClCompile Include="src\Scripting\ScriptSystem.cpp" />
+    <ClCompile Include="src\AI\BTNodes.cpp" />
+    <ClCompile Include="src\AI\BTAsset.cpp" />
+    <ClCompile Include="src\AI\ActionRegistry.cpp" />
+    <ClCompile Include="src\AI\AISystem.cpp" />
+    <ClCompile Include="src\AI\AILODSystem.cpp" />
+    <ClCompile Include="src\AI\LuaBTBindings.cpp" />
+    <ClCompile Include="external\lua\onelua.c">
+      <CompileAs>CompileAsC</CompileAs>
+      <AdditionalOptions>/FS %(AdditionalOptions)</AdditionalOptions>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <ForcedIncludeFiles>
+      </ForcedIncludeFiles>
+    </ClCompile>
+    <ClCompile Include="src\System\Keyboard.cpp" />
+    <ClCompile Include="src\System\Log.cpp" />
+    <ClCompile Include="src\System\Mouse.cpp" />
+    <ClCompile Include="src\Resoruce\ResourceManager.cpp" />
+    <ClCompile Include="src\System\TaskSystem.cpp" />
+    <ClCompile Include="src\System\Timer.cpp" />
+    <ClCompile Include="src\Resoruce\TextureLoader.cpp" />
+    <ClCompile Include="src\Resoruce\TextureSystem.cpp" />
+    <ClCompile Include="src\Resoruce\MaterialLoader.cpp" />
+    <ClCompile Include="src\Resoruce\AssetManager.cpp" />
+    <ClCompile Include="src\Resoruce\MaterialSerializer.cpp" />
+    <ClCompile Include="src\Resoruce\PrefabSerializer.cpp" />
+    <ClCompile Include="src\Resoruce\ComponentSerializers.cpp" />
+    <ClCompile Include="src\Resoruce\MeshSystem.cpp" />
+    <ClCompile Include="src\Resoruce\MeshLibrary.cpp" />
+    <ClCompile Include="src\Resoruce\MaterialSystem.cpp" />
+    <ClCompile Include="src\Resoruce\DecalMaterialAsset.cpp" />
+    <ClCompile Include="src\Resoruce\DecalMaterialLibrary.cpp" />
+    <ClCompile Include="src\Resoruce\DecalMaterialSerializer.cpp" />
+    <ClCompile Include="src\SceneSerialization.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderGraph.cpp" />
+    <ClCompile Include="src\RenderGraph\RenderContext.cpp" />
+    <ClCompile Include="src\RenderGraph\TestTrianglePass.cpp" />
+    <ClCompile Include="src\Scene\MeshSpawner.cpp" />
+    <ClCompile Include="src\Scene\Ray.cpp" />
+    <ClCompile Include="src\Scene\SceneInstanceLoader.cpp" />
+    <ClCompile Include="src\Scene\SceneManager.cpp" />
+    <ClCompile Include="src\Scene\TestScene.cpp" />
+    <ClCompile Include="src\Scene\TitleScene.cpp" />
+    <!-- ShaderLabScene.cpp is intentionally NOT in EngineCore — it uses ImGui
+         and so must only land in projects that link imgui (i.e. ShaderLab.exe).
+         The header lives under include/Scene so all .exe projects can reference
+         it via App.cpp's WITH_SHADERLAB-gated PushScene call. -->
+    <ClCompile Include="src\Scene\GameScene.cpp" />
+    <ClCompile Include="src\Scene\EndScene.cpp" />
+    <ClCompile Include="src\Scene\TransformSystem.cpp" />
+    <ClCompile Include="src\System\Window.cpp" />
+    <ClCompile Include="src\Audio\AudioClipLoader.cpp" />
+    <ClCompile Include="src\Audio\AudioClipSystem.cpp" />
+    <ClCompile Include="src\Audio\AudioImporter.cpp" />
+    <ClCompile Include="src\Audio\AudioEngine.cpp" />
+    <ClCompile Include="src\Audio\AudioSystem.cpp" />
+    <ClCompile Include="src\Audio\Audio3DSystem.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\pch.h" />
+    <ClInclude Include="include\Audio\AudioTypes.h" />
+    <ClInclude Include="include\Audio\AudioEvents.h" />
+    <ClInclude Include="include\Audio\AudioComponents.h" />
+    <ClInclude Include="include\Audio\AudioClipResource.h" />
+    <ClInclude Include="include\Audio\AudioClipLoader.h" />
+    <ClInclude Include="include\Audio\AudioClipSystem.h" />
+    <ClInclude Include="include\Audio\AudioImporter.h" />
+    <ClInclude Include="include\Audio\AudioEngine.h" />
+    <ClInclude Include="include\Audio\AudioSystem.h" />
+    <ClInclude Include="include\Audio\Audio3DSystem.h" />
+    <ClInclude Include="include\ECS\Components.h" />
+    <ClInclude Include="include\Graphics\DescriptorHeapAllocator.h" />
+    <ClInclude Include="include\ECS\CameraSystem.h" />
+    <ClInclude Include="include\ECS\ECS.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\AutoExposurePass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\BloomPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\LensFlarePass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\GBufferPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\TerrainPass.h" />
+    <ClInclude Include="include\ECS\TerrainComponent.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\LightingPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\PickingPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\SkyboxPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\ReflectionProbeCapturePass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\SSRPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\SSRDepthHierarchyPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\SceneColorPyramidPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\TAAPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\XeGTAOPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\CASPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\GlassShatterPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\ToneMapPass.h" />
+    <ClInclude Include="include\PostProcess\IPostProcessEffect.h" />
+    <ClInclude Include="include\PostProcess\PostProcessStack.h" />
+    <ClInclude Include="include\PostProcess\BuiltinPostProcessEffects.h" />
+    <ClInclude Include="include\PostProcess\PostProcessParams.h" />
+    <ClInclude Include="include\PostProcess\ParameterStore.h" />
+    <ClInclude Include="include\PostProcess\Volume.h" />
+    <ClInclude Include="include\PostProcess\VolumeSystem.h" />
+    <ClInclude Include="include\PostProcess\ParameterBlender.h" />
+    <ClInclude Include="include\PostProcess\ScriptedOverride.h" />
+    <ClInclude Include="include\PostProcess\IVolumeSource.h" />
+    <ClInclude Include="include\PostProcess\EntityVolumeSource.h" />
+    <ClInclude Include="include\ECS\VolumeComponent.h" />
+    <ClInclude Include="include\Graphics\GraphicsStruct.h" />
+    <ClInclude Include="include\Graphics\PermutationKey.h" />
+    <ClInclude Include="include\Graphics\MeshDescriptorHeap.h" />
+    <ClInclude Include="include\Graphics\PSOCache.h" />
+    <ClInclude Include="include\Graphics\Renderer.h" />
+    <ClInclude Include="include\Graphics\ShaderLibrary.h" />
+    <ClInclude Include="include\Graphics\DxcCompiler.h" />
+    <ClInclude Include="include\System\FileWatcher.h" />
+    <ClInclude Include="include\Graphics\RenderTypes.h" />
+    <ClInclude Include="include\Graphics\RHICommandList.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\TransparentPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\ShadowPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\OutlinePass.h" />
+    <ClInclude Include="include\Resource\BCCompressor.h" />
+    <ClInclude Include="include\Resource\MaterialSerializer.h" />
+    <ClInclude Include="include\Resource\ProceduralMesh.h" />
+    <ClInclude Include="include\Resource\DDSTextureLoader.h" />
+    <ClInclude Include="include\Resource\IImporter.h" />
+    <ClInclude Include="include\Resource\ShaderLoader.h" />
+    <ClInclude Include="include\Resource\ShaderResource.h" />
+    <ClInclude Include="include\Resource\SkeletonAsset.h" />
+    <ClInclude Include="include\Resource\SkeletonImporter.h" />
+    <ClInclude Include="include\ECS\IKSystem.h" />
+    <ClInclude Include="include\Physics\ChainPhysicsSystem.h" />
+    <ClInclude Include="include\Physics\PhysicsSystem.h" />
+    <ClInclude Include="include\ECS\PhysicsComponents.h" />
+    <ClInclude Include="include\Resource\AnimationResource.h" />
+    <ClInclude Include="include\Resource\AnimationLoader.h" />
+    <ClInclude Include="include\Resource\AnimationClipSystem.h" />
+    <ClInclude Include="include\System\allocator.h" />
+    <ClInclude Include="include\System\Exception_handle.h" />
+    <ClInclude Include="include\Graphics\Graphics.h" />
+    <ClInclude Include="include\Graphics\IGraphicsDevice.h" />
+    <ClInclude Include="include\Graphics\GraphicsDX12.h" />
+    <ClInclude Include="include\System\Keyboard.h" />
+    <ClInclude Include="include\System\Log.h" />
+    <ClInclude Include="include\System\Mouse.h" />
+    <ClInclude Include="include\Resource\Resource.h" />
+    <ClInclude Include="include\Resource\ResourceHandle.h" />
+    <ClInclude Include="include\Resource\IResourceLoader.h" />
+    <ClInclude Include="include\Resource\IPendingGPUUpload.h" />
+    <ClInclude Include="include\Resource\ResourceManager.h" />
+    <ClInclude Include="include\System\TaskSystem.h" />
+    <ClInclude Include="include\Resource\TextureResource.h" />
+    <ClInclude Include="include\Resource\TextureLoader.h" />
+    <ClInclude Include="include\Resource\HeightField.h" />
+    <ClInclude Include="include\Resource\MaterialLoader.h" />
+    <ClInclude Include="include\Resource\MaterialResource.h" />
+    <ClInclude Include="include\Resource\SystemHandles.h" />
+    <ClInclude Include="include\Resource\TextureSystem.h" />
+    <ClInclude Include="include\Resource\MeshSystem.h" />
+    <ClInclude Include="include\Resource\MeshLibrary.h" />
+    <ClInclude Include="include\Resource\AssetManager.h" />
+    <ClInclude Include="include\Resource\MaterialSystem.h" />
+    <ClInclude Include="include\RenderGraph\RenderGraph.h" />
+    <ClInclude Include="include\RenderGraph\TestTrianglePass.h" />
+    <ClInclude Include="include\ECS\HierarchyComponents.h" />
+    <ClInclude Include="include\ECS\SkyboxComponent.h" />
+    <ClInclude Include="include\ECS\ReflectionProbeComponent.h" />
+    <ClInclude Include="include\Graphics\ReflectionProbeTypes.h" />
+    <ClInclude Include="include\Graphics\Raytracing.h" />
+    <ClInclude Include="include\Graphics\DDGIVolumeManager.h" />
+    <ClInclude Include="include\Graphics\DDGISceneAS.h" />
+    <ClInclude Include="include\ECS\DDGIComponents.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\DDGIPass.h" />
+    <ClInclude Include="include\RenderGraph\RenderPass\DDGIProbeDebugPass.h" />
+    <ClInclude Include="include\Scene\IScene.h" />
+    <ClInclude Include="include\Scene\MeshSpawner.h" />
+    <ClInclude Include="include\Scene\Ray.h" />
+    <ClInclude Include="include\Scene\SceneInstanceLoader.h" />
+    <ClInclude Include="include\Scene\SceneLoader.h" />
+    <ClInclude Include="include\Scene\SceneManager.h" />
+    <ClInclude Include="include\Scene\TestScene.h" />
+    <ClInclude Include="include\Scene\TitleScene.h" />
+    <ClInclude Include="include\Scene\ShaderLabScene.h" />
+    <ClInclude Include="include\Scene\GameScene.h" />
+    <ClInclude Include="include\Scene\EndScene.h" />
+    <ClInclude Include="include\Scene\TransformSystem.h" />
+    <ClInclude Include="include\SceneSerialization.h" />
+    <ClInclude Include="include\System\Window.h" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

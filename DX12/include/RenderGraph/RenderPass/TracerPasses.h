@@ -1,0 +1,128 @@
+#pragma once
+
+// TracerSimPass — runs the tracer emit + age compute shaders.
+// TracerRenderPass — draws the tracer pool as instanced cylindrical billboards.
+//
+// Both live in one header to keep the tracer module cohesive; mirrors the
+// ParticleSystem / ParticlePasses / TrailSystem split.
+//
+// Execution order in Renderer::Render:
+//   1. TracerSimPass  (compute, manual BeginCommandList — same pattern as
+//                      ParticleSimPass / SkinningPass).
+//   2. TracerRenderPass (graphics, in RenderGraph after TransparentPass /
+//                        ParticleRenderPass / TrailRenderPass).
+
+#include "RenderGraph/RenderGraph.h"
+#include "Graphics/ShaderLibrary.h"
+#include "Graphics/GraphicsStruct.h"
+
+#include <DirectXMath.h>
+
+class TracerSystem;
+
+// ---------------------------------------------------------------------------
+// TracerSimPass — compute-only; not in the RenderGraph.
+// ---------------------------------------------------------------------------
+class TracerSimPass
+{
+public:
+    void Init(IGraphicsDevice& gfx);
+    void Shutdown(IGraphicsDevice& gfx) { (void)gfx; }
+
+    void SetSystem(TracerSystem* sys) { m_sys = sys; }
+
+    void Execute(RHI::CommandList cl);
+
+private:
+    IGraphicsDevice*   m_gfx = nullptr;
+    ShaderLibrary      m_shaderLib;
+    RHI::PipelineState m_emitPSO;
+    RHI::PipelineState m_updatePSO;
+
+    TracerSystem*      m_sys = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// TracerRenderPass — graphics; lives in m_graph after TransparentPass.
+// Reads scene depth as SRV (no DSV) so the PS can do soft-particle fade.
+// ---------------------------------------------------------------------------
+class TracerRenderPass : public RG::RenderPass
+{
+public:
+    explicit TracerRenderPass(RG::RGTextureHandle depth);
+
+    const char* GetName() const override { return "TracerRenderPass"; }
+    void Setup  (RG::RenderGraphBuilder& b) override;
+    void Init   (IGraphicsDevice& gfx)      override;
+    RHI::CommandList Execute(RHI::CommandList cl) override;
+
+    void SetSystem(TracerSystem* sys) { m_sys = sys; }
+
+    // Per-frame camera + projection metadata. Renderer pushes this each frame
+    // (camera position is needed for cylindrical billboard math; nearZ/farZ
+    // for the depth linearisation in soft-particle fade).
+    void SetFrameData(const DirectX::XMFLOAT4X4& viewProj,
+                      const DirectX::XMFLOAT3&   cameraPos,
+                      float                      time,
+                      float                      nearZ,
+                      float                      farZ)
+    {
+        m_viewProj  = viewProj;
+        m_cameraPos = cameraPos;
+        m_time      = time;
+        m_nearZ     = nearZ;
+        m_farZ      = farZ;
+    }
+
+    // Visual tuning — exposed so the editor can drive these.
+    void SetTuning(float fadeRange, float coreSharpness,
+                   float noiseTiling, float scrollSpeed, float noiseFloor)
+    {
+        m_fadeRange     = fadeRange;
+        m_coreSharpness = coreSharpness;
+        m_noiseTiling   = noiseTiling;
+        m_scrollSpeed   = scrollSpeed;
+        m_noiseFloor    = noiseFloor;
+    }
+
+private:
+    // 256-byte aligned for root CBV.
+    struct alignas(16) RenderCB
+    {
+        float    viewProj[16];   // 64 — column-major (CPU transposes from row-vec)
+        float    cameraPos[3];   // 12
+        float    time;           // 4
+        float    nearZ;          // 4
+        float    farZ;           // 4
+        float    fadeRange;      // 4
+        float    coreSharpness;  // 4
+        float    noiseTiling;    // 4
+        float    scrollSpeed;    // 4
+        float    noiseFloor;     // 4
+        float    _pad;           // 4
+    };
+
+    DirectX::XMFLOAT4X4 m_viewProj{};
+    DirectX::XMFLOAT3   m_cameraPos{};
+    float               m_time           = 0.0f;
+    float               m_nearZ          = 0.1f;
+    float               m_farZ           = 1000.0f;
+    float               m_fadeRange      = 0.3f;
+    float               m_coreSharpness  = 2.5f;
+    float               m_noiseTiling    = 6.0f;
+    float               m_scrollSpeed    = 4.0f;
+    float               m_noiseFloor     = 0.65f;
+
+    RG::RGTextureHandle m_depth;
+
+    IGraphicsDevice*   m_gfx = nullptr;
+    ShaderLibrary      m_shaderLib;
+    RHI::PipelineState m_pso;
+
+    RHI::GPUBuffer m_renderCB;
+    void*          m_renderCBMapped = nullptr;
+
+    int            m_linearSamplerIdx = -1;
+
+    TracerSystem*  m_sys = nullptr;
+};
