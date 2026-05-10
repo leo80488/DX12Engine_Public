@@ -375,3 +375,9 @@ CMakeUserPresets.json
 _deps/
 vcpkg_installed/
 install/
+
+# Engine runtime artifacts (regenerated at first run)
+DX12Log.txt
+imgui.ini
+pso_cache.bin
+DX12/shaders/shader_cache_dxil/
