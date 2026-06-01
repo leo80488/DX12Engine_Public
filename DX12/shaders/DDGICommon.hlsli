@@ -239,13 +239,18 @@ float3 DDGI_HaltonSphere(uint i)
 // over `raysPerProbe / adaptiveRays` frames every position in the full
 // sequence is sampled exactly once.
 //
-// Why: with adaptive ray count = N < raysPerProbe, naively taking Halton
-// indices [0..N-1] every frame samples the SAME N world-space directions
-// forever (the ±17° random rotation jitter is smaller than Halton's inter-
-// sample arc at low ray count). The remaining ~89% of the sphere never
-// enters the SH, producing a constant per-probe directional bias visible
-// as "one wall always bright, opposite wall always dark", independent of
-// sun direction.
+// IMPORTANT — advance-by-block is intentional; do NOT "smooth" it.
+//   The block advances by the FULL adaptive count each frame, so per-frame
+//   `newSample` jumps between disjoint blocks. That jump has a SHORT period
+//   (raysPerProbe/adaptiveRays frames, e.g. 4) — i.e. it's HIGH frequency,
+//   which the relight's plain-EMA hysteresis filters well. A 2026-05-14
+//   attempt to "smooth" this (advance by 1 instead of by the block) turned
+//   the 4-frame jump into a ~64-frame slow SWEEP — i.e. LOW frequency — and
+//   the EMA passes low frequencies (gain ~0.7 at a 64-frame period vs ~0.07
+//   at a 4-frame period). Result: visibly WORSE whole-scene "breathing".
+//   Reverted. Lesson: for an EMA-smoothed signal, jittered sampling must stay
+//   HIGH frequency; slow/smooth temporal changes are exactly what an EMA
+//   cannot hide.
 //
 // Why CONTIGUOUS block, not stride: an earlier attempt used stride-K
 // sampling (rayIdx*stride + frameOffset). That's broken for base-2 Halton
@@ -339,37 +344,31 @@ DDGIProbeSH DDGI_SH_Multiply(DDGIProbeSH a, float s)
 }
 
 // Reconstruct the diffuse-IBL signal from the L1 SH projected by
-// DDGIRelight.cs. Output magnitude is calibrated to match the engine's
-// existing sky-IBL convention (sky_sh.hlsli's EvalSH2 — radiance projected
-// onto SH, reconstructed without cosine-lobe convolution, then used
-// directly as `iblDiffuse * albedo` in Lighting.ps).
+// DDGIRelight.cs. Returns E(N)/π — same magnitude convention as
+// sky_sh.hlsli's EvalSH2 and a standard prefiltered irradiance cube, so
+// the consumer in Lighting.ps does `albedo * iblDiffuse` with no extra /π.
 //
-// Coefficient choice:
+// Derivation. DDGIRelight projects per-texel cos-weighted radiance averages
+// (`sumColor · saturate(dot(rayDir, texelDir))` accumulated then normalised)
+// — that quantity is approximately E(D)/π at the texel direction D. Those
+// per-texel values are then SH-projected uniformly over the sphere with
+// weight 4π/N. Evaluation Σ c_lm Y_lm(N) of an SH-projected function gives
+// back the function value at N, so this returns ≈ E(N)/π directly without
+// any extra cosine convolution (already cosine-weighted at projection).
 //
-//   c0 = π · Y00 ≈ 0.886    →  L0 reconstruction matches the magnitude
-//                              the previous (bug-for-bug) implementation
-//                              produced, and matches what the lighting
-//                              consumer was calibrated against. Choosing
-//                              the strictly-physical Y00 = 0.282 instead
-//                              divides the result by π, making every probe
-//                              read invisible against the same-magnitude
-//                              sky-IBL path (observed regression: "probes
-//                              appear to have no effect").
+// Coefficient choice — standard real SH basis:
+//   c0 = Y00 = 0.282095
+//   c1 = Y1  = 0.488603
 //
-//   c1 = π · Y1 ≈ 1.534     →  L1 weight relative to L0 stays at the
-//                              physical Y1/Y00 = √3 ratio. The previous
-//                              code used (2π/3)·Y1 ≈ 1.023, a Ramamoorthi
-//                              clamped-cosine convolution constant whose
-//                              c1/c0 ratio of ≈1.155 squashed L1 by 2/3 —
-//                              probes were still over-bright but felt
-//                              omnidirectional. Using π·Y1 keeps the
-//                              brightness AND restores directionality.
-//
-// This is a calibration choice, not a derivation: the projection in
-// DDGIRelight stores `cos-weighted radiance average ≈ E(D)/π` and the
-// engine's diffuse IBL consumer multiplies by albedo without dividing by
-// π, so the probe path needs the extra π factor to land on the same
-// dimensionally-mixed-but-internally-consistent scale as the sky path.
+// History. Before 2026-05-23 this used c0 = π·Y00 ≈ 0.886, c1 = π·Y1 ≈ 1.534
+// because sky_sh.hlsli's EvalSH2 then returned raw radiance L(N) — DDGI was
+// boosted by π× to land on the same dimensionally-mixed visual scale. After
+// fixing sky_sh to apply Ramamoorthi A_l/π convolution (so it returns proper
+// E(N)/π), DDGI dropped the π and the global IndirectLightingSettings
+// .ddgiDiffuseScale default was raised from 1.0 → π to keep the visual
+// magnitude unchanged at default settings. Existing scenes with
+// .ddgiDiffuseScale = 1.0 baked in will appear π× dimmer for DDGI than
+// before — re-tune the slider after pulling this change.
 //
 // NaN/Inf gate: max(r, 0.0) does NOT strip NaN (IEEE 754 specifies
 // max(NaN, x) = NaN) — a single corrupt SH coefficient propagating into
@@ -379,8 +378,8 @@ DDGIProbeSH DDGI_SH_Multiply(DDGIProbeSH a, float s)
 // breaks the loop deterministically.
 float3 DDGI_SH_Irradiance(DDGIProbeSH sh, float3 N)
 {
-    const float c0 = 0.886226926; // π · Y00
-    const float c1 = 1.534990081; // π · Y1   (Y1/Y00 ≈ √3 ratio for full directionality)
+    const float c0 = 0.282095; // Y00
+    const float c1 = 0.488603; // Y1   (Y1/Y00 ≈ √3 ratio preserves directionality)
     float3 nyx = float3(N.y, N.z, N.x);
 
     // L0 and per-channel L1·N decoded separately so we can clamp each
@@ -404,7 +403,9 @@ float3 DDGI_SH_Irradiance(DDGIProbeSH sh, float3 N)
     // We choose floor=0.05 (reconstructed channel ≥ 5% of pure-L0 result),
     // which corresponds to L1·N ≥ -0.95·(c0/c1)·L0 ≈ -0.548·L0. Channels
     // with strongly-negative L1·N still get heavily attenuated (preserving
-    // the directional cue) but never collapse to zero.
+    // the directional cue) but never collapse to zero. (c0/c1 = Y00/Y1 ≈
+    // 0.5774, so 0.95 × that ≈ 0.5485 — unchanged from the previous π·Y00
+    // / π·Y1 ratio because the π cancels.)
     const float kAlpha = 0.548f; // 0.95 * c0 / c1
     L1r = max(L1r, -kAlpha * max(L0r, 0.0));
     L1g = max(L1g, -kAlpha * max(L0g, 0.0));

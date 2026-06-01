@@ -10,7 +10,16 @@
 | **Visual Studio 2022**    | 17.x                 | "Desktop development with C++" + "Game development with C++"       |
 | **Windows 10 SDK**        | 10.0.26100.0 or newer | Provides D3D12, DXGI, XAudio2 headers                              |
 | **CMake**                 | ≥ 3.21               | Bundled with VS 2022                                               |
-| **vcpkg**                 | manifest mode        | For Assimp. Set `VCPKG_ROOT` env var                                |
+| **vcpkg**                 | manifest mode        | For Assimp (see `vcpkg.json`). Set `VCPKG_ROOT` env var             |
+
+### Bundled dependencies
+
+Everything else is vendored prebuilt under `DX12/external/` and needs no install: DirectXTex, Jolt, DXC,
+FreeType, Dear ImGui (+ ImGuizmo), Lua 5.4, sol2, nlohmann/json, **meshoptimizer**, **Recast/Detour**,
+**FFmpeg** (avcodec/avformat/avutil/swscale + version-suffixed runtime DLLs in `DX12/`), and the
+DirectX-Headers. Most are linked inline via `#pragma comment(lib, ...)`; the CMake build just puts their
+`external/<lib>/lib` folders on the linker search path. DXC + FFmpeg runtime DLLs are copied next to each
+`.exe` at build time.
 
 ## One-time setup
 
@@ -66,7 +75,7 @@ Override with e.g. `-DENGINE_BUILD_GAME=OFF` on the configure line.
 cmake --build build --config Release --target package
 ```
 
-Produces `DX12Engine-<version>-win64.zip` containing the exes, runtime DLLs (DXC, Assimp),
+Produces `DX12Engine-<version>-win64.zip` containing the exes, runtime DLLs (DXC, Assimp, FFmpeg),
 shaders, scripts, and (optionally) bundled assets.
 
 ## Runtime tips
@@ -80,3 +89,5 @@ shaders, scripts, and (optionally) bundled assets.
 - **`Could not find package 'assimp'`** — `VCPKG_ROOT` is unset, or the toolchain file wasn't passed. Re-run with the preset.
 - **Mesh-shader / DXR errors at startup** — needs a GPU + driver supporting D3D12 SM 6.6 + Mesh Shaders + DXR 1.1. Update GPU drivers.
 - **Black viewport / no scene** — assets missing under `DX12/asset/`. Confirm the working directory matches `DX12/` (CMake sets it for VS launches).
+- **`LNK1104: cannot open file '<lib>.lib'`** — a vendored `external/<lib>/lib` folder is missing from the linker search path. The build links most third-party libs via `#pragma comment(lib, ...)`; confirm `DX12/external/` is intact (Recast/Detour, meshoptimizer, FFmpeg, DirectXTex, Jolt, FreeType, DXC).
+- **Video plays black / decode errors** — D3D12 video decode needs a GPU + driver supporting the clip's codec (H.264 / HEVC). The FFmpeg path falls back to software decode; ensure `avcodec-*.dll` / `avformat-*.dll` / `avutil-*.dll` / `swscale-*.dll` (+ `swresample-*.dll`) sit next to the exe.

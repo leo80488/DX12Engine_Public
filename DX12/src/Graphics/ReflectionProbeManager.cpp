@@ -38,6 +38,8 @@ bool ReflectionProbeManager::Init(IGraphicsDevice& gfx)
     }
 
     // ---- StructuredBuffer<Reflection::GPUReflectionProbe> ----
+    // Ring of kFrameCount UPLOAD buffers — see header comment for rationale.
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
         RHI::GPUBufferDesc desc{};
         desc.size       = static_cast<uint64_t>(kMaxReflectionProbes) * sizeof(Reflection::GPUReflectionProbe);
@@ -45,16 +47,16 @@ bool ReflectionProbeManager::Init(IGraphicsDevice& gfx)
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         desc.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-        if (!gfx.CreateBuffer(desc, m_buffer))
+        if (!gfx.CreateBuffer(desc, m_buffer[i]))
         {
-            LOG_ERROR("ReflectionProbeManager: StructuredBuffer create failed");
+            LOG_ERROR("ReflectionProbeManager: StructuredBuffer create failed (slot %u)", i);
             return false;
         }
-        m_bufferMapped = static_cast<Reflection::GPUReflectionProbe*>(gfx.MapBuffer(m_buffer));
-        m_bufferSrv    = gfx.GetBufferSRVGpuHandle(m_buffer);
+        m_bufferMapped[i] = static_cast<Reflection::GPUReflectionProbe*>(gfx.MapBuffer(m_buffer[i]));
+        m_bufferSrv[i]    = gfx.GetBufferSRVGpuHandle(m_buffer[i]);
 
-        if (m_bufferMapped)
-            std::memset(m_bufferMapped, 0,
+        if (m_bufferMapped[i])
+            std::memset(m_bufferMapped[i], 0,
                         kMaxReflectionProbes * sizeof(Reflection::GPUReflectionProbe));
     }
 
@@ -64,6 +66,30 @@ bool ReflectionProbeManager::Init(IGraphicsDevice& gfx)
         return false;
     }
     return true;
+}
+
+void ReflectionProbeManager::Shutdown(IGraphicsDevice& gfx)
+{
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (m_bufferMapped[i])      { gfx.UnmapBuffer(m_buffer[i]); m_bufferMapped[i] = nullptr; }
+        if (m_buffer[i].IsValid())  { gfx.DestroyBuffer(m_buffer[i]); }
+        m_bufferSrv[i] = 0;
+    }
+}
+
+Reflection::GPUReflectionProbe* ReflectionProbeManager::GetUploadPointer(IGraphicsDevice& gfx) const
+{
+    const uint32_t s = gfx.GetFrameIndex();
+    if (s >= kFrameCount) return nullptr;
+    return m_bufferMapped[s];
+}
+
+uint64_t ReflectionProbeManager::GetBufferSrv(IGraphicsDevice& gfx) const
+{
+    const uint32_t s = gfx.GetFrameIndex();
+    if (s >= kFrameCount) return 0;
+    return m_bufferSrv[s];
 }
 
 void ReflectionProbeManager::EnqueueBake(uint32_t cubeSlice)

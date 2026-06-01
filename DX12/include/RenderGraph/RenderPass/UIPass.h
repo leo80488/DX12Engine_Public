@@ -15,6 +15,7 @@
 #include "Graphics/GraphicsStruct.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
+#include "Graphics/FrameCB.h"
 #include "UI/UIDrawList.h"
 
 class IGraphicsDevice;
@@ -57,15 +58,20 @@ private:
 
     UI::UIDrawList   m_drawList;
 
-    // Vertex / index UPLOAD buffers, single-allocated, mapped persistently.
-    RHI::GPUBuffer   m_vertexBuffer;
+    // Vertex UPLOAD buffer (triple-buffered ring — 3 == GraphicsDX12::FrameCount).
+    // The index buffer member below is currently unused — UIPass flat-expands
+    // indices on CPU into the VB at upload time (engine root sig has no IA
+    // index-buffer slot). Kept declared so a future engine-side IA index path
+    // can wire it in without ABI churn.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer   m_vertexBuffer[kFrameCount];
+    void*            m_vbMapped[kFrameCount] = {};
     RHI::GPUBuffer   m_indexBuffer;
-    void*            m_vbMapped = nullptr;
     void*            m_ibMapped = nullptr;
 
     // Per-pass UI CB (canvas size).
-    RHI::GPUBuffer   m_cb;
-    void*            m_cbMapped = nullptr;
+    struct alignas(16) UICB { float w, h; uint32_t pad0, pad1; };
+    FrameCB<UICB>    m_cb;
 
     // 1×1 white default texture (used when a draw cmd has no texture bound).
     RHI::Texture     m_whiteTex;

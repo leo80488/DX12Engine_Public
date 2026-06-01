@@ -15,15 +15,19 @@ void DebugWirePass::Init(IGraphicsDevice& gfx)
     m_shaderLib.Register(ShaderID::DebugWire_PS, RHI::ShaderStage::PS, "DebugWire.ps.hlsl");
     m_psoCache.Init(gfx, m_shaderLib);
 
-    // UPLOAD heap vertex buffer (CPU-writable each frame).
+    // UPLOAD heap vertex buffer (CPU-writable each frame) — triple-buffered
+    // ring so the CPU's frame N+1 write doesn't stomp the GPU's frame N read.
     RHI::GPUBufferDesc bd{};
     bd.size       = static_cast<uint64_t>(kMaxVertices) * sizeof(LineVertex);
     bd.stride     = 0; // raw buffer
     bd.usage      = RHI::Usage::UPLOAD;
     bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
     bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_RAW;
-    if (gfx.CreateBuffer(bd, m_vertexBuffer))
-        m_vertexMapped = gfx.MapBuffer(m_vertexBuffer);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (gfx.CreateBuffer(bd, m_vertexBuffer[i]))
+            m_vertexMapped[i] = gfx.MapBuffer(m_vertexBuffer[i]);
+    }
 
     if (m_psoCache.GetOrCreate(BuildPSODesc()))
         LOG_SUCCESS("DebugWirePass: initialized");
@@ -64,12 +68,27 @@ PSODesc DebugWirePass::BuildPSODesc() const
     return desc;
 }
 
+void DebugWirePass::Clear()
+{
+    m_vertexCount = 0;
+    // Cache this frame's mapped vertex pointer ONCE so AddLine's hot path stays
+    // free of the per-call virtual GetFrameIndex() (it's hit once per wireframe
+    // edge — millions on a full-scene collision overlay, where it showed up as
+    // the #1 self-CPU cost). The frame slot is stable across the whole
+    // BeginFrame…Execute window, and Clear() runs at the top of every debug-wire
+    // build (Renderer::BuildScene_DebugWireframes) before any AddLine that frame.
+    m_curVerts = nullptr;
+    if (!m_gfx) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot < kFrameCount)
+        m_curVerts = static_cast<LineVertex*>(m_vertexMapped[frameSlot]);
+}
+
 void DebugWirePass::AddLine(const XMFLOAT3& a, const XMFLOAT3& b, uint32_t color)
 {
-    if (m_vertexCount + 2 > kMaxVertices) return;
-    auto* verts = static_cast<LineVertex*>(m_vertexMapped);
-    if (!verts) return;
-
+    // Hot path — once per wireframe edge. m_curVerts is cached by Clear().
+    LineVertex* verts = m_curVerts;
+    if (!verts || m_vertexCount + 2 > kMaxVertices) return;
     verts[m_vertexCount++] = { a.x, a.y, a.z, color };
     verts[m_vertexCount++] = { b.x, b.y, b.z, color };
 }
@@ -167,6 +186,78 @@ void DebugWirePass::AddCapsule(const XMFLOAT3& a, const XMFLOAT3& b,
         XMStoreFloat3(&fb, XMVectorAdd(vB, off));
         AddLine(fa, fb, color);
     }
+
+    // Hemisphere arcs at each endpoint — without these the wireframe looks
+    // like a cylinder. Two great-circle half-arcs per hemisphere (in the
+    // axis-u and axis-v planes) give the iconic capsule silhouette regardless
+    // of viewing angle. Pole at A = A + (-axis)*radius; pole at B = B + axis*radius.
+    const int   halfSegs = std::max(2, segments / 2);
+    const float halfStep = DirectX::XM_PI / static_cast<float>(halfSegs);
+
+    auto emitHemisphere = [&](XMVECTOR centre, XMVECTOR outward)
+    {
+        for (int planeIdx = 0; planeIdx < 2; ++planeIdx)
+        {
+            XMVECTOR tangent = (planeIdx == 0) ? u : v;
+            for (int i = 0; i < halfSegs; ++i)
+            {
+                const float p0 = halfStep * static_cast<float>(i);
+                const float p1 = halfStep * static_cast<float>(i + 1);
+                XMVECTOR pos0 = XMVectorAdd(centre,
+                    XMVectorAdd(XMVectorScale(outward, sinf(p0) * radius),
+                                 XMVectorScale(tangent, cosf(p0) * radius)));
+                XMVECTOR pos1 = XMVectorAdd(centre,
+                    XMVectorAdd(XMVectorScale(outward, sinf(p1) * radius),
+                                 XMVectorScale(tangent, cosf(p1) * radius)));
+                XMFLOAT3 f0, f1;
+                XMStoreFloat3(&f0, pos0);
+                XMStoreFloat3(&f1, pos1);
+                AddLine(f0, f1, color);
+            }
+        }
+    };
+
+    emitHemisphere(vA, XMVectorNegate(axis));  // dome away from B
+    emitHemisphere(vB, axis);                  // dome away from A
+}
+
+void DebugWirePass::AddSphere(const XMFLOAT3& center, float radius,
+                              uint32_t color, int segments)
+{
+    if (segments < 4) segments = 4;
+
+    const XMVECTOR c    = XMLoadFloat3(&center);
+    const float    step = DirectX::XM_2PI / static_cast<float>(segments);
+
+    // Three orthogonal great circles — XY, YZ, XZ. Each is a closed loop of
+    // `segments` lines. From any view angle at least one circle's silhouette
+    // is on-edge, so the sphere reads as round rather than slabby.
+    const XMVECTOR basis[3][2] = {
+        { XMVectorSet(1,0,0,0), XMVectorSet(0,1,0,0) },   // XY plane
+        { XMVectorSet(0,1,0,0), XMVectorSet(0,0,1,0) },   // YZ plane
+        { XMVectorSet(0,0,1,0), XMVectorSet(1,0,0,0) },   // XZ plane
+    };
+
+    for (int axisIdx = 0; axisIdx < 3; ++axisIdx)
+    {
+        const XMVECTOR& u = basis[axisIdx][0];
+        const XMVECTOR& v = basis[axisIdx][1];
+        for (int i = 0; i < segments; ++i)
+        {
+            const float a0 = step * static_cast<float>(i);
+            const float a1 = step * static_cast<float>(i + 1);
+            XMVECTOR p0 = XMVectorAdd(c, XMVectorAdd(
+                XMVectorScale(u, cosf(a0) * radius),
+                XMVectorScale(v, sinf(a0) * radius)));
+            XMVECTOR p1 = XMVectorAdd(c, XMVectorAdd(
+                XMVectorScale(u, cosf(a1) * radius),
+                XMVectorScale(v, sinf(a1) * radius)));
+            XMFLOAT3 f0, f1;
+            XMStoreFloat3(&f0, p0);
+            XMStoreFloat3(&f1, p1);
+            AddLine(f0, f1, color);
+        }
+    }
 }
 
 void DebugWirePass::Execute(RHI::CommandList cl, const RHI::Texture* depthTex,
@@ -195,7 +286,10 @@ void DebugWirePass::Execute(RHI::CommandList cl, const RHI::Texture* depthTex,
     gfx.BindConstantBuffer(perViewCB, 0, cl);
 
     // Bind line vertex buffer at t2 space0 (root param 10 = descriptor table).
-    uint64_t vbSrv = gfx.GetBufferSRVGpuHandle(m_vertexBuffer);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    uint64_t vbSrv = (frameSlot < kFrameCount)
+        ? gfx.GetBufferSRVGpuHandle(m_vertexBuffer[frameSlot])
+        : 0;
     if (vbSrv)
         gfx.BindDescriptorTableGpuHandle(10, vbSrv, cl);
 

@@ -17,6 +17,9 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 | **sol2**                           | C++ ↔ Lua binding                                         | MIT                |
 | **FreeType**                       | Font rasterization for the UI                             | FTL / GPL          |
 | **nlohmann/json**                  | Scene serialization, post-process volume blobs            | MIT                |
+| **meshoptimizer**                  | Mesh simplification / optimization (collision-mesh baker) | MIT                |
+| **Recast & Detour**                | Navmesh generation (Recast) + pathfinding (Detour)        | zlib               |
+| **FFmpeg** (avcodec/format/util/swscale) | Video demux + hardware (D3D12VA) decode + scaling   | LGPL-2.1+          |
 | **XAudio2 / X3DAudio**             | Audio mixer + 3D spatialisation                           | Windows SDK        |
 
 ## Libraries via vcpkg
@@ -50,6 +53,8 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 | **TAA Velocity Dilation**  | Drobot / Lottes nearest-depth dilation                                                                                                       |
 | **Reverse-Z Depth**        | Reed/Persson — recommended for D32_FLOAT depth precision                                                                                     |
 | **GPU Skinning**           | Standard linear-blend skinning + morph targets (compute)                                                                                     |
+| **Navmesh / Pathfinding**  | Recast (voxelization → region → contour → polymesh) + Detour A* query (Mikko Mononen)                                                       |
+| **Video Decode**           | FFmpeg demux + D3D12 Video (`ID3D12VideoDecoder`, D3D12VA hardware decode), `swscale` colour convert                                          |
 
 ## Architecture Inspirations
 

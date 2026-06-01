@@ -106,9 +106,12 @@ public:
     };
     const std::vector<ActiveBeam>& GetActiveBeams() const { return m_activeBeams; }
 
-    const RHI::GPUBuffer& GetParamsBuffer()    const { return m_paramsBuffer; }
-    const RHI::GPUBuffer& GetControlPointsBuf()const { return m_controlPointsBuffer; }
-    uint64_t              GetControlPointsSrv()const { return m_controlPointsSrv; }
+    // The params / control-points UPLOAD buffers are triple-buffered (per-
+    // frame written). Accessors return the slot matching gfx.GetFrameIndex()
+    // — BeamSimPass calls these once per Execute so the cost is negligible.
+    const RHI::GPUBuffer& GetParamsBuffer()    const;
+    const RHI::GPUBuffer& GetControlPointsBuf()const;
+    uint64_t              GetControlPointsSrv()const;
 
     const RHI::GPUBuffer& GetPosBuffer()       const { return m_posBuffer; }
     const RHI::GPUBuffer& GetNormalBuffer()    const { return m_normalBuffer; }
@@ -147,14 +150,16 @@ private:
     uint32_t       m_indexBindless = 0;
 
     // Per-beam control-point buffer (UPLOAD heap, SR-bound StructuredBuffer).
-    RHI::GPUBuffer m_controlPointsBuffer;
-    uint64_t       m_controlPointsSrv    = 0;
-    void*          m_controlPointsMapped = nullptr;
+    // Triple-buffered — written every frame by BeginFrame.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_controlPointsBuffer[kFrameCount];
+    uint64_t       m_controlPointsSrv[kFrameCount]    = {};
+    void*          m_controlPointsMapped[kFrameCount] = {};
 
     // Per-beam BeamGenParams CBV (UPLOAD heap, root CBV per dispatch with
-    // offset = beamSlot * kBeamParamSlotStride).
-    RHI::GPUBuffer m_paramsBuffer;
-    void*          m_paramsMapped = nullptr;
+    // offset = beamSlot * kBeamParamSlotStride). Triple-buffered.
+    RHI::GPUBuffer m_paramsBuffer[kFrameCount];
+    void*          m_paramsMapped[kFrameCount] = {};
 
     struct PerBeam
     {

@@ -1,6 +1,7 @@
 #include "Resource/AnimationLoader.h"
 #include "Resource/AnimationResource.h"
 #include "Resource/AssetHeader.h"
+#include "ECS/NotifySerialization.h"
 #include "System/Log.h"
 
 #include <cstring>
@@ -114,8 +115,34 @@ namespace Resource
         for (uint32_t mi = 0; mi < morphClipCount; ++mi)
             res->morphClips.push_back(ReadMorphClip(src));
 
-        LOG_INFO("AnimationLoader: loaded '%s' — %u bone clip(s), %u morph clip(s)",
-                 path.c_str(), clipCount, morphClipCount);
+        // ---- AnimNotify section (tail, optional) ----------------------------
+        // Only present when the writer set ANIM_FLAG_HAS_NOTIFIES. Old .ianim
+        // files and importer output (no notifies) skip this branch entirely.
+        uint32_t notifiedClips = 0;
+        if (meta->flags & ANIM_FLAG_HAS_NOTIFIES)
+        {
+            uint32_t notifyClipCount = 0;
+            std::memcpy(&notifyClipCount, src, sizeof(uint32_t)); src += sizeof(uint32_t);
+            for (uint32_t ci = 0; ci < notifyClipCount; ++ci)
+            {
+                uint32_t len = 0;
+                std::memcpy(&len, src, sizeof(uint32_t)); src += sizeof(uint32_t);
+                std::string json(reinterpret_cast<const char*>(src), len);
+                src += len;
+                if (ci < res->clips.size())
+                {
+                    AnimClipData& clip = res->clips[ci];
+                    if (NotifyIO::TracksFromJsonString(json, clip.notifyTracks,
+                                                       nullptr, &clip.nextNotifyId)
+                        && !clip.notifyTracks.empty())
+                        ++notifiedClips;
+                }
+            }
+        }
+
+        LOG_INFO("AnimationLoader: loaded '%s' — %u bone clip(s), %u morph clip(s), "
+                 "%u clip(s) with notifies",
+                 path.c_str(), clipCount, morphClipCount, notifiedClips);
 
         result.resource = std::move(res);
         // No GPU upload needed for CPU-only clip data.

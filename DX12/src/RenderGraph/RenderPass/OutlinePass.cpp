@@ -6,6 +6,15 @@
 
 #include <cstring>
 
+// Stencil bit reserved for "this pixel was painted by OutlinePass".
+// Sub-pass 1 (Inverted Hull) sets bit-7 on the rim pixels it writes onto HDR;
+// downstream TAA reads the depth-buffer's stencil plane and reduces history
+// weight on these pixels so the outline doesn't ghost behind moving meshes.
+// Bit-7 chosen so the lighting passes' low-bit material codes (1=PBR, 2=NPR,
+// 3=Unlit) remain inside the standard 0..0x7F range — no read_mask changes
+// needed in LightingPass.
+static constexpr uint8_t kOutlineStencilBit = 0x80;
+
 // ---- Root parameter slot indices (graphics root sig, match GraphicsDX12.cpp) ---
 static constexpr uint32_t kPerViewCBSlot   = 0;  // BindCBByName slot 0 → b1 space0
 static constexpr uint32_t kOutlineCBSlot   = 1;  // BindConstantBuffer slot 1 → b2 space0
@@ -28,7 +37,7 @@ OutlinePass::OutlinePass(RG::RGTextureHandle depth, RG::RGTextureHandle normal)
 OutlinePass::~OutlinePass()
 {
     if (!m_gfxPtr) return;
-    if (m_outlineCBMapped) m_gfxPtr->UnmapBuffer(m_outlineCB);
+    m_outlineCB.Destroy(*m_gfxPtr);
     if (m_objectIdTex.IsValid()) m_gfxPtr->DestroyTexture(m_objectIdTex);
 }
 
@@ -47,17 +56,9 @@ void OutlinePass::Init(IGraphicsDevice& gfx)
     m_gfxPtr = &gfx;
 
     // ---- OutlineCB ---------------------------------------------------------
-    if (m_outlineCBMapped) { gfx.UnmapBuffer(m_outlineCB); m_outlineCBMapped = nullptr; }
-    {
-        RHI::GPUBufferDesc bd;
-        bd.size       = (sizeof(OutlineCBData) + 255u) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_outlineCB))
-            m_outlineCBMapped = gfx.MapBuffer(m_outlineCB);
-        else
-            LOG_ERROR("OutlinePass: OutlineCB creation failed");
-    }
+    m_outlineCB.Destroy(gfx); // safe-guard in case Init is re-entered
+    if (!m_outlineCB.Create(gfx, "OutlinePass.OutlineCB"))
+        LOG_ERROR("OutlinePass: OutlineCB creation failed");
 
     // ---- ObjectID texture (matches current render resolution) --------------
     const uint32_t w = gfx.GetRenderWidth();
@@ -76,6 +77,7 @@ void OutlinePass::Init(IGraphicsDevice& gfx)
     // ---- PSO caches --------------------------------------------------------
     m_hullPsoCache.Init(gfx, m_shaderLib);
     m_objectIdPsoCache.Init(gfx, m_shaderLib);
+    m_pickingObjectIdPsoCache.Init(gfx, m_shaderLib);
     m_screenSpacePsoCache.Init(gfx, m_shaderLib);
 
     if (!m_hullPsoCache.GetOrCreate(BuildHullPSODesc()))
@@ -87,6 +89,11 @@ void OutlinePass::Init(IGraphicsDevice& gfx)
         LOG_ERROR("OutlinePass: objectId PSO creation failed");
     else
         LOG_INFO("OutlinePass: objectId PSO ready");
+
+    if (!m_pickingObjectIdPsoCache.GetOrCreate(BuildPickingObjectIdPSODesc()))
+        LOG_ERROR("OutlinePass: picking objectId PSO creation failed");
+    else
+        LOG_INFO("OutlinePass: picking objectId PSO ready");
 
     if (!m_screenSpacePsoCache.GetOrCreate(BuildScreenSpacePSODesc()))
         LOG_ERROR("OutlinePass: screen-space PSO creation failed");
@@ -140,6 +147,17 @@ PSODesc OutlinePass::BuildHullPSODesc() const
     desc.dss.depth_write_mask = RHI::DepthWriteMask::ZERO;
     desc.dss.depth_func       = RHI::ComparisonFunc::GREATER_EQUAL; // reversed Z
 
+    // Tag rim pixels with kOutlineStencilBit so TAA can identify them and
+    // weaken history blending. write_mask = kOutlineStencilBit means only that
+    // bit is touched; the existing 0..0x7F material code from GBufferPass is
+    // preserved. read_mask is irrelevant (stencil_func = ALWAYS).
+    desc.dss.stencil_enable     = true;
+    desc.dss.stencil_read_mask  = 0xFF;
+    desc.dss.stencil_write_mask = kOutlineStencilBit;
+    desc.dss.front_face.stencil_func    = RHI::ComparisonFunc::ALWAYS;
+    desc.dss.front_face.stencil_pass_op = RHI::StencilOp::REPLACE;
+    desc.dss.back_face = desc.dss.front_face;
+
     // Alpha blending: outline fades with distance to prevent dense-mesh
     // areas (hair) from becoming solid black at a distance.
     auto& rt0 = desc.bs.render_target[0];
@@ -176,6 +194,19 @@ PSODesc OutlinePass::BuildObjectIdPSODesc() const
     desc.rtvFormats[0] = RHI::Format::R32_UINT;
     desc.rtvCount      = 1;
     desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    return desc;
+}
+
+// ---------------------------------------------------------------------------
+// Picking ObjectID: same as BuildObjectIdPSODesc() but depth-test off so the
+// selected entity's silhouette is recorded into the mask even where it is
+// occluded. The PS sets bit-31 of the written ID so sub-pass 3 paints the
+// edges in pickingOutlineColor (Blender / Unity selection look).
+PSODesc OutlinePass::BuildPickingObjectIdPSODesc() const
+{
+    PSODesc desc = BuildObjectIdPSODesc();
+    desc.dss.depth_enable     = false;
+    desc.dss.depth_write_mask = RHI::DepthWriteMask::ZERO;
     return desc;
 }
 
@@ -217,10 +248,11 @@ RHI::CommandList OutlinePass::Execute(RHI::CommandList cl)
 
     if (!m_objectIdTex.IsValid()) return cl;
 
-    const RHI::PipelineState* hullPso = m_hullPsoCache.GetOrCreate(BuildHullPSODesc());
-    const RHI::PipelineState* objIdPso = m_objectIdPsoCache.GetOrCreate(BuildObjectIdPSODesc());
-    const RHI::PipelineState* ssPso = m_screenSpacePsoCache.GetOrCreate(BuildScreenSpacePSODesc());
-    if (!hullPso || !objIdPso || !ssPso) return cl;
+    const RHI::PipelineState* hullPso          = m_hullPsoCache.GetOrCreate(BuildHullPSODesc());
+    const RHI::PipelineState* objIdPso         = m_objectIdPsoCache.GetOrCreate(BuildObjectIdPSODesc());
+    const RHI::PipelineState* pickingObjIdPso  = m_pickingObjectIdPsoCache.GetOrCreate(BuildPickingObjectIdPSODesc());
+    const RHI::PipelineState* ssPso            = m_screenSpacePsoCache.GetOrCreate(BuildScreenSpacePSODesc());
+    if (!hullPso || !objIdPso || !pickingObjIdPso || !ssPso) return cl;
 
     IGraphicsDevice& gfx = *m_gfxPtr;
 
@@ -237,7 +269,7 @@ RHI::CommandList OutlinePass::Execute(RHI::CommandList cl)
     if (!m_objectIdTex.IsValid()) return cl;
 
     // ---- Upload OutlineCB --------------------------------------------------
-    if (m_outlineCBMapped)
+    if (auto* slot = m_outlineCB.Current(gfx))
     {
         OutlineCBData cb;
         cb.outlinePixels   = outlinePixels;
@@ -253,7 +285,10 @@ RHI::CommandList OutlinePass::Execute(RHI::CommandList cl)
         cb.outlineFadeEnd   = outlineFadeEnd;
         cb.nearZ = nearZ;
         cb.farZ  = farZ;
-        std::memcpy(m_outlineCBMapped, &cb, sizeof(cb));
+        cb.pickingOutlineColor[0] = pickingOutlineColor[0];
+        cb.pickingOutlineColor[1] = pickingOutlineColor[1];
+        cb.pickingOutlineColor[2] = pickingOutlineColor[2];
+        *slot = cb;
     }
 
     auto bindGeometryGlobals = [&]()
@@ -275,89 +310,117 @@ RHI::CommandList OutlinePass::Execute(RHI::CommandList cl)
     cl.SetScissorRect(renderW, renderH);
     cl.SetPrimitiveTopology();
 
-    cl.SetPipelineState(*hullPso);
-    bindGeometryGlobals();
-    cl.GetDevice().BindConstantBuffer(m_outlineCB, kOutlineCBSlot, cl);
-
-    for (const DrawPacket& dp : draws)
+    if (!diagSkipHull)
     {
-        cl.SetPVFRootConstants(dp.meshDescriptorIndex, dp.instanceOffset, dp.materialIndex);
-        // Set outlinePixels as the 4th root constant (word offset 3) per draw.
-        gfx.SetGraphicsRootConstant(
-            0, *reinterpret_cast<const uint32_t*>(&dp.outlinePixels), 3, cl);
-        cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
+        cl.SetPipelineState(*hullPso);
+        bindGeometryGlobals();
+        cl.GetDevice().BindConstantBuffer(m_outlineCB.CurrentBuffer(gfx), kOutlineCBSlot, cl);
+        // Stencil ref carries kOutlineStencilBit into REPLACE writes (gated to that
+        // bit by the PSO's stencil_write_mask). Every hull pixel that survives the
+        // depth test ends up with bit-7 set in the depth buffer's stencil plane.
+        cl.GetDevice().SetStencilRef(kOutlineStencilBit, cl);
+
+        for (const DrawPacket& dp : draws)
+        {
+            // Picking outline does NOT use the inverted-hull pass — it's a pure
+            // screen-space silhouette (sub-passes 2+3). Drawing the hull with
+            // depth disabled produces a solid blob instead of a thin ring;
+            // depth-tested hull cuts off at walls. Skip entirely.
+            if (dp.isPickingOutline) continue;
+            cl.SetPVFRootConstants(dp.meshDescriptorIndex, dp.instanceOffset, dp.materialIndex);
+            // Set outlinePixels as the 4th root constant (word offset 3) per draw.
+            gfx.SetGraphicsRootConstant(
+                0, *reinterpret_cast<const uint32_t*>(&dp.outlinePixels), 3, cl);
+            cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
+        }
     }
 
-    // =====================================================================
-    // Sub-pass 2: Object ID → R32_UINT RTV + depth DSV (depth test + write)
-    // Transition ObjectID from its current state → RENDERTARGET.
-    // =====================================================================
-    if (m_objectIdState != RHI::ResourceState::RENDERTARGET)
+    if (!diagSkipScreenSpace)
     {
+        // =====================================================================
+        // Sub-pass 2: Object ID → R32_UINT RTV + depth DSV (depth test + write)
+        // Transition ObjectID from its current state → RENDERTARGET.
+        // =====================================================================
+        if (m_objectIdState != RHI::ResourceState::RENDERTARGET)
+        {
+            cl.PushBarrier(RHI::GPUBarrier::Image(
+                &m_objectIdTex,
+                m_objectIdState,
+                RHI::ResourceState::RENDERTARGET));
+            m_objectIdState = RHI::ResourceState::RENDERTARGET;
+        }
+
+        const float zeroClear[4] = {};
+        gfx.ClearRenderTarget(m_objectIdTex, zeroClear, cl);
+        const RHI::Texture* rts[] = { &m_objectIdTex };
+        gfx.SetRenderTargets(1, rts, depthTex, cl);
+
+        cl.SetViewport(renderW, renderH);
+        cl.SetScissorRect(renderW, renderH);
+        cl.SetPrimitiveTopology();
+
+        // Switch ObjectID PSO when dp.isPickingOutline flips so we get depth-test
+        // off for picking draws (silhouette through walls) and on for normal draws.
+        // The 4th root constant (word offset 3) tells OutlineObjectID.ps.hlsl
+        // whether to OR bit-31 into the written ID — sub-pass 3 keys outline color
+        // off that bit.  -1 = nothing bound yet.
+        int curObjIdVariant = -1;
+        for (const DrawPacket& dp : draws)
+        {
+            if (!dp.screenSpaceOutline) continue;
+            const int wantVariant = dp.isPickingOutline ? 1 : 0;
+            if (wantVariant != curObjIdVariant)
+            {
+                cl.SetPipelineState(dp.isPickingOutline ? *pickingObjIdPso : *objIdPso);
+                bindGeometryGlobals();
+                curObjIdVariant = wantVariant;
+            }
+            cl.SetPVFRootConstants(dp.meshDescriptorIndex, dp.instanceOffset, dp.materialIndex);
+            // Word offset 3 of the root-constants slot: picking-flag for the PS.
+            const uint32_t pickingFlag = dp.isPickingOutline ? 1u : 0u;
+            gfx.SetGraphicsRootConstant(0, pickingFlag, 3, cl);
+            cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
+        }
+
+        // =====================================================================
+        // Sub-pass 3: Screen-Space Composite (fullscreen triangle, alpha blend)
+        // Transition ObjectID RENDERTARGET → SHADER_RESOURCE.
+        // Transition Depth DEPTHSTENCIL → SHADER_RESOURCE (restore afterwards).
+        // =====================================================================
         cl.PushBarrier(RHI::GPUBarrier::Image(
             &m_objectIdTex,
-            m_objectIdState,
-            RHI::ResourceState::RENDERTARGET));
-        m_objectIdState = RHI::ResourceState::RENDERTARGET;
+            RHI::ResourceState::RENDERTARGET,
+            RHI::ResourceState::SHADER_RESOURCE));
+        m_objectIdState = RHI::ResourceState::SHADER_RESOURCE;
+
+        cl.PushBarrier(RHI::GPUBarrier::Image(
+            depthTex,
+            RHI::ResourceState::DEPTHSTENCIL,
+            RHI::ResourceState::SHADER_RESOURCE));
+
+        // Bind HDR RTV without depth (nullptr = no DSV).
+        cl.GetDevice().SetRenderTargetToHdrWithDepth(nullptr, cl);
+
+        cl.SetPipelineState(*ssPso);
+        cl.BindDescriptorHeaps();
+        cl.GetDevice().BindConstantBuffer(m_outlineCB.CurrentBuffer(gfx), kOutlineCBSlot, cl);
+
+        const uint64_t objIdSrv  = gfx.GetTextureSRVGpuHandle(m_objectIdTex);
+        const uint64_t normalSrv = gfx.GetTextureSRVGpuHandle(*normalTex);
+        const uint64_t depthSrv  = gfx.GetTextureSRVGpuHandle(*depthTex);
+
+        if (objIdSrv)  cl.BindDescriptorTableHandle(kObjectIDSrvSlot, objIdSrv);
+        if (normalSrv) cl.BindDescriptorTableHandle(kNormalSrvSlot,   normalSrv);
+        if (depthSrv)  cl.BindDescriptorTableHandle(kDepthSrvSlot,    depthSrv);
+
+        cl.DrawFullscreenTriangle();
+
+        // Restore depth to DEPTHSTENCIL so TAA's hardcoded transition is correct.
+        cl.PushBarrier(RHI::GPUBarrier::Image(
+            depthTex,
+            RHI::ResourceState::SHADER_RESOURCE,
+            RHI::ResourceState::DEPTHSTENCIL));
     }
-
-    const float zeroClear[4] = {};
-    gfx.ClearRenderTarget(m_objectIdTex, zeroClear, cl);
-    const RHI::Texture* rts[] = { &m_objectIdTex };
-    gfx.SetRenderTargets(1, rts, depthTex, cl);
-
-    cl.SetViewport(renderW, renderH);
-    cl.SetScissorRect(renderW, renderH);
-    cl.SetPrimitiveTopology();
-
-    cl.SetPipelineState(*objIdPso);
-    bindGeometryGlobals();
-
-    for (const DrawPacket& dp : draws)
-    {
-        if (!dp.screenSpaceOutline) continue; // skip if screen-space outline disabled
-        cl.SetPVFRootConstants(dp.meshDescriptorIndex, dp.instanceOffset, dp.materialIndex);
-        cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
-    }
-
-    // =====================================================================
-    // Sub-pass 3: Screen-Space Composite (fullscreen triangle, alpha blend)
-    // Transition ObjectID RENDERTARGET → SHADER_RESOURCE.
-    // Transition Depth DEPTHSTENCIL → SHADER_RESOURCE (restore afterwards).
-    // =====================================================================
-    cl.PushBarrier(RHI::GPUBarrier::Image(
-        &m_objectIdTex,
-        RHI::ResourceState::RENDERTARGET,
-        RHI::ResourceState::SHADER_RESOURCE));
-    m_objectIdState = RHI::ResourceState::SHADER_RESOURCE;
-
-    cl.PushBarrier(RHI::GPUBarrier::Image(
-        depthTex,
-        RHI::ResourceState::DEPTHSTENCIL,
-        RHI::ResourceState::SHADER_RESOURCE));
-
-    // Bind HDR RTV without depth (nullptr = no DSV).
-    cl.GetDevice().SetRenderTargetToHdrWithDepth(nullptr, cl);
-
-    cl.SetPipelineState(*ssPso);
-    cl.BindDescriptorHeaps();
-    cl.GetDevice().BindConstantBuffer(m_outlineCB, kOutlineCBSlot, cl);
-
-    const uint64_t objIdSrv  = gfx.GetTextureSRVGpuHandle(m_objectIdTex);
-    const uint64_t normalSrv = gfx.GetTextureSRVGpuHandle(*normalTex);
-    const uint64_t depthSrv  = gfx.GetTextureSRVGpuHandle(*depthTex);
-
-    if (objIdSrv)  cl.BindDescriptorTableHandle(kObjectIDSrvSlot, objIdSrv);
-    if (normalSrv) cl.BindDescriptorTableHandle(kNormalSrvSlot,   normalSrv);
-    if (depthSrv)  cl.BindDescriptorTableHandle(kDepthSrvSlot,    depthSrv);
-
-    cl.DrawFullscreenTriangle();
-
-    // Restore depth to DEPTHSTENCIL so TAA's hardcoded transition is correct.
-    cl.PushBarrier(RHI::GPUBarrier::Image(
-        depthTex,
-        RHI::ResourceState::SHADER_RESOURCE,
-        RHI::ResourceState::DEPTHSTENCIL));
 
     return cl;
 }

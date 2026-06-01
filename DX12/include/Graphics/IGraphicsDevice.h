@@ -20,6 +20,8 @@
 #include "Graphics/GraphicsStruct.h"
 #include <cstdint>
 
+namespace RHI { class IVideoDecoderBackend; }
+
 class IGraphicsDevice
 {
 public:
@@ -28,6 +30,20 @@ public:
     // =========================================================================
     // Frame lifecycle
     // =========================================================================
+
+    /** Acquire the next swap-chain backbuffer slot and CPU-wait until the GPU
+     *  has finished using it (slot N%FrameCount's fence from N-FrameCount frames
+     *  ago — graphics + compute + copy queues). Sets GetFrameIndex().
+     *
+     *  Call BEFORE any phase that writes to a per-frame upload-buffer slot
+     *  (mesh-descriptor ring, pose ring, skinned-vertex ring, instance/material
+     *  ring …). Idempotent within a frame: the wait portion of BeginFrame is
+     *  skipped if this has already run. Reset internally by EndFrame.
+     *
+     *  Required because per-frame CPU writes that happen before the slot fence
+     *  wait will race the GPU still-reading that same slot from frame N-FrameCount
+     *  — visible as torn descriptor reads / occasional skinned-mesh flicker. */
+    virtual void WaitForNextFrameSlot() {}
 
     /** Fence-wait for previous frame, advance frame index, open the primary
      *  command list (id 0). Returns a CommandList handle for the primary list.
@@ -40,6 +56,13 @@ public:
     /** Signal the graphics queue fence and CPU-wait until all submitted GPU work completes.
      *  Use sparingly (editor operations only — stalls the CPU). */
     virtual void FlushAndWait() = 0;
+
+    /** Hard sync: wait on EVERY queue (graphics + compute + copy) and drain
+     *  all per-slot deferred-release queues so pending Destroy* calls
+     *  actually free GPU memory.  Heavier than FlushAndWait (full pipeline
+     *  bubble) — call only on rare editor transitions where freeing prior
+     *  resources before allocating new ones matters (e.g. world reload). */
+    virtual void WaitIdleAndReleaseDeferred() = 0;
 
     // =========================================================================
     // Command list management
@@ -104,6 +127,15 @@ public:
     virtual uint32_t GetRenderWidth()  const { return GetWidth();  }
     virtual uint32_t GetRenderHeight() const { return GetHeight(); }
 
+    /** Current frame-pipeline slot — backbuffer index modulo FrameCount.
+     *  Stable across the entire frame after BeginFrame returns. Used by
+     *  FrameCB and any other per-frame upload-buffer wrapper to pick the
+     *  right slot so CPU writes don't race the GPU reading the same buffer
+     *  from an earlier in-flight frame.
+     *  (FrameCount is exposed as GraphicsDX12's existing static constexpr —
+     *  no virtual is needed; FrameCB.h hard-codes kFrameCount=3 to match.) */
+    virtual uint32_t GetFrameIndex()   const { return 0; }
+
     /** GPU handle of the HDR SRV as uint64_t (ImTextureID / D3D12_GPU_DESCRIPTOR_HANDLE::ptr). */
     virtual uint64_t GetHdrSceneSrvGpuHandle() const = 0;
 
@@ -128,6 +160,18 @@ public:
      *  Falls back to the default SRV when no alias exists. */
     virtual uint64_t GetTexturePreviewSrvGpuHandle(const RHI::Texture& texture) const
     { return GetTextureSRVGpuHandle(texture); }
+
+    /** GPU handle of the NV12 UV-plane SRV (R8G8_UNORM, PlaneSlice=1).
+     *  GetTextureSRVGpuHandle returns the Y plane (R8_UNORM, PlaneSlice=0) of
+     *  the same texture. Returns 0 when the texture is not NV12/P010 or has
+     *  not been created with SHADER_RESOURCE bind flag. */
+    virtual uint64_t GetTextureUVPlaneSRVGpuHandle(const RHI::Texture& tex) const { return 0; }
+
+    /** GPU handle of the stencil-plane SRV for a depth/stencil texture
+     *  (X24_TYPELESS_G8_UINT view of D24_UNORM_S8_UINT). Returns 0 when the
+     *  texture is not a stencil-bearing format or has no SRV. Sample as
+     *  Texture2D<uint2> and read .y for the stencil byte. */
+    virtual uint64_t GetTextureStencilSRVGpuHandle(const RHI::Texture& texture) const { return 0; }
 
     // =========================================================================
     // Descriptor table management
@@ -168,6 +212,21 @@ public:
         const RHI::TextureDesc&      desc,
         RHI::Texture&                outTexture,
         const RHI::SubresourceData*  initialData = nullptr) = 0;
+
+    /** Upload @p planes data into an EXISTING DEFAULT-heap texture via an
+     *  UPLOAD staging buffer + CopyTextureRegion. @p subresourceCount must
+     *  equal `texture.desc.mip_levels * desc.array_size` for regular formats,
+     *  or 2 for an NV12 texture (plane 0 = Y, plane 1 = UV).
+     *
+     *  Synchronous — flushes the upload CL on return. Suitable for per-frame
+     *  video / streaming texture updates where the staging copy needs to be
+     *  visible to the next BeginFrame. Caller owns no barriers; the impl
+     *  transitions in→COPY_DEST→back internally. Returns false on size
+     *  mismatch or staging failure. */
+    virtual bool UpdateTexture(
+        RHI::Texture&                texture,
+        const RHI::SubresourceData*  planes,
+        uint32_t                     subresourceCount) { return false; }
 
     virtual bool CreateShader(
         RHI::ShaderStage stage,
@@ -539,4 +598,16 @@ public:
     virtual bool CaptureTextureToPNG(const RHI::Texture& tex,
                                      RHI::ResourceState  currentState,
                                      const char*         path) = 0;
+
+    // =========================================================================
+    // Video decode
+    //
+    // Lazily instantiated GPU video decoder back-end. Returns nullptr when the
+    // platform / driver does not advertise ID3D12VideoDevice (older Vista WDDM
+    // drivers, software-only fallbacks). The returned reference is owned by
+    // the IGraphicsDevice and stays valid until device destruction — callers
+    // do NOT delete it. See Graphics/IVideoDecoder.h for the per-decoder
+    // lifecycle (CreateVideoDecoder / DecodeVideoFrame / DestroyVideoDecoder).
+    // =========================================================================
+    virtual RHI::IVideoDecoderBackend* GetVideoBackend() { return nullptr; }
 };

@@ -94,6 +94,33 @@ bool AllocateUploadBuffer(GraphicsDX12& gfx,
     return SUCCEEDED(hr);
 }
 
+// READBACK heap variant — used to read back AS postbuild (compacted-size) info.
+bool AllocateReadbackBuffer(GraphicsDX12& gfx, uint64_t sizeBytes,
+                            Microsoft::WRL::ComPtr<ID3D12Resource>& out)
+{
+    ID3D12Device* device = gfx.GetDevice();
+    if (!device || sizeBytes == 0) return false;
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width              = sizeBytes;
+    desc.Height             = 1;
+    desc.DepthOrArraySize   = 1;
+    desc.MipLevels          = 1;
+    desc.Format             = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count   = 1;
+    desc.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags              = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&out));
+    return SUCCEEDED(hr);
+}
+
 // Translate caller's GeometryDesc[] into D3D12_RAYTRACING_GEOMETRY_DESC[].
 // The output vector references caller memory — keep it alive across the
 // build call (the engine API is synchronous so the temp is fine).
@@ -140,7 +167,8 @@ std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> TranslateGeometryArray(
 
 bool QueryBLASBuildSize(GraphicsDX12& gfx,
                         const GeometryDesc* geoms, uint32_t geomCount,
-                        uint64_t& outResultSize, uint64_t& outScratchSize)
+                        uint64_t& outResultSize, uint64_t& outScratchSize,
+                        bool allowCompaction)
 {
     outResultSize = 0; outScratchSize = 0;
     if (!gfx.SupportsDXR() || geomCount == 0) return false;
@@ -153,7 +181,11 @@ bool QueryBLASBuildSize(GraphicsDX12& gfx,
     D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS inputs{};
     inputs.Type           = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     inputs.DescsLayout    = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    // Prebuild flags MUST match the BuildBLAS flags or the reported sizes are
+    // wrong — ALLOW_COMPACTION can change both result and scratch sizes.
+    inputs.Flags          = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+                          | (allowCompaction ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+                                             : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE);
     inputs.NumDescs       = geomCount;
     inputs.pGeometryDescs = geoArr.data();
 
@@ -191,7 +223,8 @@ void BuildBLAS(GraphicsDX12& gfx,
                ID3D12GraphicsCommandList4* cmd,
                const GeometryDesc* geoms, uint32_t geomCount,
                BLAS& blas,
-               const ScratchBuffer& scratch)
+               const ScratchBuffer& scratch,
+               bool allowCompaction)
 {
     if (!gfx.SupportsDXR() || !cmd || !blas.resource || !scratch.resource || geomCount == 0)
         return;
@@ -203,7 +236,11 @@ void BuildBLAS(GraphicsDX12& gfx,
     desc.ScratchAccelerationStructureData = scratch.resource->GetGPUVirtualAddress();
     desc.Inputs.Type                      = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
     desc.Inputs.DescsLayout               = D3D12_ELEMENTS_LAYOUT_ARRAY;
-    desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    // ALLOW_COMPACTION lets a later EmitBLASCompactedSize + CompactBLAS shrink
+    // this AS. Must match the flag passed to QueryBLASBuildSize for this build.
+    desc.Inputs.Flags                     = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+                                          | (allowCompaction ? D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION
+                                                             : D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_NONE);
     desc.Inputs.NumDescs                  = geomCount;
     desc.Inputs.pGeometryDescs            = geoArr.data();
 
@@ -220,6 +257,99 @@ void BuildBLAS(GraphicsDX12& gfx,
     barriers[1].Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     barriers[1].UAV.pResource = scratch.resource.Get();
     cmd->ResourceBarrier(2, barriers);
+}
+
+void EmitBLASCompactedSize(GraphicsDX12& gfx,
+                           ID3D12GraphicsCommandList4* cmd,
+                           BLAS& blas)
+{
+    if (!gfx.SupportsDXR() || !cmd || !blas.resource) return;
+
+    // The COMPACTED_SIZE postbuild query writes a single UINT64. Its dest must
+    // be GPU-writable (UAV) — a READBACK heap buffer can't be a postbuild dest
+    // — so emit into a tiny DEFAULT UAV buffer, then copy that into a READBACK
+    // buffer the CPU can map a few frames later.
+    constexpr uint64_t kSizeBytes = sizeof(UINT64);
+    // DEFAULT-heap buffers are always created in COMMON — passing
+    // UNORDERED_ACCESS as the initial state is ignored and the debug layer
+    // warns. Create in COMMON, then transition COMMON->UAV before the emit
+    // (the postbuild dest must be in UNORDERED_ACCESS).
+    if (!AllocateD3DBuffer(gfx, kSizeBytes,
+                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                           D3D12_RESOURCE_STATE_COMMON,
+                           blas.compactSizeUav))
+        return;
+    if (!AllocateReadbackBuffer(gfx, kSizeBytes, blas.compactSizeReadback))
+    {
+        blas.compactSizeUav.Reset();
+        return;
+    }
+
+    {
+        D3D12_RESOURCE_BARRIER toUav{};
+        toUav.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toUav.Transition.pResource   = blas.compactSizeUav.Get();
+        toUav.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        toUav.Transition.StateAfter  = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        toUav.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        cmd->ResourceBarrier(1, &toUav);
+    }
+
+    // BuildBLAS already issued the result-UAV barrier on blas.resource, so the
+    // just-built AS is safe to read here.
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC pbi{};
+    pbi.InfoType   = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE;
+    pbi.DestBuffer = blas.compactSizeUav->GetGPUVirtualAddress();
+    const D3D12_GPU_VIRTUAL_ADDRESS srcVA = blas.resource->GetGPUVirtualAddress();
+    cmd->EmitRaytracingAccelerationStructurePostbuildInfo(&pbi, 1, &srcVA);
+
+    // UAV barrier on the emit dest, then UAV->COPY_SOURCE so we can copy it into
+    // the readback buffer. (No transition back — it's transient, released after
+    // the CPU read.)
+    D3D12_RESOURCE_BARRIER post[2]{};
+    post[0].Type                   = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    post[0].UAV.pResource          = blas.compactSizeUav.Get();
+    post[1].Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[1].Transition.pResource   = blas.compactSizeUav.Get();
+    post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    post[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmd->ResourceBarrier(2, post);
+
+    cmd->CopyBufferRegion(blas.compactSizeReadback.Get(), 0,
+                          blas.compactSizeUav.Get(), 0, kSizeBytes);
+
+    blas.compactState = BLAS::CompactState::AwaitingSize;
+}
+
+bool CompactBLAS(GraphicsDX12& gfx,
+                 ID3D12GraphicsCommandList4* cmd,
+                 const BLAS& src, uint64_t compactedSize,
+                 BLAS& outCompacted)
+{
+    if (!gfx.SupportsDXR() || !cmd || !src.resource || compactedSize == 0)
+        return false;
+
+    // Right-sized result buffer (DEFAULT UAV, RAYTRACING_ACCELERATION_STRUCTURE
+    // state — same as a normal BLAS). Committed-resource VAs are 64KB-aligned,
+    // so the 256B AS alignment is satisfied.
+    if (!AllocateBLAS(gfx, compactedSize, outCompacted))
+        return false;
+
+    cmd->CopyRaytracingAccelerationStructure(
+        outCompacted.resource->GetGPUVirtualAddress(),
+        src.resource->GetGPUVirtualAddress(),
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT);
+
+    // The TLAS build that reads this compacted BLAS this same frame must wait
+    // for the copy to finish.
+    D3D12_RESOURCE_BARRIER uavb{};
+    uavb.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    uavb.UAV.pResource = outCompacted.resource.Get();
+    cmd->ResourceBarrier(1, &uavb);
+
+    outCompacted.compactState = BLAS::CompactState::Done;
+    return true;
 }
 
 // =============================================================================

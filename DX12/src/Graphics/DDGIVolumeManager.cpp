@@ -19,22 +19,26 @@ namespace DDGI
 bool DDGIVolumeManager::Init(IGraphicsDevice& gfx)
 {
     // Engine-wide volume desc buffer (kMaxVolumes entries, UPLOAD heap so the
-    // CPU can rewrite it each frame without staging copies).
+    // CPU can rewrite it each frame without staging copies). Triple-buffered
+    // ring — written every frame by Tick().
     RHI::GPUBufferDesc desc{};
     desc.size       = uint64_t(kMaxVolumes) * sizeof(VolumeGPUDesc);
     desc.stride     = sizeof(VolumeGPUDesc);
     desc.usage      = RHI::Usage::UPLOAD;
     desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
     desc.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-    if (!gfx.CreateBuffer(desc, m_volumeBuffer))
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
-        LOG_ERROR("DDGIVolumeManager: volume buffer create failed");
-        return false;
+        if (!gfx.CreateBuffer(desc, m_volumeBuffer[i]))
+        {
+            LOG_ERROR("DDGIVolumeManager: volume buffer create failed (slot %u)", i);
+            return false;
+        }
+        m_volumeBufferMapped[i] = gfx.MapBuffer(m_volumeBuffer[i]);
+        m_volumeBufferSrv[i]    = gfx.GetBufferSRVGpuHandle(m_volumeBuffer[i]);
+        if (m_volumeBufferMapped[i])
+            std::memset(m_volumeBufferMapped[i], 0, desc.size);
     }
-    m_volumeBufferMapped = gfx.MapBuffer(m_volumeBuffer);
-    m_volumeBufferSrv    = gfx.GetBufferSRVGpuHandle(m_volumeBuffer);
-    if (m_volumeBufferMapped)
-        std::memset(m_volumeBufferMapped, 0, desc.size);
 
     // Allocate the three multi-volume descriptor tables (one block of
     // kMaxVolumes contiguous SRV slots each — for ProbeSH / Depth / ProbeData).
@@ -80,6 +84,10 @@ bool DDGIVolumeManager::Init(IGraphicsDevice& gfx)
         return false;
 
     LOG_INFO("DDGIVolumeManager: ready (max %u volumes; SH/Depth/ProbeData tables allocated)", kMaxVolumes);
+    // Build marker — grep DX12Log.txt for this string to confirm the running
+    // exe actually contains the latest DDGI changes. If it's absent (or shows
+    // an older tag), a stale build is being run.
+    LOG_INFO("DDGIVolumeManager: [stability-build 2026-05-14d] adaptive off + rotation amplitude scaled to ray count");
     return true;
 }
 
@@ -88,12 +96,15 @@ void DDGIVolumeManager::Shutdown(IGraphicsDevice& gfx)
     for (uint32_t i = 0; i < kMaxVolumes; ++i)
         if (m_volumes[i].allocated)
             DestroyVolume(gfx, m_volumes[i]);
-    if (m_volumeBuffer.IsValid())
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
-        if (m_volumeBufferMapped) gfx.UnmapBuffer(m_volumeBuffer);
-        gfx.DestroyBuffer(m_volumeBuffer);
-        m_volumeBufferMapped = nullptr;
-        m_volumeBufferSrv    = 0;
+        if (m_volumeBuffer[i].IsValid())
+        {
+            if (m_volumeBufferMapped[i]) gfx.UnmapBuffer(m_volumeBuffer[i]);
+            gfx.DestroyBuffer(m_volumeBuffer[i]);
+            m_volumeBufferMapped[i] = nullptr;
+            m_volumeBufferSrv[i]    = 0;
+        }
     }
     if (m_probeSHTable.IsValid())   m_probeSHTable.Free();
     if (m_depthTable.IsValid())     m_depthTable.Free();
@@ -348,7 +359,11 @@ bool DDGIVolumeManager::CreateAtlasesForVolume(IGraphicsDevice& gfx,
         res.varianceUav = gfx.GetBufferUAVGpuHandle(res.varianceBuffer);
     }
 
-    // ---- Volume CB (UPLOAD heap, persistently mapped) ----------------------
+    // ---- Volume CB ring (UPLOAD heap, persistently mapped) ------------------
+    // Triple-buffered — Tick() rewrites randomRotation + frameIndex every
+    // frame; a single CB would race the GPU's in-flight DDGIPass read of the
+    // prior frame's data under 3-frame CPU pipelining.
+    for (uint32_t f = 0; f < kFrameCount; ++f)
     {
         // 256-byte aligned per CBV. The struct is < 256 bytes — pad to that.
         RHI::GPUBufferDesc bd{};
@@ -356,17 +371,17 @@ bool DDGIVolumeManager::CreateAtlasesForVolume(IGraphicsDevice& gfx,
         bd.stride     = 0;
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (!gfx.CreateBuffer(bd, res.volumeCB))
+        if (!gfx.CreateBuffer(bd, res.volumeCB[f]))
         {
-            LOG_ERROR("DDGIVolumeManager: volume CB create failed");
+            LOG_ERROR("DDGIVolumeManager: volume CB create failed (slot %u)", f);
             return false;
         }
-        res.cbvMapped     = gfx.MapBuffer(res.volumeCB);
-        res.cbvGpuAddress = 0; // backend doesn't expose CB GPU VA directly here;
-                               // the manager will look it up via SetComputeRootCBV
-                               // which the device handles. Keep field for future
-                               // direct-bind use cases.
-        if (res.cbvMapped) std::memset(res.cbvMapped, 0, 256);
+        res.cbvMapped[f]     = gfx.MapBuffer(res.volumeCB[f]);
+        res.cbvGpuAddress[f] = 0; // backend doesn't expose CB GPU VA directly here;
+                                  // the manager will look it up via SetComputeRootCBV
+                                  // which the device handles. Keep field for future
+                                  // direct-bind use cases.
+        if (res.cbvMapped[f]) std::memset(res.cbvMapped[f], 0, 256);
     }
 
     res.probeCountsX = pcx;
@@ -381,8 +396,11 @@ bool DDGIVolumeManager::CreateAtlasesForVolume(IGraphicsDevice& gfx,
 void DDGIVolumeManager::DestroyVolume(IGraphicsDevice& gfx, VolumeResources& res)
 {
     if (!res.allocated) return;
-    if (res.cbvMapped) { gfx.UnmapBuffer(res.volumeCB); res.cbvMapped = nullptr; }
-    if (res.volumeCB.IsValid())            gfx.DestroyBuffer (res.volumeCB);
+    for (uint32_t f = 0; f < kFrameCount; ++f)
+    {
+        if (res.cbvMapped[f])      { gfx.UnmapBuffer(res.volumeCB[f]); res.cbvMapped[f] = nullptr; }
+        if (res.volumeCB[f].IsValid()) gfx.DestroyBuffer(res.volumeCB[f]);
+    }
     if (res.varianceBuffer.IsValid())      gfx.DestroyBuffer (res.varianceBuffer);
     if (res.dispatchArgsBuffer.IsValid())  gfx.DestroyBuffer (res.dispatchArgsBuffer);
     if (res.rayAllocBuffer.IsValid())      gfx.DestroyBuffer (res.rayAllocBuffer);
@@ -503,24 +521,39 @@ void DDGIVolumeManager::FreeUnclaimedSlots(IGraphicsDevice& gfx,
 
 namespace
 {
-// Cheap blue-noise-ish per-frame rotation seed (low-discrepancy on (frame, slot)).
-void GenerateRandomRotation(uint32_t frame, uint32_t slot, float out[9])
+// Per-frame rotation seed for the probe ray set — van der Corput on
+// (frame, slot), amplitude scaled to the Halton point spacing.
+//
+// IMPORTANT — this is INTENTIONALLY uncorrelated frame-to-frame; do NOT
+// "smooth" it into a slow drift. The rotation jitter the relight EMA sees is
+// HIGH frequency (a fresh orientation every frame), which the EMA filters
+// well. A 2026-05-14 attempt to make this a smooth slow drift made the
+// per-frame ray set evolve at LOW frequency — exactly what the EMA passes
+// through — and the whole-scene "breathing" got visibly WORSE. Reverted.
+//
+// AMPLITUDE — the jitter only needs to fill the gaps BETWEEN the fixed Halton
+// directions. The angular gap radius for N directions on a sphere is
+// ≈ sqrt(π / N). The old fixed 0.3 rad (≈17°) was tuned for ~64 rays; at 256
+// rays the gaps are only ≈6.4°, so 17° was ~3× oversized — every frame it
+// swept many rays across radiance discontinuities (sky↔wall edges), injecting
+// per-frame noise that bought no extra coverage and forced a high hysteresis.
+// Scaling kAmp to sqrt(π / raysPerProbe) keeps just-enough dither: more rays →
+// smaller gaps → smaller jitter → less per-frame noise → lower stable
+// hysteresis. Still uncorrelated (high-frequency) — only the amplitude shrank.
+void GenerateRandomRotation(uint32_t frame, uint32_t slot, uint32_t raysPerProbe,
+                            float out[9])
 {
-    // van der Corput (base 2) → x angle, base 3 → y, base 5 → z. The angle
-    // amplitude is deliberately small (≈17° per axis max). Full-range 2π
-    // rotation per frame produced uncorrelated direction sets between frames,
-    // and at the engine's typical 64 rays/probe budget this swamped the EMA's
-    // smoothing capacity (visible wall flicker). Damping to 0.3 rad keeps
-    // consecutive frames highly correlated for a clean default-hysteresis
-    // (0.92) image, while the Halton(2,3) base distribution + low-amplitude
-    // jitter still scans the full sphere within ~30 frames.
     auto vdc = [](uint32_t i, uint32_t base) {
         float r = 0.0f, f = 1.0f / float(base);
         while (i > 0) { r += f * float(i % base); i /= base; f /= float(base); }
         return r;
     };
     const uint32_t k  = frame * 73u + slot * 19u + 1u;
-    constexpr float kAmp = 0.3f; // ≈17° per axis
+    // kAmp ≈ Halton gap radius for raysPerProbe directions, clamped to a sane
+    // band so a degenerate ray count can't make it 0 or absurdly large.
+    float kAmp = std::sqrt(3.14159265f / float(raysPerProbe < 1u ? 1u : raysPerProbe));
+    if (kAmp < 0.05f) kAmp = 0.05f;
+    if (kAmp > 0.35f) kAmp = 0.35f;
     const float    ax = vdc(k, 2) * kAmp;
     const float    ay = vdc(k, 3) * kAmp;
     const float    az = vdc(k, 5) * kAmp;
@@ -551,8 +584,9 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
                              uint32_t volumeCount,
                              uint32_t lightCount)
 {
-    if (!m_volumeBufferMapped) return;
-    auto* gpuDesc = static_cast<VolumeGPUDesc*>(m_volumeBufferMapped);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    if (frameSlot >= kFrameCount || !m_volumeBufferMapped[frameSlot]) return;
+    auto* gpuDesc = static_cast<VolumeGPUDesc*>(m_volumeBufferMapped[frameSlot]);
     std::memset(gpuDesc, 0, kMaxVolumes * sizeof(VolumeGPUDesc));
 
     // Slot-indexed packing: each entry in the volume buffer is at
@@ -571,9 +605,11 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
 
         VolumeResources& res = m_volumes[r.volumeSlot];
 
-        // Advance frame + roll a fresh rotation.
+        // Advance frame + roll a fresh rotation. Amplitude scales to the
+        // ray count (more rays → tighter Halton gaps → smaller dither needed).
         r.frameCounter++;
-        GenerateRandomRotation(r.frameCounter, r.volumeSlot, r.randomRotation);
+        GenerateRandomRotation(r.frameCounter, r.volumeSlot, v.raysPerProbe,
+                               r.randomRotation);
 
         VolumeGPUDesc& d = gpuDesc[r.volumeSlot];
         d.origin       = v.origin;
@@ -615,7 +651,9 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
 
         // Per-volume CB mirrors the same data — the DDGI passes bind only the
         // CB (not the engine-wide buffer) to keep their root sigs simple.
-        if (res.cbvMapped) std::memcpy(res.cbvMapped, &d, sizeof(VolumeGPUDesc));
+        // Write to the current frame's ring slot.
+        if (res.cbvMapped[frameSlot])
+            std::memcpy(res.cbvMapped[frameSlot], &d, sizeof(VolumeGPUDesc));
 
         written++;
     }
@@ -656,10 +694,18 @@ const RHI::GPUBuffer* DDGIVolumeManager::GetProbeSHBuffer(uint32_t s) const
 { return (s < kMaxVolumes && m_volumes[s].allocated) ? &m_volumes[s].probeSHBuffer : nullptr; }
 const RHI::GPUBuffer* DDGIVolumeManager::GetProbeDataBuffer(uint32_t s) const
 { return (s < kMaxVolumes && m_volumes[s].allocated) ? &m_volumes[s].probeDataBuffer : nullptr; }
-uint64_t DDGIVolumeManager::GetVolumeCBVGpuAddress(uint32_t s) const
-{ return s < kMaxVolumes ? m_volumes[s].cbvGpuAddress : 0; }
-const RHI::GPUBuffer* DDGIVolumeManager::GetVolumeCB(uint32_t s) const
-{ return (s < kMaxVolumes && m_volumes[s].allocated) ? &m_volumes[s].volumeCB : nullptr; }
+uint64_t DDGIVolumeManager::GetVolumeCBVGpuAddress(IGraphicsDevice& gfx, uint32_t s) const
+{
+    if (s >= kMaxVolumes) return 0;
+    const uint32_t f = gfx.GetFrameIndex();
+    return (f < kFrameCount) ? m_volumes[s].cbvGpuAddress[f] : 0;
+}
+const RHI::GPUBuffer* DDGIVolumeManager::GetVolumeCB(IGraphicsDevice& gfx, uint32_t s) const
+{
+    if (s >= kMaxVolumes || !m_volumes[s].allocated) return nullptr;
+    const uint32_t f = gfx.GetFrameIndex();
+    return (f < kFrameCount) ? &m_volumes[s].volumeCB[f] : nullptr;
+}
 
 void DDGIVolumeManager::TransitionVolumeAtlases(IGraphicsDevice& gfx,
                                                 RHI::CommandList cmd,
@@ -713,36 +759,90 @@ void DDGIVolumeManager::PromoteAtlasesForGraphicsQueue(IGraphicsDevice& gfx,
     // (PIXEL | NON_PIXEL). Caller MUST have already enforced the cross-queue
     // fence so the prior compute-queue writes are visible to this transition.
     //
-    // Two resources need promoting per slot:
-    //   1. depth atlas (Texture2D R16G16F) — texture barrier.
+    // Three resources promote per slot:
+    //   1. depth atlas (Texture2D R16G16F) — texture barrier, gated on atlas
+    //      state.
     //   2. probe SH buffer (StructuredBuffer<DDGIProbeSH>) — buffer barrier;
     //      DDGIPass leaves it in SH-read state at end-of-frame, which on a
     //      compute queue means NON_PIXEL only.
+    //   3. probeData buffer — same compute-only SH-read state at end of
+    //      Execute; LightingPass samples it via the relocation offset.
     for (uint32_t s = 0; s < kMaxVolumes; ++s)
     {
         VolumeResources& r = m_volumes[s];
         if (!r.allocated) continue;
-        if (!r.atlasInComputeOnlyState) continue; // already in full state
-        // Only attempt promotion when the prior transition actually left the
-        // resources in NON_PIXEL state — the flag captures that.
 
-        if (r.atlasState == AtlasState::SRV)
+        if (r.atlasInComputeOnlyState)
         {
-            RHI::GPUBarrier b = RHI::GPUBarrier::Image(&r.depthAtlas,
-                RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
-                RHI::ResourceState::SHADER_RESOURCE);
-            gfx.PushBarrier(b, graphicsCmd);
+            if (r.atlasState == AtlasState::SRV)
+            {
+                RHI::GPUBarrier b = RHI::GPUBarrier::Image(&r.depthAtlas,
+                    RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
+                    RHI::ResourceState::SHADER_RESOURCE);
+                gfx.PushBarrier(b, graphicsCmd);
+            }
+            r.atlasInComputeOnlyState = false;
         }
 
-        // SH probe buffer — DDGIPass restored it to its "shader-read" state
-        // (kSHReadState) at the end of Execute. On the compute queue that's
-        // NON_PIXEL only; promote to NON_PIXEL | PIXEL for the lighting PS.
-        RHI::GPUBarrier shB = RHI::GPUBarrier::Buffer(&r.probeSHBuffer,
-            RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
-            RHI::ResourceState::SHADER_RESOURCE);
-        gfx.PushBarrier(shB, graphicsCmd);
+        if (r.buffersInComputeOnlyState)
+        {
+            // SH probe buffer — DDGIPass restored it to its "shader-read"
+            // state (kSHReadState) at the end of Execute. On the compute
+            // queue that's NON_PIXEL only; promote to NON_PIXEL | PIXEL
+            // for the lighting PS.
+            RHI::GPUBarrier shB = RHI::GPUBarrier::Buffer(&r.probeSHBuffer,
+                RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
+                RHI::ResourceState::SHADER_RESOURCE);
+            gfx.PushBarrier(shB, graphicsCmd);
 
-        r.atlasInComputeOnlyState = false;
+            // ProbeData buffer — same state cycle as the SH buffer.
+            RHI::GPUBarrier pdB = RHI::GPUBarrier::Buffer(&r.probeDataBuffer,
+                RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
+                RHI::ResourceState::SHADER_RESOURCE);
+            gfx.PushBarrier(pdB, graphicsCmd);
+
+            r.buffersInComputeOnlyState = false;
+        }
+    }
+}
+
+void DDGIVolumeManager::DemoteForComputeQueue(IGraphicsDevice& gfx,
+                                              RHI::CommandList graphicsCmd)
+{
+    // Symmetric inverse of PromoteAtlasesForGraphicsQueue — see header doc.
+    // Gates on the per-resource compute-only-state flags so re-entry is a
+    // no-op (e.g. first frame after Allocate the depth atlas is at UAV state,
+    // not SR, so the atlas barrier is skipped while the buffer barriers fire).
+    for (uint32_t s = 0; s < kMaxVolumes; ++s)
+    {
+        VolumeResources& r = m_volumes[s];
+        if (!r.allocated) continue;
+
+        // Depth atlas: only demote when currently in SRV state with the full
+        // PSR|NPSR mask. UAV state doesn't have PSR, so nothing to do.
+        if (!r.atlasInComputeOnlyState && r.atlasState == AtlasState::SRV)
+        {
+            RHI::GPUBarrier b = RHI::GPUBarrier::Image(&r.depthAtlas,
+                RHI::ResourceState::SHADER_RESOURCE,
+                RHI::ResourceState::SHADER_RESOURCE_COMPUTE);
+            gfx.PushBarrier(b, graphicsCmd);
+            r.atlasInComputeOnlyState = true;
+        }
+
+        if (!r.buffersInComputeOnlyState)
+        {
+            RHI::GPUBarrier shB = RHI::GPUBarrier::Buffer(&r.probeSHBuffer,
+                RHI::ResourceState::SHADER_RESOURCE,
+                RHI::ResourceState::SHADER_RESOURCE_COMPUTE);
+            gfx.PushBarrier(shB, graphicsCmd);
+
+            RHI::GPUBarrier pdB = RHI::GPUBarrier::Buffer(&r.probeDataBuffer,
+                RHI::ResourceState::SHADER_RESOURCE,
+                RHI::ResourceState::SHADER_RESOURCE_COMPUTE);
+            gfx.PushBarrier(pdB, graphicsCmd);
+
+            r.buffersInComputeOnlyState = true;
+        }
     }
 }
 
@@ -764,5 +864,15 @@ uint32_t DDGIVolumeManager::GetDepthAtlasHeight(uint32_t s) const
        ? DepthAtlasHeight(m_volumes[s].probeCountsX,
                           m_volumes[s].probeCountsY * m_volumes[s].probeCountsZ)
        : 0; }
+
+// =============================================================================
+// Per-frame accessors
+// =============================================================================
+
+uint64_t DDGIVolumeManager::GetVolumeBufferSrv(IGraphicsDevice& gfx) const
+{
+    const uint32_t s = gfx.GetFrameIndex();
+    return (s < kFrameCount) ? m_volumeBufferSrv[s] : 0;
+}
 
 } // namespace DDGI

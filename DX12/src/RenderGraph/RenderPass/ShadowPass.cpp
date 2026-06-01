@@ -1,5 +1,6 @@
 #include "RenderGraph/RenderPass/ShadowPass.h"
-#include "ECS/Components.h"         // ShadowCullMode enum
+#include "ECS/Components.h"             // ShadowCullMode enum
+#include "ECS/HierarchyComponents.h"    // ViewBit (Phase 3 per-view filter)
 #include "Graphics/IGraphicsDevice.h"
 #include "Graphics/GraphicsDX12.h"
 #include "Graphics/RenderTypes.h"
@@ -31,9 +32,13 @@ ShadowPass::~ShadowPass()
 {
     if (m_gfxPtr)
     {
-        for (int i = 0; i < kCascadeCount; ++i)
-            if (m_cascadeCBMapped[i])
-                m_gfxPtr->UnmapBuffer(m_cascadeCBs[i]);
+        m_cascadeCBs.Destroy(*m_gfxPtr);
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (m_indirectArgMapped[i])    m_gfxPtr->UnmapBuffer(m_indirectArgBuffer[i]);
+            if (m_indirectArgBuffer[i].IsValid()) m_gfxPtr->DestroyBuffer(m_indirectArgBuffer[i]);
+            m_indirectArgMapped[i] = nullptr;
+        }
         if (m_shadowArray.IsValid())
             m_gfxPtr->DestroyTexture(m_shadowArray);
     }
@@ -134,7 +139,9 @@ void ShadowPass::RenderTerrainShadow(RHI::CommandList cl, int cascadeIdx)
 {
     if (!m_terrainPass || !m_terrainShadowPSO.IsValid())     return;
     if (cascadeIdx < 0 || cascadeIdx >= kCascadeCount)       return;
-    if (!m_cascadeCBs[cascadeIdx].IsValid())                 return;
+    if (!m_gfxPtr)                                           return;
+    const RHI::GPUBuffer& cascadeCBBuf = m_cascadeCBs.CurrentBuffer(*m_gfxPtr);
+    if (!cascadeCBBuf.IsValid())                             return;
     if (!m_terrainParamsCB || !m_terrainParamsCB->IsValid()) return;
 
     const auto& tile = m_terrainPass->GetTileBindings();
@@ -144,8 +151,13 @@ void ShadowPass::RenderTerrainShadow(RHI::CommandList cl, int cascadeIdx)
     cl.BindDescriptorHeaps();
 
     // b1 cascade ShadowPerViewCB (idempotent re-bind in case the regular
-    // draw loop never touched this slot for this cascade).
-    cl.GetDevice().BindConstantBuffer(m_cascadeCBs[cascadeIdx], kShadowPerViewSlot, cl);
+    // draw loop never touched this slot for this cascade). Each cascade
+    // lives at `i * kCascadeCBStride` inside the pooled CB buffer.
+    auto& dx12 = static_cast<GraphicsDX12&>(cl.GetDevice());
+    dx12.BindConstantBufferAtOffset(kShadowPerViewSlot,
+                                    cascadeCBBuf,
+                                    static_cast<uint64_t>(cascadeIdx) * kCascadeCBStride,
+                                    cl);
 
     // b2 TerrainCB. ShadowPass is standalone (not in m_graph), so the
     // graph-published "TerrainParams" lookup via BindCBByName fails here.
@@ -237,39 +249,28 @@ void ShadowPass::Init(IGraphicsDevice& gfx)
     // Total 160 B, padded to 256 B by CB alignment. Terrain.shadow.as.hlsl
     // reads the planes for per-cascade frustum cull; the VS / MS only declare
     // the matrix and ignore the tail bytes.
-    {
-        RHI::GPUBufferDesc desc;
-        desc.size       = (sizeof(XMFLOAT4X4) + 6u * sizeof(XMFLOAT4) + 255u) & ~255u;  // 256-byte aligned CB
-        desc.usage      = RHI::Usage::UPLOAD;
-        desc.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
+    // Cascade CBs share one triple-buffered FrameCB<> pool with 256-byte
+    // slots — bound via BindConstantBufferAtOffset(cascade * kCascadeCBStride).
+    if (!m_cascadeCBs.Create(gfx, "ShadowPass.CascadeCBs"))
+        LOG_ERROR("ShadowPass: cascade CB pool creation failed");
 
-        for (int i = 0; i < kCascadeCount; ++i)
-        {
-            if (!gfx.CreateBuffer(desc, m_cascadeCBs[i]))
-            {
-                LOG_ERROR("ShadowPass: cascade %d CB creation failed", i);
-                continue;
-            }
-            m_cascadeCBMapped[i] = gfx.MapBuffer(m_cascadeCBs[i]);
-            if (!m_cascadeCBMapped[i])
-                LOG_ERROR("ShadowPass: cascade %d CB map failed", i);
-        }
-    }
-
-    // ---- Create ExecuteIndirect arg buffer (UPLOAD, persistent map) ----------
+    // ---- Create ExecuteIndirect arg buffer (UPLOAD, triple-buffered ring) ----
     {
         RHI::GPUBufferDesc desc;
         desc.size       = static_cast<uint64_t>(kMaxIndirectCommands) * sizeof(IndirectDrawCommand);
         desc.stride     = sizeof(IndirectDrawCommand);
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::NONE;
-        if (gfx.CreateBuffer(desc, m_indirectArgBuffer))
-            m_indirectArgMapped = gfx.MapBuffer(m_indirectArgBuffer);
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(desc, m_indirectArgBuffer[i]))
+                m_indirectArgMapped[i] = gfx.MapBuffer(m_indirectArgBuffer[i]);
+        }
     }
 
     LOG_SUCCESS("ShadowPass: initialized — Texture2DArray %ux%ux%d, indirect=%s",
         kShadowMapSize, kShadowMapSize, kCascadeCount,
-        m_indirectArgMapped ? "YES" : "NO");
+        m_indirectArgMapped[0] ? "YES" : "NO");
 }
 
 // ---------------------------------------------------------------------------
@@ -348,18 +349,18 @@ PSODesc ShadowPass::BuildPSODesc(PermutationKey perm, RHI::CullMode cullMode) co
 // shadow.as.hlsl reads the plane block for per-cascade culling.
 void ShadowPass::UploadCascadeCBs()
 {
-    if (!m_sys) return;
+    if (!m_sys || !m_gfxPtr) return;
+    auto* pool = m_cascadeCBs.Current(*m_gfxPtr);
+    if (!pool) return;
     const DirectX::XMFLOAT4X4* src = m_sys->CascadeMatricesForPass();
     for (int i = 0; i < kCascadeCount; ++i)
     {
-        if (!m_cascadeCBMapped[i]) continue;
-
         // ---- Matrix ----
         XMMATRIX mat = XMLoadFloat4x4(&src[i]);
         XMFLOAT4X4 transposed;
         XMStoreFloat4x4(&transposed, XMMatrixTranspose(mat));
 
-        uint8_t* dst = static_cast<uint8_t*>(m_cascadeCBMapped[i]);
+        uint8_t* dst = pool->slots + i * kCascadeCBStride;
         std::memcpy(dst, &transposed, sizeof(transposed));
 
         // ---- Frustum planes (from the untransposed VP, Gribb-Hartmann) ----
@@ -413,7 +414,8 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
             RHI::ResourceState::DEPTHSTENCIL));
 
     const uint64_t bindlessHandle = cl.GetBindlessTableHandle();
-    const bool useIndirect = (m_indirectArgMapped != nullptr);
+    const uint32_t frameSlot      = gfx.GetFrameIndex();
+    const bool useIndirect = (m_indirectArgMapped[frameSlot] != nullptr);
 
     // ---- 4-group classification --------------------------------------------
     // Alpha-test is handled as a single bucket (shader permutation differs,
@@ -435,6 +437,12 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
 
     auto classify = [](const DrawPacket& dp) -> int {
         if (!dp.castShadow) return GRP_SKIP;
+        // Phase 3: drop entities whose viewMask excludes every shadow cascade.
+        // Per-cascade filtering would require splitting the indirect buffer per
+        // cascade; the current architecture renders all cascades from one bucket,
+        // so we filter on "any cascade requested". A future per-cascade pass can
+        // bit-test ViewBit::ShadowCascadeN with the cascade index.
+        if ((dp.viewMask & ViewBit::ShadowAny) == 0) return GRP_SKIP;
         // Transparent (Alpha/Premul/Additive/Multiply) packets reach this pass only
         // because foliage opts in via alphaRef. Skip the rest — additive sparks /
         // multiply decals would render solid silhouettes otherwise.
@@ -455,7 +463,7 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
 
     if (useIndirect)
     {
-        auto* args = static_cast<IndirectDrawCommand*>(m_indirectArgMapped);
+        auto* args = static_cast<IndirectDrawCommand*>(m_indirectArgMapped[frameSlot]);
 
         // Pass 1: count per group (SKIP bucket ignored).
         auto countList = [&](DrawList list) {
@@ -522,10 +530,10 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
     groupPSO[GRP_ALPHATEST].perm.Set(PermutationKey::ALPHA_TEST, true);
 
     // ---- Render each cascade -----------------------------------------------
+    const RHI::GPUBuffer& cascadeCBBuf = m_cascadeCBs.CurrentBuffer(gfx);
+    if (!cascadeCBBuf.IsValid()) return cl;
     for (int cascade = 0; cascade < kCascadeCount; ++cascade)
     {
-        if (!m_cascadeCBs[cascade].IsValid()) continue;
-
         gfx.ClearDepthStencilSlice(m_shadowArray, cascade, 0.0f, 0, cl);  // reversed Z
         gfx.SetDepthStencilSlice(m_shadowArray, cascade, cl);
 
@@ -555,7 +563,13 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
             cl.BindBufferSRVByName(kMeshDescSlot,    "MeshDescriptors");
             if (bindlessHandle)
                 cl.BindDescriptorTableHandle(kBindlessSlot, bindlessHandle);
-            cl.GetDevice().BindConstantBuffer(m_cascadeCBs[cascade], kShadowPerViewSlot, cl);
+            {
+                auto& dx12CB = static_cast<GraphicsDX12&>(cl.GetDevice());
+                dx12CB.BindConstantBufferAtOffset(kShadowPerViewSlot,
+                                                  cascadeCBBuf,
+                                                  static_cast<uint64_t>(cascade) * kCascadeCBStride,
+                                                  cl);
+            }
 
             // ALPHA_TEST PS reads MaterialBuffer (alphaRef) + bindless g_AllTextures[]
             // (foliage albedo). Skip these binds on the opaque groups — they don't
@@ -578,7 +592,7 @@ RHI::CommandList ShadowPass::Execute(RHI::CommandList cl)
 
             if (useIndirect)
             {
-                gfx.ExecuteIndirectDraw(m_indirectArgBuffer,
+                gfx.ExecuteIndirectDraw(m_indirectArgBuffer[frameSlot],
                                         groupOffsets[g],
                                         groupCounts[g],
                                         nullptr, 0, cl);

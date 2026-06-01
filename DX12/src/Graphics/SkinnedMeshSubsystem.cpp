@@ -18,18 +18,27 @@ void SkinnedMeshSubsystem::Init(IGraphicsDevice& gfx, MeshManager& meshMgr)
 
     // Register every frame's pos/nrm slots in the bindless table. Each frame
     // holds its own buffer so the GPU can read frame N-1 while the CPU writes
-    // frame N.
+    // frame N. Use the PERSISTENT (engine-lifetime) register path: the vertex
+    // ring buffers live for the entire app lifetime, so their bindless slot
+    // index must survive every world reload. Without this, MeshDescriptorHeap::
+    // OnWorldClear would invalidate the slot and per-frame UpdateMeshThisFrame
+    // patches would point posBindlessIdx[] at whatever the new world's mesh
+    // VB happened to land at — animated skinned meshes would then sample
+    // Bistro's vertex bytes as skinned positions (the disappearing-character
+    // bug).
     auto& descHeap = meshMgr.GetDescriptorHeap();
     for (uint32_t i = 0; i < SkinnedVertexRing::kFramesInFlight; ++i)
     {
         m_vertRing.BeginFrame(i);
-        m_vertRing.posBindlessIdx[i] = descHeap.RegisterBuffer(m_vertRing.GetPosBuffer());
-        m_vertRing.nrmBindlessIdx[i] = descHeap.RegisterBuffer(m_vertRing.GetNrmBuffer());
+        m_vertRing.posBindlessIdx[i] = descHeap.RegisterPersistentBuffer(m_vertRing.GetPosBuffer());
+        m_vertRing.nrmBindlessIdx[i] = descHeap.RegisterPersistentBuffer(m_vertRing.GetNrmBuffer());
     }
     m_vertRing.BeginFrame(0);
 
     m_animSystem         = std::make_unique<AnimationSystem>(m_skeletonRegistry, m_clipLibrary, m_morphClipLibrary);
     m_ikSystem           = std::make_unique<IKSystem>(*m_animSystem, m_skeletonRegistry);
+    m_footIKSystem       = std::make_unique<FootIKTargetSystem>(*m_animSystem, m_skeletonRegistry);
+    m_characterStateSystem = std::make_unique<CharacterStateSystem>(m_skeletonRegistry, nullptr);
     m_chainPhysicsSystem = std::make_unique<ChainPhysicsSystem>(*m_animSystem, m_skeletonRegistry);
     m_localToWorldSystem = std::make_unique<LocalToWorldSystem>(*m_animSystem, m_skeletonRegistry);
     m_socketSystem       = std::make_unique<SocketSystem>(m_poseBuffer, m_skeletonRegistry);
@@ -44,6 +53,11 @@ void SkinnedMeshSubsystem::Init(IGraphicsDevice& gfx, MeshManager& meshMgr)
 
     m_initialised = true;
     LOG_SUCCESS("SkinnedMeshSubsystem: initialised");
+}
+
+void SkinnedMeshSubsystem::SetAnimationClipSystem(Resource::AnimationClipSystem* cs)
+{
+    if (m_characterStateSystem) m_characterStateSystem->SetClipSystem(cs);
 }
 
 void SkinnedMeshSubsystem::OnWorldClear()
@@ -165,6 +179,8 @@ void SkinnedMeshSubsystem::BuildSkinJobs(World& world, MeshManager& meshMgr)
 
                 if (morphClip)
                 {
+                    // Clip mode: weights[] is indexed by clip channel; remap to
+                    // mesh target slots via channel-name ↔ target-name match.
                     std::unordered_map<std::string, uint32_t> clipNameMap;
                     clipNameMap.reserve(morphClip->morphCount);
                     for (uint32_t ci = 0; ci < morphClip->morphCount; ++ci)
@@ -176,6 +192,16 @@ void SkinnedMeshSubsystem::BuildSkinJobs(World& world, MeshManager& meshMgr)
                         if (it != clipNameMap.end() && it->second < morph->count)
                             job.morphWeights[ti] = morph->weights[it->second];
                     }
+                }
+                else
+                {
+                    // Manual mode (editor / scripted): weights[] is already
+                    // indexed by mesh morph-target slot; copy straight through.
+                    const uint32_t n = (std::min)(mesh->morphTargetCount,
+                                                  (std::min)(morph->count,
+                                                             static_cast<uint32_t>(MorphComponent::MAX)));
+                    for (uint32_t ti = 0; ti < n; ++ti)
+                        job.morphWeights[ti] = morph->weights[ti];
                 }
             }
         }
@@ -200,7 +226,13 @@ void SkinnedMeshSubsystem::BuildSkinJobs(World& world, MeshManager& meshMgr)
             patchedDesc.normal.format        = static_cast<uint32_t>(RHI::VertexFormat::Float3);
             patchedDesc.vertexCount          = mesh->vertexCount;
 
-            meshMgr.GetDescriptorHeap().UpdateMesh(descSlot, patchedDesc);
+            // Per-frame patch: `position.bufferIndex` is `posBindlessIdx[currentFrameSlot]`,
+            // which only stays valid for the current frame.  Use UpdateMeshThisFrame
+            // so the write goes ONLY into the active GPU slot — without this, the
+            // shared MeshDescriptor buffer was raced by the next frame's CPU write
+            // while late passes (e.g. OutlinePass) were still reading it, causing
+            // the inverted-hull outline to trail the GBuffer body during motion.
+            meshMgr.GetDescriptorHeap().UpdateMeshThisFrame(descSlot, patchedDesc);
         }
     }
 
@@ -477,6 +509,20 @@ bool SkinnedMeshSubsystem::RegisterSkinnedMeshFull(IGraphicsDevice& gfx,
             sc.boneCount  = skel.boneCount;
             world.AddComponent<SkeletonComponent>(rootEnt, sc);
             world.AddComponent<AnimationComponent>(rootEnt, AnimationComponent{});
+
+            // Auto-attach a MorphComponent when the skeleton ships morph targets,
+            // so the editor inspector can author weights manually without first
+            // needing to drop a .ianim morph clip onto the character.
+            if (skel.morphTargetCount > 0 && !world.HasComponent<MorphComponent>(rootEnt))
+            {
+                MorphComponent mc{};
+                mc.primaryMorphClip = kInvalidAnimHandle; // manual mode
+                mc.count = (std::min)(skel.morphTargetCount,
+                                       static_cast<uint32_t>(MorphComponent::MAX));
+                world.AddComponent<MorphComponent>(rootEnt, mc);
+                LOG_INFO("SkinnedMeshSubsystem: MorphComponent auto-attached to root %u (%u targets)",
+                         rootEnt, mc.count);
+            }
 
             bool hasPhysBones = false;
             for (uint32_t b = 0; b < skel.boneCount && !hasPhysBones; ++b)

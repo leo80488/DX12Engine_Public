@@ -21,6 +21,7 @@
 
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
+#include "Graphics/FrameCB.h"
 #include "ECS/Components.h"
 
 #include <DirectXMath.h>
@@ -160,17 +161,17 @@ private:
     RHI::PipelineState m_applyPSO;
 
     // GPU buffers
-    RHI::GPUBuffer m_decalBuffer;     // StructuredBuffer<GPUDecal>          — UPLOAD, mapped
-    RHI::GPUBuffer m_decalIndexBuf;   // RWStructuredBuffer<uint>            — DEFAULT
-    RHI::GPUBuffer m_decalGridBuf;    // RWStructuredBuffer<DecalGridEntry>  — DEFAULT
-    RHI::GPUBuffer m_cullCB;          // UPLOAD, mapped
-    RHI::GPUBuffer m_applyCB;         // UPLOAD, mapped
+    // Decal upload — triple-buffered manual ring; struct UPLOAD heap, SR-bound.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_decalBuffer[kFrameCount];     // StructuredBuffer<GPUDecal>          — UPLOAD, mapped
+    RHI::GPUBuffer m_decalIndexBuf;                // RWStructuredBuffer<uint>            — DEFAULT
+    RHI::GPUBuffer m_decalGridBuf;                 // RWStructuredBuffer<DecalGridEntry>  — DEFAULT
+    FrameCB<DecalCullCB>  m_cullCB;                // UPLOAD CB, triple-buffered
+    FrameCB<DecalApplyCB> m_applyCB;               // UPLOAD CB, triple-buffered
 
-    void* m_decalMapped   = nullptr;
-    void* m_cullCBMapped  = nullptr;
-    void* m_applyCBMapped = nullptr;
+    void*    m_decalMapped[kFrameCount]  = {};
+    uint64_t m_decalsSRV[kFrameCount]    = {};
 
-    uint64_t m_decalsSRV      = 0;
     uint64_t m_decalIndexSRV  = 0;
     uint64_t m_decalIndexUAV  = 0;
     uint64_t m_decalGridSRV   = 0;

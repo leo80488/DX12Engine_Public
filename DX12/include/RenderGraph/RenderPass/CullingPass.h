@@ -8,6 +8,7 @@
 
 #include "Graphics/GraphicsStruct.h"
 #include "Graphics/ShaderLibrary.h"
+#include "Graphics/FrameCB.h"
 #include <DirectXMath.h>
 
 class IGraphicsDevice;
@@ -50,9 +51,8 @@ private:
     };                                 // total: 176 bytes
     static_assert(sizeof(CullingCB) % 16 == 0);
 
-    CullingCB       m_cbData{};
-    RHI::GPUBuffer  m_cb;
-    void*           m_cbMapped = nullptr;
+    CullingCB           m_cbData{};
+    FrameCB<CullingCB>  m_cb;
 
     DirectX::XMFLOAT4X4 m_viewProj{};
     uint32_t m_instanceCount = 0;

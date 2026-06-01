@@ -25,6 +25,7 @@
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include "Graphics/IndirectDrawCommand.h"
 
 #ifndef NOMINMAX
@@ -92,9 +93,16 @@ private:
     // accessed via IGraphicsDevice::SetDepthStencilSlice / ClearDepthStencilSlice.
     RHI::Texture m_shadowArray;
 
-    // Per-cascade constant buffers (UPLOAD heap, layout = float4x4 shadowViewProj).
-    RHI::GPUBuffer m_cascadeCBs[kCascadeCount];
-    void*          m_cascadeCBMapped[kCascadeCount]{};
+    // Per-cascade constant buffers (UPLOAD heap, layout = float4x4
+    // shadowViewProj + 6 frustum planes). The four cascades live as 256-byte-
+    // aligned slots inside one FrameCB pool. The pool is triple-buffered so
+    // CPU writes don't race the GPU draws still consuming last frame's data.
+    static constexpr uint32_t kCascadeCBStride = 256; // D3D12 CBV alignment
+    struct CascadeCBPool
+    {
+        uint8_t slots[kCascadeCount * kCascadeCBStride];
+    };
+    FrameCB<CascadeCBPool> m_cascadeCBs;
 
     // Source of cascade matrices. Non-owning; lifetime managed by Renderer.
     const ShadowSystem* m_sys = nullptr;
@@ -110,10 +118,13 @@ private:
     // >20 k shadow casters and under-sizing here makes the write loop cap
     // at 512 while groupCounts track the full count, so ExecuteIndirect
     // reads past the buffer tail ("argument resource too small").
-    // 32 k × 32 B = 1 MB per buffer — trivial memory cost.
+    // 32 k × 32 B = 1 MB per buffer — trivial memory cost. Triple-buffered
+    // manual ring (UPLOAD heap, no CB bind flag → can't use FrameCB<>).
+    // 3 == GraphicsDX12::FrameCount.
     static constexpr uint32_t kMaxIndirectCommands = 32768;
-    RHI::GPUBuffer m_indirectArgBuffer;
-    void*          m_indirectArgMapped = nullptr;
+    static constexpr uint32_t kFrameCount          = 3;
+    RHI::GPUBuffer m_indirectArgBuffer[kFrameCount];
+    void*          m_indirectArgMapped[kFrameCount] = {};
 
     // ---- Terrain shadow casting (mesh-shader path) -----------------------
     // The terrain is dispatched per-cascade after the regular DrawPacket

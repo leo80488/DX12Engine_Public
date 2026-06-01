@@ -9,31 +9,6 @@ static constexpr uint32_t kCBSlot = 0;
 static constexpr uint32_t kSRV0   = 1;  // t0 space2 — depth
 static constexpr uint32_t kUAV0   = 4;  // u0 space2 — output flare
 
-struct LensFlareCB
-{
-    uint32_t dstWidth;
-    uint32_t dstHeight;
-    uint32_t srcDepthWidth;
-    uint32_t srcDepthHeight;
-
-    uint32_t enabled;
-    float    intensity;
-    float    sunBehind;
-    float    chromaticOffset;
-
-    float    sunUV[2];
-    float    haloWidth;
-    float    streakLength;
-
-    float    sunColor[3];
-    float    ghostDispersal;
-
-    uint32_t ghostCount;
-    float    streakWidth;
-    float    occlusionRadius;
-    float    _pad0;
-};
-
 // ---------------------------------------------------------------------------
 void LensFlarePass::Init(IGraphicsDevice& gfx)
 {
@@ -51,12 +26,7 @@ void LensFlarePass::Init(IGraphicsDevice& gfx)
     if (!gfx.CreatePipelineState(d, m_pso))
     { LOG_ERROR("LensFlarePass: PSO failed"); return; }
 
-    RHI::GPUBufferDesc bd{};
-    bd.size       = (sizeof(LensFlareCB) + 255) & ~255u;
-    bd.usage      = RHI::Usage::UPLOAD;
-    bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(bd, m_cb))
-        m_cbMapped = gfx.MapBuffer(m_cb);
+    m_cb.Create(gfx, "LensFlare.CB");
 
     LOG_SUCCESS("LensFlarePass: initialized");
 }
@@ -126,9 +96,9 @@ RHI::CommandList LensFlarePass::Execute(RHI::CommandList cl)
     }
 
     // Upload CB.
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
-        LensFlareCB cb{};
+        LensFlarePass::LensFlareCB cb{};
         cb.dstWidth        = m_texW;
         cb.dstHeight       = m_texH;
         cb.srcDepthWidth   = m_depthW ? m_depthW : m_vpW;
@@ -148,11 +118,11 @@ RHI::CommandList LensFlarePass::Execute(RHI::CommandList cl)
         cb.ghostCount      = (m_ghostCount > 8u) ? 8u : m_ghostCount;
         cb.streakWidth     = 0.014f;
         cb.occlusionRadius = 0.006f;
-        std::memcpy(m_cbMapped, &cb, sizeof(cb));
+        *slot = cb;
     }
 
     gfx.BindComputePipelineState(m_pso, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
     if (m_depthSrv) gfx.SetComputeDescriptorTable(kSRV0, m_depthSrv, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_texture), cl);
 

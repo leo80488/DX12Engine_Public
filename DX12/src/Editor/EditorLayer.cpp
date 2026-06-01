@@ -1,7 +1,11 @@
 #include "Editor/EditorLayer.h"
+#include "Editor/EntityRefPicker.h"
 #include "Editor/FontAwesomeIcons.h"
 #include "Reflection/ComponentReflection.h" // Reflect::Descriptor<T> specializations for RegisterReflectedComponent
+#include "ECS/GuidComponent.h"
+#include "ECS/GuidRegistry.h"
 #include "AI/AIComponents.h"
+#include "AI/AISystem.h"   // m_aiSys->AcquireTree from the AIComponent inspector
 #include "AI/BTAsset.h"
 #include "AI/BTNode.h"
 #include "ECS/Components.h"           // Transform, MaterialComponent
@@ -12,16 +16,26 @@
 #include "ECS/TerrainComponent.h"     // TerrainComponent + TerrainLayer
 #include "ECS/BillboardComponent.h"   // BillboardComponent
 #include "ECS/ParticleComponent.h"    // ParticleEmitterComponent
+#include "ECS/VideoComponent.h"       // VideoComponent (inspector postDraw)
+#include "ECS/VideoHelpers.h"         // Video::Play/Pause/Stop/Restart/Seek
 #include "ECS/TrailComponent.h"       // TrailComponent
 #include "ECS/BeamComponent.h"        // BeamComponent (procedural-tube heavy beam)
 #include "Graphics/TracerSystem.h"    // Renderer::GetTracerSystem() for Debug menu test spawn
 #include "ECS/ReflectionProbeComponent.h"
 #include "ECS/TagComponent.h"
 #include "Scene/MeshSpawner.h"
-#include "Resource/WorldSerializer.h"  // SaveWorld / LoadWorld
+#include "Resource/SceneSerializer.h"  // SaveScene / LoadScene
 #include "Resource/PostProcessConfig.h" // Save/Load/Apply post-process config (.ippc)
 #include "ECS/HierarchyComponents.h"  // LocalTransform, GlobalTransform, Parent, Children, etc.
 #include "ECS/PhysicsComponents.h"    // RigidBodyComponent, ColliderComponent
+#include "Tools/CollisionMeshBaker.h" // Bake render meshes into combined .meshlib
+#include "Resource/MeshLibrary.h"     // Load baked meshlib for in-world preview swap
+#include "System/TaskSystem.h"        // Worker count for the bake popup
+#include "Physics/PhysicsSystem.h"    // InvalidateMeshShapeCache after re-baking colliders
+#include "Nav/NavMeshSystem.h"        // Build NavMesh from world colliders
+#include "Nav/NavComponents.h"        // NavAgentComponent (reflection-registered)
+#include "ECS/AIIntentComponent.h"    // AIIntentComponent (reflection-registered)
+#include "ECS/PerceptionComponent.h"  // PerceptionComponent (reflection-registered)
 #include "Scene/Ray.h"
 #include "Scene/SceneInstanceLoader.h"
 #include "Graphics/Renderer.h"
@@ -34,6 +48,8 @@
 #include "RenderGraph/RenderPass/VolumetricFogPass.h"
 #include "RenderGraph/RenderPass/AutoExposurePass.h"
 #include "RenderGraph/RenderPass/TAAPass.h"
+#include "RenderGraph/RenderPass/FXAAPass.h"
+#include "RenderGraph/RenderPass/OutlinePass.h"
 #include "RenderGraph/RenderPass/XeGTAOPass.h"
 #include "RenderGraph/RenderPass/SSRPass.h"
 #include "RenderGraph/RenderPass/CASPass.h"
@@ -64,15 +80,20 @@
 #include "Resource/VrmImporter.h"
 #include "Resource/AnimationImporter.h"
 #include "Resource/AnimationClipSystem.h"
+#include "Resource/AnimationResource.h"
+#include "Resource/AnimationSerializer.h"
 #include "Resource/VmdImporter.h"
 #include "Audio/AudioImporter.h"
 #include "ECS/AnimationComponents.h"
+#include "ECS/NotifyTypes.h"
+#include "Editor/NotifyEditorCategoryDrawers.h"
 #include "ECS/FollowComponents.h"
 #include "ECS/SkyboxComponent.h"
 #include "ECS/ReflectionProbeComponent.h"
 #include "ECS/DDGIComponents.h"
 #include "Physics/ChainPhysicsSystem.h"
 #include "Scripting/ScriptComponent.h"
+#include "Scripting/ScriptSystem.h"     // exposed-var schema + live push
 #include "Math/MathUtils.h"
 #include "Graphics/IGraphicsDevice.h"
 #include "Graphics/GraphicsDX12.h"
@@ -117,6 +138,14 @@ namespace
     const char* kWindowViewport  = "Viewport";
     const char* kWindowInspector = "Inspector";
     const char* kWindowResource  = "Resource";
+
+    // Set by Tools > Bake Collision Meshes... menu item; consumed by
+    // OnUIRender after EndMenuBar to open the modal popup at the correct
+    // ID stack level (modals can't be opened from inside BeginMenuBar).
+    bool g_bakeCollisionOpenRequest = false;
+
+    // Same pattern for Tools > Bake NavMesh...
+    bool g_bakeNavMeshOpenRequest = false;
 
     // Fwd-decl: definition lives in the entity-picker namespace below; Material inspector calls it before that.
     bool DrawTextureSlotWidget(const char* label, MaterialComponent::TextureMap& slot);
@@ -228,6 +257,11 @@ namespace
     Entity s_pendingCreateChild  = NullEntity;
     Entity s_pendingDuplicate    = NullEntity;
     Entity s_pendingPrefabSave   = NullEntity;
+    Entity s_pendingWrapVisual   = NullEntity;       // context-menu → wrap visual into child
+    // Drag-drop reparent. child == NullEntity means "no pending"; newParent
+    // == NullEntity means "drop into root (unparent)".
+    struct PendingReparent { Entity child = NullEntity; Entity newParent = NullEntity; };
+    PendingReparent s_pendingReparent;
 
     // ---- Dynamic hierarchy view (DesignMd/ecs_flat_hierarchical_editor_design.md §3) ----
     //
@@ -363,7 +397,7 @@ namespace
             ser.serialize(*world, src, ss);
             const std::string line = ss.str();
 
-            // Format: "  Tag: key=val key=val\n" (mirrors WorldSerializer parser)
+            // Format: "  Tag: key=val key=val\n" (mirrors SceneSerializer parser)
             const auto colonPos = line.find(':');
             if (colonPos == std::string::npos) continue;
             size_t start = colonPos + 1;
@@ -406,11 +440,128 @@ namespace
         return dst;
     }
 
+    // Cycle check for drag-drop: dropping `child` onto `newParent` would form
+    // a cycle if `child` is itself an ancestor of `newParent`. Walks up the
+    // Parent chain with a hard depth cap so a degenerate ECS state doesn't
+    // hang the editor.
+    bool WouldCreateCycle(World* world, Entity child, Entity newParent)
+    {
+        Entity cur = newParent;
+        for (int hops = 0; hops < 4096 && cur != NullEntity; ++hops)
+        {
+            if (cur == child) return true;
+            const Parent* p = world->GetComponent<Parent>(cur);
+            cur = p ? p->entity : NullEntity;
+        }
+        return false;
+    }
+
+    // Move a component value from src → dst. Captures by value first so we
+    // never dereference a pointer that AddComponent could relocate via pool
+    // growth. Returns true when a move happened.
+    template <typename T>
+    bool MoveComponentBetween(World* world, Entity src, Entity dst)
+    {
+        T* p = world->GetComponent<T>(src);
+        if (!p) return false;
+        T value = *p;
+        world->RemoveComponent<T>(src);
+        world->AddComponent<T>(dst, std::move(value));
+        return true;
+    }
+
+    // Reparent `child` under `newParent` (or detach when newParent ==
+    // NullEntity) while preserving the child's world transform. The
+    // LocalTransform is recomputed so child.GlobalTransform on the next
+    // Propagate matches its current world pose: newLT = childGT * inv(newParentGT).
+    void ReparentEntity(World* world, Entity child, Entity newParent)
+    {
+        using namespace DirectX;
+
+        // 1. Recompute LocalTransform to preserve world pose.
+        const GlobalTransform* childGT = world->GetComponent<GlobalTransform>(child);
+        LocalTransform*        lt      = world->GetComponent<LocalTransform>(child);
+        if (childGT && lt)
+        {
+            XMMATRIX worldM = XMLoadFloat4x4(&childGT->matrix);
+            XMMATRIX newLocalM;
+            if (newParent == NullEntity)
+            {
+                newLocalM = worldM; // root — local == world
+            }
+            else if (const GlobalTransform* pGT =
+                         world->GetComponent<GlobalTransform>(newParent))
+            {
+                XMVECTOR det;
+                XMMATRIX pInv = XMMatrixInverse(&det, XMLoadFloat4x4(&pGT->matrix));
+                // Degenerate parent matrix (zero-scale, etc.) — fall back to
+                // keeping the current LT, which is at least valid even if it
+                // visually snaps the child.
+                if (XMVectorGetX(det) == 0.0f) newLocalM = XMLoadFloat4x4(&childGT->matrix);
+                else                           newLocalM = XMMatrixMultiply(worldM, pInv);
+            }
+            else
+            {
+                newLocalM = worldM;
+            }
+            XMVECTOR t, r, s;
+            if (XMMatrixDecompose(&s, &r, &t, newLocalM))
+            {
+                XMStoreFloat3(&lt->translation, t);
+                XMStoreFloat4(&lt->rotation,    r);
+                XMStoreFloat3(&lt->scale,       s);
+            }
+        }
+
+        // 2. Detach from old parent's Children list.
+        Parent* oldP = world->GetComponent<Parent>(child);
+        const Entity oldParent = oldP ? oldP->entity : NullEntity;
+        if (oldParent != NullEntity)
+        {
+            if (Children* oldCh = world->GetComponent<Children>(oldParent))
+            {
+                auto& v = oldCh->entities;
+                v.erase(std::remove(v.begin(), v.end(), child), v.end());
+            }
+        }
+
+        // 3. Write new Parent or remove if reparenting to root.
+        if (newParent == NullEntity)
+        {
+            if (oldP) world->RemoveComponent<Parent>(child);
+        }
+        else
+        {
+            if (oldP) oldP->entity = newParent;
+            else      world->AddComponent<Parent>(child, Parent{ newParent });
+
+            // 4. Insert into new parent's Children list.
+            if (Children* newCh = world->GetComponent<Children>(newParent))
+            {
+                newCh->entities.push_back(child);
+            }
+            else
+            {
+                Children c; c.entities.push_back(child);
+                world->AddComponent<Children>(newParent, std::move(c));
+            }
+        }
+    }
+
     // Recursive tree node draw helper for the Hierarchy panel. Walks the
     // logical-children map (Parent/Children + Follow* edges) rather than
     // raw Children component, so entities that follow a target appear under
     // that target visually.
-    void DrawEntityTree(World* world, Entity e, Entity& selectedEntity,
+    //
+    // Two-click selection: hierarchyHighlight tracks the row that draws the
+    // ImGuiTreeNodeFlags_Selected bar. Clicking a row that ISN'T currently
+    // highlighted just moves the highlight (Inspector content stays put —
+    // the user can now drag this entity onto an Inspector field). Clicking
+    // the already-highlighted row promotes it to selectedEntity (which the
+    // Inspector reads). See EditorLayer.h for the rationale.
+    void DrawEntityTree(World* world, Entity e,
+                        Entity& selectedEntity,
+                        Entity& hierarchyHighlight,
                         const HierarchyMap& hmap)
     {
         if (!world->IsAlive(e)) return;
@@ -433,7 +584,10 @@ namespace
             ImGuiTreeNodeFlags_OpenOnArrow  |
             ImGuiTreeNodeFlags_SpanAvailWidth;
         if (!hasChildren)  flags |= ImGuiTreeNodeFlags_Leaf;
-        if (selectedEntity == e) flags |= ImGuiTreeNodeFlags_Selected;
+        // ImGui's Selected bar follows the Hierarchy highlight (the first-
+        // click selection). The Inspector content still keys off
+        // selectedEntity, which only changes on second-click promote.
+        if (hierarchyHighlight == e) flags |= ImGuiTreeNodeFlags_Selected;
 
         ImGui::PushID(static_cast<int>(e));
 
@@ -469,17 +623,56 @@ namespace
         {
             open = ImGui::TreeNodeEx("##node", flags, "%s", name.c_str());
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
-                selectedEntity = e;
-
-            // Double-click starts inline rename.
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             {
-                s_renamingEntity = e;
-                strncpy_s(s_renameBuffer, sizeof(s_renameBuffer), name.c_str(), _TRUNCATE);
-
-                s_renameBuffer[sizeof(s_renameBuffer) - 1] = '\0';
-                ImGui::SetKeyboardFocusHere(-1);  // next InputText will grab focus
+                if (hierarchyHighlight == e)
+                {
+                    // Second click on the already-highlighted row —
+                    // promote to Inspector. The OnUIRender frame-start
+                    // sync will mirror this back into m_lastSeen on the
+                    // next frame, so no further state needed here.
+                    selectedEntity = e;
+                }
+                hierarchyHighlight = e;
             }
+
+            // Drag-drop source: the tree node ships its Entity id under the
+            // generic "ENTITY" payload type. Two distinct targets currently
+            // consume it: another tree node / the root drop zone (treats it
+            // as a reparent), and AttachmentRef fields in the Inspector
+            // (treats it as a ref bind via Editor::DrawAttachmentRef).
+            // Reparent is deferred via s_pendingReparent — mutating
+            // Parent/Children during the traversal would invalidate the
+            // iteration.
+            if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None))
+            {
+                ImGui::SetDragDropPayload("ENTITY", &e, sizeof(Entity));
+                ImGui::Text("Entity \"%s\"", name.c_str());
+                ImGui::EndDragDropSource();
+            }
+            // Drag-drop target: accept onto this entity to make it the new
+            // parent. Cycle check prevents dropping a parent into its own
+            // descendant.
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* payload =
+                        ImGui::AcceptDragDropPayload("ENTITY"))
+                {
+                    const Entity dragged = *static_cast<const Entity*>(payload->Data);
+                    if (dragged != e && !WouldCreateCycle(world, dragged, e))
+                    {
+                        s_pendingReparent.child     = dragged;
+                        s_pendingReparent.newParent = e;
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            // Rename is right-click → context menu → Rename only. Double-
+            // click is intentionally NOT bound: it collided with the
+            // two-click "first-click select, second-click promote to
+            // Inspector" flow (and made it impossible to deliberately
+            // re-click an entity to open it in Inspector without entering
+            // rename mode by accident).
 
             // Right-click context menu
             if (ImGui::BeginPopupContextItem("##entity_ctx"))
@@ -493,6 +686,20 @@ namespace
                 }
                 if (ImGui::MenuItem("Create Child"))
                     s_pendingCreateChild = e;
+                if (ImGui::MenuItem("Wrap Visual as Child",
+                                    nullptr, false,
+                                    world->HasComponent<MeshHandle>(e)
+                                 || world->HasComponent<MeshLibRef>(e)))
+                {
+                    s_pendingWrapVisual = e;
+                }
+                if (ImGui::MenuItem("Unparent (drop to root)",
+                                    nullptr, false,
+                                    world->HasComponent<Parent>(e)))
+                {
+                    s_pendingReparent.child     = e;
+                    s_pendingReparent.newParent = NullEntity;
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Duplicate"))
                     s_pendingDuplicate = e;
@@ -512,7 +719,7 @@ namespace
         {
             if (kids)
                 for (Entity child : *kids)
-                    DrawEntityTree(world, child, selectedEntity, hmap);
+                    DrawEntityTree(world, child, selectedEntity, hierarchyHighlight, hmap);
             ImGui::TreePop();
         }
     }
@@ -594,6 +801,50 @@ void EditorLayer::BeginImGuiFrame()
     if (m_imguiBackendsReady) m_imguiMgr.BeginFrame();
 }
 
+void EditorLayer::ProcessPendingActions()
+{
+    if (m_pendingLoadScenePath.empty()) return;
+
+    const std::string loadPath = std::move(m_pendingLoadScenePath);
+    m_pendingLoadScenePath.clear();
+
+    if (!m_world || !m_assetMgr) return;
+
+    m_selectedEntity = NullEntity;
+
+    // Hard-sync ALL queues (graphics + compute + copy — DDGI's compute pipeline
+    // outlives FlushAndWait's graphics-only sync) and drain every deferred-
+    // release slot before touching renderer caches. WITHOUT this, MeshDescriptor-
+    // Heap reset could race in-flight compute work referencing the old bindless
+    // VB/IB.
+    //
+    // We deliberately do NOT call WaitIdleAndReleaseDeferred a second time
+    // AFTER OnWorldClear, even though it would free the prior world's GPU
+    // memory before LoadScene and reduce peak VRAM. Empirically that triggered
+    // a delayed GPU TDR ~5 s after reload (bindless SRV slots referencing the
+    // just-freed memory seem to get reached even after a full sync). Renderer
+    // is responsible for safe deferral instead (texture release chains through
+    // TextureSystem::Tick; MeshLibrary uses a one-world-lag two-stage release).
+    // Peak VRAM = old + new briefly during reload.
+    if (m_gfx)
+        m_gfx->WaitIdleAndReleaseDeferred();
+
+    if (m_renderer)
+        m_renderer->OnWorldClear();
+
+    std::string sceneName;
+    std::string ppcPath;
+    std::string navPath;
+    Resource::LoadScene(loadPath, *m_world, *m_assetMgr,
+                       m_renderer, m_animClipSys, &sceneName, &ppcPath, &navPath);
+    m_postProcessConfigPath = ppcPath;
+
+    // .iscene stored a .inav alongside — load it so runtime FindPath /
+    // NavAgent path-following are live without a separate "Load NavMesh" click.
+    if (!navPath.empty() && m_navSys)
+        m_navSys->Load(navPath);
+}
+
 void EditorLayer::EndImGuiFrame(RHI::CommandList cmd)
 {
     if (!m_imguiBackendsReady || !m_gfx) return;
@@ -609,6 +860,12 @@ void EditorLayer::OnAttach()
         ImGui::CreateContext();
         ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     }
+
+    // Wire concrete per-NotifyCategory property panels into the registry
+    // the NotifyTrackEditor consults. Idempotent — re-registering a
+    // category just overwrites the previous drawer, so re-attaching the
+    // editor layer is safe.
+    RegisterDefaultNotifyEditors();
 
     ImGuiIO& io = ImGui::GetIO();
 
@@ -800,8 +1057,8 @@ void EditorLayer::OnUIRender()
             for (size_t i = 0; i < tagData.size(); ++i)
             {
                 if (!tagData[i].Has("ReflectionProbe")) continue;
-                if (auto* vis = m_world->GetComponent<Visibility>(tagEnts[i]))
-                    vis->is_visible = m_showProbeVizSpheres;
+                if (auto* vis = m_world->GetComponent<VisibilityComponent>(tagEnts[i]))
+                    vis->SetVisible(m_showProbeVizSpheres);
             }
         }
     }
@@ -883,6 +1140,19 @@ void EditorLayer::OnUIRender()
         }
     }
 
+    // Two-click Hierarchy selection sync: any time m_selectedEntity moved
+    // since last frame (external setter, picking, viewport gizmo, scene
+    // load, Hierarchy second-click promotion), re-align the Hierarchy
+    // highlight so the row visually matches the Inspector content. The
+    // first-click case leaves m_selectedEntity untouched, so this check
+    // doesn't fire and m_hierarchyHighlight stays divergent — exactly the
+    // "highlight an entity to drag without losing Inspector focus" UX.
+    if (m_selectedEntity != m_lastSeenSelectedEntity)
+    {
+        m_hierarchyHighlight     = m_selectedEntity;
+        m_lastSeenSelectedEntity = m_selectedEntity;
+    }
+
     if (m_viewportFullscreen)
     {
         RenderFullscreenViewport();
@@ -901,6 +1171,7 @@ void EditorLayer::OnUIRender()
     if (m_showSSRDebug) RenderSSRDebugWindow();
     if (m_showDecalMaterials) RenderDecalMaterialsWindow();
     if (m_showFontEditor) RenderFontEditorWindow();
+    if (m_showCameraSwitcher) RenderCameraSwitcherWindow();
 }
 
 void EditorLayer::RenderFullscreenViewport()
@@ -971,32 +1242,38 @@ void EditorLayer::RenderMenuBar()
 {
     if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("Save World..."))
+        if (ImGui::MenuItem("Save Scene..."))
         {
             std::string savePath = SaveFileDialog(
-                "World Scene (*.iworld)\0*.iworld\0All Files\0*.*\0\0",
-                "iworld", "");
+                "Scene (*.iscene)\0*.iscene\0All Files\0*.*\0\0",
+                "iscene", "");
             if (!savePath.empty() && m_world)
-                Resource::SaveWorld(*m_world, savePath, "Scene",
-                                    m_postProcessConfigPath);
+            {
+                // Export baked (non-realtime) reflection-probe cubemaps to
+                // .dds beside the .iscene and stamp each probe's
+                // bakedCubemapPath BEFORE serializing — SaveScene then
+                // persists those paths so the next load restores the
+                // cubemaps off disk instead of re-baking from scratch.
+                if (m_renderer)
+                    m_renderer->ExportBakedProbeCubemaps(*m_world, savePath);
+                Resource::SaveScene(*m_world, savePath, "Scene",
+                                    m_postProcessConfigPath,
+                                    m_navSys ? m_navSys->SourcePath() : std::string{});
+            }
         }
-        if (ImGui::MenuItem("Load World..."))
+        if (ImGui::MenuItem("Load Scene..."))
         {
             std::string loadPath = OpenFileDialog(
-                "World Scene (*.iworld)\0*.iworld\0All Files\0*.*\0\0", "");
+                "Scene (*.iscene)\0*.iscene\0All Files\0*.*\0\0", "");
             if (!loadPath.empty() && m_world)
             {
-                m_selectedEntity = NullEntity;
-
-                // Invalidate Renderer caches (skinned mesh desc, prev pose, etc.) before clearing world.
-                if (m_renderer)
-                    m_renderer->OnWorldClear();
-
-                std::string sceneName;
-                std::string ppcPath;
-                Resource::LoadWorld(loadPath, *m_world, *m_assetMgr,
-                                   m_renderer, m_animClipSys, &sceneName, &ppcPath);
-                m_postProcessConfigPath = ppcPath; // tracks whatever the world recorded
+                // Defer the actual teardown / load to ProcessPendingActions
+                // so it runs OUTSIDE the in-flight ImGui frame. Running it
+                // inline would free descriptor slots that ImGui::Image calls
+                // earlier this frame already captured as raw GPU handles,
+                // causing the driver to dereference dangling descriptors
+                // during EndImGuiFrame.
+                m_pendingLoadScenePath = std::move(loadPath);
             }
         }
         ImGui::EndMenu();
@@ -1010,6 +1287,10 @@ void EditorLayer::RenderMenuBar()
             if (m_createMeshCallback) m_createMeshCallback(1);
         if (ImGui::MenuItem("Cone",   nullptr))
             if (m_createMeshCallback) m_createMeshCallback(2);
+        if (ImGui::MenuItem("Plane",  nullptr))
+            if (m_createMeshCallback) m_createMeshCallback(3);
+        if (ImGui::MenuItem("Torus",  nullptr))
+            if (m_createMeshCallback) m_createMeshCallback(4);
 
         ImGui::Separator();
 
@@ -1439,30 +1720,30 @@ void EditorLayer::RenderMenuBar()
 
     if (ImGui::BeginMenu("Build"))
     {
-        if (ImGui::MenuItem("Set Startup World..."))
+        if (ImGui::MenuItem("Set Startup Scene..."))
         {
             std::string path = OpenFileDialog(
-                "World Scene (*.iworld)\0*.iworld\0All Files\0*.*\0\0", "asset/");
+                "Scene (*.iscene)\0*.iscene\0All Files\0*.*\0\0", "asset/");
             if (!path.empty())
             {
                 // Convert to path relative to working dir (project/package root); fall back to absolute.
                 namespace fs = std::filesystem;
                 std::error_code ec;
                 fs::path rel = fs::relative(fs::path(path), fs::current_path(), ec);
-                std::string worldPath = (ec || rel.empty()) ? path : rel.string();
-                std::replace(worldPath.begin(), worldPath.end(), '\\', '/');
+                std::string scenePath = (ec || rel.empty()) ? path : rel.string();
+                std::replace(scenePath.begin(), scenePath.end(), '\\', '/');
 
                 FILE* fp = nullptr;
                 if (fopen_s(&fp, "game.json", "w") == 0 && fp)
                 {
                     fprintf(fp,
                         "{\n"
-                        "  \"_comment\": \"Edit startup_world to the .iworld Game.exe should boot into.\",\n"
-                        "  \"startup_world\": \"%s\"\n"
+                        "  \"_comment\": \"Edit startup_scene to the .iscene Game.exe should boot into.\",\n"
+                        "  \"startup_scene\": \"%s\"\n"
                         "}\n",
-                        worldPath.c_str());
+                        scenePath.c_str());
                     fclose(fp);
-                    LOG_INFO("game.json updated: startup_world = '%s'", worldPath.c_str());
+                    LOG_INFO("game.json updated: startup_scene = '%s'", scenePath.c_str());
                 }
                 else
                 {
@@ -1481,10 +1762,63 @@ void EditorLayer::RenderMenuBar()
         ImGui::EndMenu();
     }
 
+    // --- Tools menu (bake operations) ---
+    // Popup body lives outside the menu-bar context (see DrawBakeCollisionPopup
+    // call after EndMenuBar in OnUIRender). Modal popups can't be opened from
+    // inside BeginMenuBar — the ID stack hash won't match.
+    if (ImGui::BeginMenu("Tools"))
+    {
+        // All one-shot bake / asset-generation actions live here (previously
+        // split across two separate "Tools" menus).
+        if (ImGui::MenuItem("Bake Collision Meshes..."))
+            g_bakeCollisionOpenRequest = true;
+        if (ImGui::MenuItem("Bake NavMesh..."))
+            g_bakeNavMeshOpenRequest = true;
+        ImGui::Separator();
+        {
+            const bool canBake = m_renderer != nullptr;
+            if (!canBake) ImGui::BeginDisabled();
+            if (ImGui::MenuItem("Bake All Reflection Probes") && m_renderer)
+                m_renderer->BakeAllProbes();
+            if (!canBake) ImGui::EndDisabled();
+        }
+        ImGui::EndMenu();
+    }
+
+    // ---- Window ---- one place for every dockable / floating editor panel
+    // toggle (was scattered across Settings / Debug / a second Tools menu). ----
+    if (ImGui::BeginMenu("Window"))
+    {
+        // Post-process / color-grading settings panel.
+        ImGui::MenuItem("Post Processing", nullptr, &m_showPostProcess);
+        // GPU timing overlay — keep the GPUProfiler's own enable flag in sync.
+        if (ImGui::MenuItem("GPU Profiler", nullptr, &m_showProfiler))
+        {
+            if (m_gpuProfiler)
+                m_gpuProfiler->enabled = m_showProfiler;
+        }
+        // Animation / phase inspectors.
+        ImGui::MenuItem("Animation Debug", nullptr, &m_showAnimDebug);
+        ImGui::MenuItem("Phase Debug",     nullptr, &m_showPhaseDebug);
+        // SSR Debug window — full-screen modes, per-stage previews, runtime tuning.
+        ImGui::MenuItem("SSR Debug",       nullptr, &m_showSSRDebug);
+        // Camera Switcher — list/push/pop/HardCut VCams per channel.
+        ImGui::MenuItem("Camera Switcher", nullptr, &m_showCameraSwitcher);
+
+        ImGui::Separator();
+        // Animation Timeline editor — AnimNotify track authoring on .ianim clips.
+        ImGui::MenuItem("Timeline Editor", nullptr, &m_showTimeline);
+        // Decal Materials editor.
+        ImGui::MenuItem("Decal Materials", nullptr, &m_showDecalMaterials);
+        // UI Font Editor — live re-bake of the runtime UI text font.
+        ImGui::MenuItem("UI Font Editor",  nullptr, &m_showFontEditor);
+        ImGui::EndMenu();
+    }
+
+    // ---- Settings ---- engine feature toggles only (window panels live under
+    // "Window"; debug-overlay visibility lives under "Debug"). ----
     if (ImGui::BeginMenu("Settings"))
     {
-        ImGui::MenuItem("Post Processing", nullptr, &m_showPostProcess);
-
         if (m_renderer)
         {
             bool indirect = m_renderer->IsIndirectDrawEnabled();
@@ -1509,20 +1843,24 @@ void EditorLayer::RenderMenuBar()
             bool ssao = m_renderer->IsSSAOEnabled();
             if (ImGui::MenuItem("SSAO (XeGTAO)", nullptr, &ssao))
                 m_renderer->SetSSAOEnabled(ssao);
+        }
 
-            // SSR Debug window — full-screen modes, per-stage previews, runtime tuning.
-            ImGui::MenuItem("SSR Debug", nullptr, &m_showSSRDebug);
+        if (m_gfx)
+        {
+            auto& dx12 = static_cast<GraphicsDX12&>(*m_gfx);
+            ImGui::MenuItem("VSync", nullptr, &dx12.vsyncEnabled);
+        }
 
-            // Toggles Visibility::is_visible on all "ReflectionProbe"-tagged entities (capture continues regardless).
-            ImGui::MenuItem("Reflection Probe Viz", nullptr, &m_showProbeVizSpheres);
+        ImGui::EndMenu();
+    }
 
-            if (m_gfx)
-            {
-                auto& dx12 = static_cast<GraphicsDX12&>(*m_gfx);
-                ImGui::MenuItem("VSync", nullptr, &dx12.vsyncEnabled);
-            }
-
-            ImGui::Separator();
+    if (ImGui::BeginMenu("Debug"))
+    {
+        // Wireframe overlays (moved out of Settings). Master toggle gates
+        // every sub-flag — even with sub-flags on, the wire buffer stays
+        // empty unless `Debug Wireframes` is checked.
+        if (m_renderer)
+        {
             if (auto* dbg = m_renderer->GetDebugWirePass())
             {
                 ImGui::MenuItem("Debug Wireframes", nullptr, &dbg->enabled);
@@ -1533,6 +1871,19 @@ void EditorLayer::RenderMenuBar()
                     ImGui::MenuItem("  Show Capsules",          nullptr, &dbg->showCapsules);
                     ImGui::MenuItem("  Show Reflection Probes", nullptr, &dbg->showReflectionProbes);
                     ImGui::MenuItem("  Show DDGI Volumes",      nullptr, &dbg->showDDGIVolumes);
+                    ImGui::MenuItem("  Show Collision",         nullptr, &dbg->showCollision);
+                    if (dbg->showCollision)
+                    {
+                        // 0 = unlimited (every Mesh collider in the world).
+                        // Dial down when the wire buffer fills (look at the
+                        // log — AddLine bails silently past kMaxVertices).
+                        ImGui::SetNextItemWidth(180);
+                        ImGui::SliderFloat("    Max distance (0 = unlimited)",
+                                            &dbg->collisionMaxDistance,
+                                            0.0f, 200.0f, "%.0f m");
+                    }
+                    if (m_navSys)
+                        ImGui::MenuItem("  Show NavMesh",       nullptr, &m_navSys->debugDraw);
                 }
             }
             if (auto* pdbg = m_renderer->GetDDGIProbeDebugPass())
@@ -1552,20 +1903,20 @@ void EditorLayer::RenderMenuBar()
                     ImGui::DragFloat("  Sphere Radius",     &pdbg->sphereRadius, 0.005f, 0.01f, 5.0f, "%.3f");
                 }
             }
+
+            // ---- Scene-gizmo visibility (overlay billboards / probe viz) ----
+            ImGui::Separator();
+            // Toggles VisibilityComponent.flags.Visible on all "ReflectionProbe"-tagged entities (capture continues regardless).
+            ImGui::MenuItem("Reflection Probe Viz", nullptr, &m_showProbeVizSpheres);
+            // Hide every light-icon billboard at once (Renderer skips their
+            // DrawCandidate emission). Useful for clean screenshots.
+            bool lightIcons = m_renderer->AreLightBillboardsVisible();
+            if (ImGui::MenuItem("Light Icons", nullptr, &lightIcons))
+                m_renderer->SetLightBillboardsVisible(lightIcons);
+
+            ImGui::Separator();
         }
 
-        ImGui::EndMenu();
-    }
-
-    if (ImGui::BeginMenu("Debug"))
-    {
-        ImGui::MenuItem("Animation Debug", nullptr, &m_showAnimDebug);
-        ImGui::MenuItem("Timeline Editor", nullptr, &m_showTimeline);
-        if (ImGui::MenuItem("GPU Profiler", nullptr, &m_showProfiler))
-        {
-            if (m_gpuProfiler)
-                m_gpuProfiler->enabled = m_showProfiler;
-        }
         // Decal cluster heatmap — green/yellow/red overlay for overdraw + bounds-sphere sanity.
         if (m_renderer)
         {
@@ -1631,25 +1982,6 @@ void EditorLayer::RenderMenuBar()
         }
         ImGui::EndMenu();
     }
-
-    // Tools menu — one-shot actions + floating window toggles (outside the docking layout).
-    if (ImGui::BeginMenu("Tools"))
-    {
-        const bool canBake = m_renderer != nullptr;
-        if (!canBake) ImGui::BeginDisabled();
-        if (ImGui::MenuItem("Bake All Reflection Probes"))
-        {
-            m_renderer->BakeAllProbes();
-        }
-        if (!canBake) ImGui::EndDisabled();
-
-        ImGui::Separator();
-        // Decal Materials editor (floating window, see RenderDecalMaterialsWindow).
-        ImGui::MenuItem("Decal Materials", nullptr, &m_showDecalMaterials);
-        // UI Font Editor — live re-bake of the runtime UI text font.
-        ImGui::MenuItem("UI Font Editor", nullptr, &m_showFontEditor);
-        ImGui::EndMenu();
-    }
 }
 
 void EditorLayer::SetupDockSpace()
@@ -1676,30 +2008,545 @@ void EditorLayer::SetupDockSpace()
         ImGui::EndMenuBar();
     }
 
+    // Tools > Bake Collision Meshes... popup. Body lives here (outside the
+    // menu bar) so the modal's ID stack matches OpenPopup's caller scope.
+    if (g_bakeCollisionOpenRequest)
+    {
+        ImGui::OpenPopup("Bake Collision Meshes");
+        g_bakeCollisionOpenRequest = false;
+    }
+    {
+        static Tools::CollisionMesh::BakeOptions s_opts;
+        static Tools::CollisionMesh::BakeJob     s_job;
+        static char s_outPath[260] = {};
+        static bool s_outPathInit  = false;
+        if (!s_outPathInit)
+        {
+            std::snprintf(s_outPath, sizeof(s_outPath), "%s", s_opts.outputPath.c_str());
+            s_outPathInit = true;
+        }
+
+        // ---- Preview-swap state ----------------------------------------
+        // When the user clicks "Preview baked", every entity that referenced
+        // a source mesh gets its MeshLibRef rewritten to point at the baked
+        // library so the simplified geometry renders in-place. Originals are
+        // saved here so "Restore" can swap them back.
+        struct PreviewBackup { MeshLibRef original; };
+        static std::unordered_map<Entity, PreviewBackup> s_previewBackups;
+        static Resource::Handle                          s_previewBakedLib;   // invalid if not loaded
+        static std::string                               s_previewLoadedFor;  // path of currently-loaded baked lib
+
+        ImGui::SetNextWindowSize(ImVec2(700, 0), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Bake Collision Meshes",
+                                    nullptr,
+                                    ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            const bool running     = s_job.IsRunning();
+            const bool hasPreview  = !s_previewBackups.empty();
+
+            ImGui::TextWrapped(
+                "Walks every MeshLibRef entity in the current world, simplifies "
+                "each source mesh in parallel via meshoptimizer, and combines "
+                "all results into ONE .meshlib (shared VB/IB + per-mesh entries "
+                "— engine-native format). Use \"Preview baked\" to render the "
+                "simplified meshes in-place for visual comparison.");
+            ImGui::Separator();
+
+            // ---- Options form (disabled while a bake is in flight) -----
+            ImGui::BeginDisabled(running);
+            ImGui::SliderFloat("Target triangle ratio",
+                                &s_opts.targetTriangleRatio, 0.01f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Target error (normalized)",
+                                &s_opts.targetError, 0.001f, 0.5f, "%.3f");
+            int minTri = static_cast<int>(s_opts.minTriangles);
+            if (ImGui::InputInt("Min triangles", &minTri))
+                s_opts.minTriangles = static_cast<uint32_t>(std::max(0, minTri));
+
+            ImGui::Checkbox("Skip skinned", &s_opts.skipSkinned);
+
+            if (ImGui::InputText("Output .meshlib path", s_outPath, sizeof(s_outPath)))
+                s_opts.outputPath = s_outPath;
+            ImGui::EndDisabled();
+
+            ImGui::Text("Worker threads: %u",  TaskSystem::Get().GetWorkerCount());
+            ImGui::Separator();
+
+            const bool hasWorld = (m_world != nullptr);
+            if (!hasWorld)
+                ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1), "No world bound.");
+
+            // ---- Action buttons row ------------------------------------
+            ImGui::BeginDisabled(!hasWorld || running || hasPreview);
+            if (ImGui::Button("Bake"))
+            {
+                s_opts.outputPath = s_outPath;
+                s_job.Begin(*m_world, s_opts);
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!running);
+            if (ImGui::Button("Cancel"))
+                s_job.Reset();
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(running || hasPreview);
+            if (ImGui::Button("Clear results"))
+                s_job.Reset();
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(running);
+            if (ImGui::Button("Close"))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndDisabled();
+
+            // ---- Progress bar -----------------------------------------
+            if (running)
+            {
+                s_job.Tick();
+                const float prog = s_job.Progress();
+                char overlay[64];
+                std::snprintf(overlay, sizeof(overlay), "%u / %u  (%.0f%%)",
+                              s_job.Processed(), s_job.Total(), prog * 100.f);
+                ImGui::ProgressBar(prog, ImVec2(-FLT_MIN, 0), overlay);
+            }
+
+            // ---- Preview row ------------------------------------------
+            if (s_job.IsComplete() && !s_job.WriteFailed())
+            {
+                ImGui::Separator();
+                const bool canPreview = hasWorld && m_renderer && m_gfx && !hasPreview;
+                ImGui::BeginDisabled(!canPreview);
+                if (ImGui::Button("Preview baked in world"))
+                {
+                    Resource::MeshLibrary* libSys = m_renderer->GetMeshLibrary();
+                    if (libSys)
+                    {
+                        // Load (or re-load) the baked .meshlib into the runtime
+                        // library system; the returned handle is what the
+                        // renderer dereferences each frame.
+                        Resource::Handle baked = libSys->Load(s_job.OutputPath(), *m_gfx);
+                        if (baked.IsValid())
+                        {
+                            s_previewBakedLib   = baked;
+                            s_previewLoadedFor  = s_job.OutputPath();
+
+                            // Build (sourcePath, sourceMeshId) → bakedMeshId.
+                            std::unordered_map<std::string,
+                                std::unordered_map<uint32_t, uint32_t>> bakedMap;
+                            for (const auto& r : s_job.Results())
+                            {
+                                if (!r.success) continue;
+                                bakedMap[r.sourcePath][r.sourceMeshId] = r.bakedMeshId;
+                            }
+
+                            // Walk entities; rewrite MeshLibRef in place.
+                            uint32_t swapped = 0;
+                            m_world->ForEach<MeshLibRef>([&](Entity e, MeshLibRef& ref)
+                            {
+                                const MeshSourcePath* sp = m_world->GetComponent<MeshSourcePath>(e);
+                                if (!sp) return;
+                                auto pit = bakedMap.find(sp->path);
+                                if (pit == bakedMap.end()) return;
+                                auto mit = pit->second.find(ref.meshId);
+                                if (mit == pit->second.end()) return;
+
+                                s_previewBackups[e] = { ref };
+                                ref.libHandle        = s_previewBakedLib;
+                                ref.meshId           = mit->second;
+                                ref.cachedGeneration = 0; // force renderer re-lookup
+                                ++swapped;
+                            });
+                            LOG_INFO("CollisionMeshBaker: preview swapped %u entities to '%s'",
+                                     swapped, s_previewLoadedFor.c_str());
+                        }
+                        else
+                        {
+                            LOG_ERROR("CollisionMeshBaker: failed to load baked .meshlib '%s' for preview",
+                                      s_job.OutputPath().c_str());
+                        }
+                    }
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!hasPreview);
+                if (ImGui::Button("Restore originals"))
+                {
+                    for (auto& [e, backup] : s_previewBackups)
+                    {
+                        if (MeshLibRef* ref = m_world->GetComponent<MeshLibRef>(e))
+                        {
+                            *ref = backup.original;
+                            ref->cachedGeneration = 0;
+                        }
+                    }
+                    LOG_INFO("CollisionMeshBaker: restored %zu entities from preview swap",
+                             s_previewBackups.size());
+                    s_previewBackups.clear();
+
+                    // Release the previewed baked lib and FLUSH the renderer's
+                    // mesh-descriptor cache. MeshManager keys its cache by
+                    // (libIdx << 32) | meshId; MeshLibrary::Release reuses the
+                    // libIdx slot on the next Load(), so without this flush the
+                    // next preview gets stale descriptor entries pointing at
+                    // freed GPU buffers — device removed on next draw.
+                    if (s_previewBakedLib.IsValid() && m_renderer && m_gfx)
+                    {
+                        if (Resource::MeshLibrary* libSys = m_renderer->GetMeshLibrary())
+                            libSys->Release(s_previewBakedLib, *m_gfx);
+                        m_renderer->OnWorldClear();
+                    }
+                    s_previewBakedLib  = {};
+                    s_previewLoadedFor.clear();
+                }
+                ImGui::EndDisabled();
+
+                if (hasPreview)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.f, 1),
+                        "(previewing %zu entities)", s_previewBackups.size());
+                }
+
+                // ---- Collision wire-up -------------------------------
+                // Walks the world, attaches a Mesh ColliderComponent +
+                // Static RigidBodyComponent to every entity whose source
+                // mesh was just baked. Mesh colliders are Jolt MeshShapes;
+                // they're static-only, which matches level geometry.
+                static uint32_t s_lastColliderApplyCount = 0;
+                const bool canApplyCollision = hasWorld && !running;
+                ImGui::BeginDisabled(!canApplyCollision);
+                if (ImGui::Button("Use baked as collision"))
+                {
+                    std::unordered_map<std::string,
+                        std::unordered_map<uint32_t, uint32_t>> bakedMap;
+                    for (const auto& r : s_job.Results())
+                    {
+                        if (!r.success) continue;
+                        bakedMap[r.sourcePath][r.sourceMeshId] = r.bakedMeshId;
+                    }
+                    const std::string libPath = s_job.OutputPath();
+
+                    uint32_t applied  = 0;
+                    uint32_t replaced = 0;
+                    std::vector<DX12Physics::PhysicsSystem::MeshShapeRequest>
+                        prewarmRequests;
+                    m_world->ForEach<MeshLibRef>([&](Entity e, MeshLibRef& ref)
+                    {
+                        const MeshSourcePath* sp = m_world->GetComponent<MeshSourcePath>(e);
+                        if (!sp) return;
+                        auto pit = bakedMap.find(sp->path);
+                        if (pit == bakedMap.end()) return;
+                        auto mit = pit->second.find(ref.meshId);
+                        if (mit == pit->second.end()) return;
+
+                        ColliderComponent col{};
+                        col.shape         = ColliderComponent::Shape::Mesh;
+                        col.meshLibPath   = libPath;
+                        col.meshLibMeshId = mit->second;
+                        prewarmRequests.push_back({ libPath, mit->second });
+
+                        if (m_world->HasComponent<ColliderComponent>(e))
+                        {
+                            *m_world->GetComponent<ColliderComponent>(e) = col;
+                            ++replaced;
+                        }
+                        else
+                        {
+                            m_world->AddComponent<ColliderComponent>(e, col);
+                        }
+
+                        if (!m_world->HasComponent<RigidBodyComponent>(e))
+                        {
+                            RigidBodyComponent rb{};
+                            rb.motion = RigidBodyComponent::Motion::Static;
+                            m_world->AddComponent<RigidBodyComponent>(e, rb);
+                        }
+                        else
+                        {
+                            // Mesh colliders require Static — see PhysicsSystem warning.
+                            m_world->GetComponent<RigidBodyComponent>(e)->motion
+                                = RigidBodyComponent::Motion::Static;
+                            // Force the existing body to be torn down so it
+                            // re-creates with the new MeshShape on next tick.
+                            m_world->GetComponent<RigidBodyComponent>(e)->bodyId
+                                = kInvalidPhysicsBodyId;
+                        }
+                        ++applied;
+                    });
+                    s_lastColliderApplyCount = applied;
+                    if (m_physicsSys && m_world)
+                    {
+                        // After re-bake the cached MeshShape is stale (same
+                        // path, different content). Flush + bump Mesh-collider
+                        // generations so the runtime-swap detector tears down
+                        // existing bodies and Phase 1 rebuilds them.
+                        m_physicsSys->InvalidateMeshShapeCache(*m_world);
+                        // Eagerly parallel-build all referenced MeshShapes
+                        // now, so the first Play tick doesn't pay the entire
+                        // file-read + BVH-build cost on the main thread.
+                        m_physicsSys->PrewarmMeshShapes(prewarmRequests);
+                    }
+
+                    LOG_INFO("CollisionMeshBaker: attached Mesh collider to %u entities "
+                             "(%u replaced existing collider)", applied, replaced);
+                }
+                ImGui::EndDisabled();
+                if (s_lastColliderApplyCount > 0)
+                {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(0.6f, 1.f, 0.6f, 1),
+                        "(applied to %u entities)", s_lastColliderApplyCount);
+                }
+
+            }
+
+            // ---- Summary / results ------------------------------------
+            if (s_job.IsComplete() || !s_job.Results().empty())
+            {
+                ImGui::Separator();
+                const auto& results = s_job.Results();
+                uint32_t ok = 0, fail = 0, skip = 0;
+                for (const auto& r : results)
+                {
+                    if (r.skipped)      ++skip;
+                    else if (r.success) ++ok;
+                    else                ++fail;
+                }
+                ImGui::Text("Baked: %u    Failed: %u    Skipped: %u",
+                            ok, fail, skip);
+                if (s_job.IsComplete())
+                {
+                    if (s_job.WriteFailed())
+                        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1),
+                            "Write FAILED — see DX12Log.txt");
+                    else if (ok > 0)
+                        ImGui::TextColored(ImVec4(0.5f, 1.f, 0.5f, 1),
+                            "Wrote '%s'  (%llu -> %llu tris total)",
+                            s_job.OutputPath().c_str(),
+                            (unsigned long long)s_job.OrigTriTotal(),
+                            (unsigned long long)s_job.BakedTriTotal());
+                    else
+                        ImGui::TextColored(ImVec4(1, 0.8f, 0.4f, 1),
+                            "No meshes survived — nothing written.");
+                }
+                if (ImGui::BeginChild("##BakeResultsList", ImVec2(0, 240), true))
+                {
+                    for (const auto& r : results)
+                    {
+                        if (r.skipped)
+                            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1),
+                                "[SKIP] %s  (%s)",
+                                r.sourcePath.empty() ? "(no source)"
+                                                     : r.sourcePath.c_str(),
+                                r.reason.c_str());
+                        else if (r.success)
+                            ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1),
+                                "[ OK ] %s [src=%u baked=%u]   %u -> %u tris   err %.4f",
+                                r.sourcePath.c_str(), r.sourceMeshId, r.bakedMeshId,
+                                r.origTriCount, r.bakedTriCount, r.actualError);
+                        else
+                            ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1),
+                                "[FAIL] %s  %s",
+                                r.sourcePath.empty() ? "(no source)"
+                                                     : r.sourcePath.c_str(),
+                                r.reason.c_str());
+                    }
+                }
+                ImGui::EndChild();
+            }
+
+            ImGui::EndPopup();
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Tools > Bake NavMesh... popup (Recast / Detour).
+    // Inputs are Mesh ColliderComponents in the world — apply collision via
+    // the "Bake Collision Meshes" tool first, then come here to bake nav.
+    // -------------------------------------------------------------------
+    if (g_bakeNavMeshOpenRequest)
+    {
+        ImGui::OpenPopup("Bake NavMesh");
+        g_bakeNavMeshOpenRequest = false;
+    }
+    {
+        static Nav::BuildParams s_navParams;
+        static Nav::BuildStats  s_navStats;
+        static char             s_navOut[260]    = "asset/nav/world.inav";
+        static char             s_navLoadPath[260] = "asset/nav/world.inav";
+
+        ImGui::SetNextWindowSize(ImVec2(560, 0), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Bake NavMesh", nullptr,
+                                    ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            const bool hasWorld = (m_world != nullptr);
+            const bool hasNav   = (m_navSys != nullptr);
+
+            ImGui::TextWrapped(
+                "Feeds every Mesh ColliderComponent in the world through Recast "
+                "(voxel rasterise → contour → polymesh → detail mesh → Detour "
+                "tile) and writes a .inav. Runtime FindPath / NavAgent path-"
+                "following go live as soon as Build completes.");
+            ImGui::Separator();
+
+            // Quick status — what's currently loaded.
+            if (hasNav && m_navSys->IsReady())
+            {
+                const std::string& src = m_navSys->SourcePath();
+                ImGui::TextColored(ImVec4(0.6f, 1.f, 0.6f, 1),
+                    "NavMesh ready%s%s",
+                    src.empty() ? "" : "  source: ",
+                    src.empty() ? "" : src.c_str());
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1),
+                                    "No navmesh loaded.");
+            }
+            ImGui::Separator();
+
+            ImGui::TextDisabled("Recast / agent parameters");
+            ImGui::SliderFloat("Cell size",       &s_navParams.cellSize,        0.05f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Cell height",     &s_navParams.cellHeight,      0.05f, 1.0f, "%.2f");
+            ImGui::SliderFloat("Agent height",    &s_navParams.agentHeight,     0.5f, 4.0f, "%.2f");
+            ImGui::SliderFloat("Agent radius",    &s_navParams.agentRadius,     0.1f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Agent max climb", &s_navParams.agentMaxClimb,   0.05f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Max slope (deg)", &s_navParams.agentMaxSlopeDeg,5.0f, 75.0f, "%.0f");
+            int minRegion = s_navParams.minRegionArea;
+            if (ImGui::InputInt("Min region area (cells^2)", &minRegion))
+                s_navParams.minRegionArea = std::max(0, minRegion);
+
+            // Tile size in cells. 0 = single-tile (fastest for small levels).
+            // 32/64/128 = tile-based — Recast splits the world into a grid
+            // of (tileSize × cellSize) world units. Use this for >1 km² worlds.
+            int tileSize = s_navParams.tileSize;
+            if (ImGui::SliderInt("Tile size (cells, 0 = single tile)",
+                                  &tileSize, 0, 256))
+                s_navParams.tileSize = std::max(0, tileSize);
+            if (s_navParams.tileSize > 1)
+                ImGui::TextDisabled("  tile world size ≈ %.1f m",
+                    s_navParams.tileSize * s_navParams.cellSize);
+            ImGui::Separator();
+
+            ImGui::InputText("Output .inav path", s_navOut, sizeof(s_navOut));
+
+            // ---- Action row ------------------------------------------
+            const bool canBuild = hasWorld && hasNav;
+            ImGui::BeginDisabled(!canBuild);
+            if (ImGui::Button("Build NavMesh"))
+            {
+                Nav::TriangleSoup soup;
+                if (Nav::BuildSoupFromWorldColliders(*m_world, soup))
+                {
+                    s_navStats = m_navSys->Build(soup, s_navParams);
+                    if (s_navStats.success && s_navOut[0])
+                        m_navSys->Save(s_navOut);
+                }
+                else
+                {
+                    s_navStats = {};
+                    s_navStats.success = false;
+                    s_navStats.error   = "no Mesh ColliderComponents in world — "
+                                          "apply collision first via "
+                                          "Bake Collision Meshes → Use baked as collision";
+                    LOG_WARNING("NavMesh: nothing to feed Recast — apply collision first");
+                }
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasNav || !m_navSys->IsReady() || s_navOut[0] == '\0');
+            if (ImGui::Button("Save"))
+                m_navSys->Save(s_navOut);
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220);
+            ImGui::InputText("##loadpath", s_navLoadPath, sizeof(s_navLoadPath));
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasNav || s_navLoadPath[0] == '\0');
+            if (ImGui::Button("Load"))
+            {
+                if (m_navSys->Load(s_navLoadPath))
+                {
+                    s_navStats = {};   // existing stats from a previous Build no longer match
+                    s_navStats.success = true;
+                }
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            ImGui::BeginDisabled(!hasNav || !m_navSys->IsReady());
+            if (ImGui::Button("Clear"))
+            {
+                m_navSys->Clear();
+                s_navStats = {};
+            }
+            ImGui::EndDisabled();
+
+            ImGui::SameLine();
+            if (ImGui::Button("Close"))
+                ImGui::CloseCurrentPopup();
+
+            // ---- Result line -----------------------------------------
+            if (s_navStats.inputTris > 0 || !s_navStats.error.empty() || s_navStats.success)
+            {
+                ImGui::Separator();
+                if (s_navStats.success && s_navStats.inputTris > 0)
+                    ImGui::TextColored(ImVec4(0.6f, 1.f, 0.6f, 1),
+                        "OK   in: %u verts %u tris    out: %u polys, %u/%u tiles    (%.1f ms)",
+                        s_navStats.inputVerts, s_navStats.inputTris,
+                        s_navStats.polyCount,
+                        s_navStats.tilesBuilt, s_navStats.tilesTotal,
+                        s_navStats.buildMs);
+                else if (s_navStats.success)
+                    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.f, 1),
+                        "Loaded.");
+                else
+                    ImGui::TextColored(ImVec4(1, 0.5f, 0.5f, 1),
+                        "FAIL: %s", s_navStats.error.c_str());
+            }
+
+            ImGui::EndPopup();
+        }
+    }
+
     ImGuiID dockspaceId = ImGui::GetID("EditorDockSpace");
     ImGui::DockSpace(dockspaceId, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
     // Default layout: left Hierarchy | center Viewport+Resource | right Inspector.
+    // Only build it when imgui.ini didn't already restore a dock tree — otherwise
+    // we'd wipe the user's runtime layout on every launch.
     if (!m_layoutInitialized)
     {
         m_layoutInitialized = true;
-        ImGui::DockBuilderRemoveNodeChildNodes(dockspaceId);
-        ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
-        ImGuiID leftId, rightPartId;
-        ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.25f, &leftId, &rightPartId);
+        ImGuiDockNode* existing = ImGui::DockBuilderGetNode(dockspaceId);
+        const bool needDefault = (existing == nullptr) || !existing->IsSplitNode();
+        if (needDefault)
+        {
+            ImGui::DockBuilderRemoveNodeChildNodes(dockspaceId);
+            ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
-        ImGuiID inspectorId, centerPartId;
-        ImGui::DockBuilderSplitNode(rightPartId, ImGuiDir_Right, 0.3f, &inspectorId, &centerPartId);
+            ImGuiID leftId, rightPartId;
+            ImGui::DockBuilderSplitNode(dockspaceId, ImGuiDir_Left, 0.25f, &leftId, &rightPartId);
 
-        ImGuiID resourceId, viewportId;
-        ImGui::DockBuilderSplitNode(centerPartId, ImGuiDir_Down, 0.2f, &resourceId, &viewportId);
+            ImGuiID inspectorId, centerPartId;
+            ImGui::DockBuilderSplitNode(rightPartId, ImGuiDir_Right, 0.3f, &inspectorId, &centerPartId);
 
-        ImGui::DockBuilderDockWindow(kWindowHierarchy, leftId);
-        ImGui::DockBuilderDockWindow(kWindowViewport, viewportId);
-        ImGui::DockBuilderDockWindow(kWindowInspector, inspectorId);
-        ImGui::DockBuilderDockWindow(kWindowResource, resourceId);
-        ImGui::DockBuilderFinish(dockspaceId);
+            ImGuiID resourceId, viewportId;
+            ImGui::DockBuilderSplitNode(centerPartId, ImGuiDir_Down, 0.2f, &resourceId, &viewportId);
+
+            ImGui::DockBuilderDockWindow(kWindowHierarchy, leftId);
+            ImGui::DockBuilderDockWindow(kWindowViewport, viewportId);
+            ImGui::DockBuilderDockWindow(kWindowInspector, inspectorId);
+            ImGui::DockBuilderDockWindow(kWindowResource, resourceId);
+            ImGui::DockBuilderFinish(dockspaceId);
+        }
     }
 
     ImGui::End();
@@ -1736,6 +2583,8 @@ void EditorLayer::RenderHierarchyPanel()
     s_pendingCreateChild = NullEntity;
     s_pendingDuplicate   = NullEntity;
     s_pendingPrefabSave  = NullEntity;
+    s_pendingWrapVisual  = NullEntity;
+    s_pendingReparent    = {};
 
     // Build per-frame logical hierarchy map (Parent + FollowSocket + FollowEntity)
     // with cycle detection. See HierarchyMap for the full design.
@@ -1754,7 +2603,35 @@ void EditorLayer::RenderHierarchyPanel()
     std::sort(roots.begin(), roots.end());
 
     for (Entity e : roots)
-        DrawEntityTree(m_world, e, m_selectedEntity, hmap);
+        DrawEntityTree(m_world, e, m_selectedEntity, m_hierarchyHighlight, hmap);
+
+    // ---- Root-level drop zone — dragging an entity here detaches it from
+    // its parent and makes it a top-level entity. Sized to fill the remaining
+    // space so users can drop anywhere below the last root.
+    {
+        const float remaining = std::max(40.0f, ImGui::GetContentRegionAvail().y);
+        ImGui::InvisibleButton("##root_drop_zone", ImVec2(-1.f, remaining));
+        if (ImGui::BeginDragDropTarget())
+        {
+            if (const ImGuiPayload* payload =
+                    ImGui::AcceptDragDropPayload("ENTITY"))
+            {
+                const Entity dragged = *static_cast<const Entity*>(payload->Data);
+                s_pendingReparent.child     = dragged;
+                s_pendingReparent.newParent = NullEntity;
+            }
+            ImGui::EndDragDropTarget();
+        }
+        // Light visual hint while a drag is active over the zone.
+        if (ImGui::IsItemHovered() && ImGui::GetDragDropPayload() &&
+            ImGui::GetDragDropPayload()->IsDataType("ENTITY"))
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImVec2 mn = ImGui::GetItemRectMin();
+            const ImVec2 mx = ImGui::GetItemRectMax();
+            dl->AddRect(mn, mx, IM_COL32(120, 200, 255, 200), 2.0f, 0, 1.5f);
+        }
+    }
 
     // ---- Process pending operations (after tree draw to avoid iterator issues)
     if (s_pendingCreateChild != NullEntity)
@@ -1824,6 +2701,91 @@ void EditorLayer::RenderHierarchyPanel()
             }
         }
         s_pendingPrefabSave = NullEntity;
+    }
+
+    // ---- Reparent (drag-drop / menu) — preserves world transform -----------
+    if (s_pendingReparent.child != NullEntity
+        && m_world->IsAlive(s_pendingReparent.child))
+    {
+        const Entity c  = s_pendingReparent.child;
+        const Entity np = s_pendingReparent.newParent;
+        if (np != NullEntity && !m_world->IsAlive(np))
+        {
+            LOG_WARNING("EditorLayer: reparent target %u is dead — ignored", np);
+        }
+        else if (np != NullEntity && WouldCreateCycle(m_world, c, np))
+        {
+            LOG_WARNING("EditorLayer: reparenting %u under %u would form a cycle — ignored",
+                        c, np);
+        }
+        else
+        {
+            ReparentEntity(m_world, c, np);
+            LOG_INFO("EditorLayer: reparented entity %u under %u",
+                     c, static_cast<uint32_t>(np));
+        }
+        s_pendingReparent = {};
+    }
+
+    // ---- Wrap Visual as Child ----------------------------------------------
+    // Moves render-only components from the parent entity into a freshly
+    // created child positioned at the collider's "Snap to Bottom" Y. Keeps
+    // navigation / physics state on the parent (the entity origin sits at
+    // ground level after this), while the visual mesh sits half-height up.
+    if (s_pendingWrapVisual != NullEntity
+        && m_world->IsAlive(s_pendingWrapVisual))
+    {
+        const Entity parent = s_pendingWrapVisual;
+
+        // Y offset mirrors the Snap-to-Bottom preset on ColliderComponent so
+        // collider top and visual centre line up.
+        float yLift = 0.0f;
+        if (const ColliderComponent* col =
+                m_world->GetComponent<ColliderComponent>(parent))
+        {
+            switch (col->shape)
+            {
+                case ColliderComponent::Shape::Capsule: yLift = col->halfHeight + col->radius; break;
+                case ColliderComponent::Shape::Sphere:  yLift = col->radius;                   break;
+                case ColliderComponent::Shape::Box:     yLift = col->halfExtents.y;            break;
+                case ColliderComponent::Shape::Mesh:    yLift = 0.0f;                          break;
+            }
+        }
+
+        const Entity child = m_world->CreateEntity();
+        const std::string childName = m_world->GetName(parent) + "_Visual";
+        m_world->SetName(child, childName);
+
+        LocalTransform childLT;
+        childLT.translation = { 0.f, yLift, 0.f };
+        m_world->AddComponent<LocalTransform>(child, childLT);
+        m_world->AddComponent<GlobalTransform>(child, GlobalTransform{});
+        m_world->AddComponent<Parent>(child, Parent{ parent });
+        if (Children* ch = m_world->GetComponent<Children>(parent))
+            ch->entities.push_back(child);
+        else
+        {
+            Children c; c.entities.push_back(child);
+            m_world->AddComponent<Children>(parent, std::move(c));
+        }
+
+        // Move every render-side component the renderer cares about. The
+        // collider / RigidBody / AIIntent + NavAgent stay on the parent so physics +
+        // pathing keep operating from the entity origin (= ground level).
+        int moved = 0;
+        moved += MoveComponentBetween<MeshHandle>        (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<MeshLibRef>        (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<MeshSourcePath>    (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<MaterialComponent> (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<MaterialSourcePath>(m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<MaterialOverride>  (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<LocalAabb>         (m_world, parent, child) ? 1 : 0;
+        moved += MoveComponentBetween<WorldAabb>         (m_world, parent, child) ? 1 : 0;
+
+        m_selectedEntity    = child;
+        s_pendingWrapVisual = NullEntity;
+        LOG_INFO("EditorLayer: wrapped %d visual component(s) from entity %u into child %u (lift Y=%.3f)",
+                 moved, parent, child, yLift);
     }
 
     // ---- Visual hint when an IPFB drag is active ---------------------------
@@ -1937,6 +2899,25 @@ void EditorLayer::RenderViewportToolbar()
         m_wantsStepFrame = true;
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("Update 1 frame");
+
+    // ---- Global View Mode dropdown (right-aligned on the toolbar row) ------
+    // Lit / Unlit / Wireframe — applies to ALL objects. Wireframe additionally
+    // suppresses sky/clouds/fog/TAA in the Renderer for a clean dark-bg result.
+    if (m_renderer)
+    {
+        static const char* kViewModes[] = { "Lit", "Unlit", "Wireframe" };
+        const float comboW = 110.0f;
+        ImGui::SameLine();
+        const float rightX = ImGui::GetCursorPosX()
+                           + ImGui::GetContentRegionAvail().x - comboW;
+        ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), rightX));
+        ImGui::SetNextItemWidth(comboW);
+        int vm = (int)m_renderer->GetViewMode();
+        if (ImGui::Combo("##viewmode", &vm, kViewModes, IM_ARRAYSIZE(kViewModes)))
+            m_renderer->SetViewMode((Renderer::ViewMode)vm);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("View Mode: Lit / Unlit / Wireframe");
+    }
 
     ImGui::PopStyleVar(2);
 }
@@ -2307,6 +3288,26 @@ void EditorLayer::RenderInspectorPanel()
     ImGui::TextColored(ImVec4(1.f, 0.85f, 0.4f, 1.f), "%s", name.c_str());
     ImGui::SameLine();
     ImGui::TextDisabled("[id=%u]", m_selectedEntity);
+    // If the entity carries a GuidComponent (i.e. something stable refs it
+    // across save/load), surface its GUID next to the volatile Entity id —
+    // copy-paste-able from the header without diving into the GUID
+    // component row. Click the badge to copy the full hex to the clipboard.
+    if (auto* gc = m_world->GetComponent<GuidComponent>(m_selectedEntity);
+        gc && gc->guid.IsValid())
+    {
+        const std::string fullGuid = gc->guid.ToString();
+        ImGui::SameLine();
+        char shortBadge[24];
+        // Show only the first 8 hex chars in the header — full GUID is
+        // 36 chars and would dominate the line. Tooltip + click-to-copy
+        // expose the full value when needed.
+        std::snprintf(shortBadge, sizeof(shortBadge), "[guid:%.8s]", fullGuid.c_str());
+        ImGui::TextDisabled("%s", shortBadge);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s\n(click to copy)", fullGuid.c_str());
+        if (ImGui::IsItemClicked())
+            ImGui::SetClipboardText(fullGuid.c_str());
+    }
     ImGui::Separator();
 
     // ---- Component badge strip — pills for every type attached to entity. ----
@@ -2395,8 +3396,10 @@ void EditorLayer::RenderInspectorPanel()
     {
         void* compPtr = entry->fetch(*m_world, m_selectedEntity);
         ImGui::PushID(entry->label.c_str());
-        bool open = ImGui::CollapsingHeader(entry->label.c_str(),
-                                             ImGuiTreeNodeFlags_DefaultOpen);
+        const ImGuiTreeNodeFlags hdrFlags = entry->defaultCollapsed
+                                          ? ImGuiTreeNodeFlags_None
+                                          : ImGuiTreeNodeFlags_DefaultOpen;
+        bool open = ImGui::CollapsingHeader(entry->label.c_str(), hdrFlags);
 
         // Right-click on the header to remove
         if (entry->remove && ImGui::BeginPopupContextItem("##comp_ctx"))
@@ -2511,13 +3514,16 @@ void EditorLayer::RenderInspectorPanel()
             // Preferred category order; unlisted go alphabetical, "Misc" pinned last.
             static const char* const kCategoryOrder[] = {
                 "Transform",
-                "Camera",
                 "Rendering",
                 "Lighting",
-                "Physics",
+                "Environment",
+                "Camera",
                 "Animation",
+                "Physics",
+                "Gameplay",
                 "VFX",
                 "Post-Process",
+                "UI",
                 "AI / Script",
                 "Attachment",
             };
@@ -4497,7 +5503,7 @@ void EditorLayer::RenderPostProcessPanel()
     }
     PostProcess::ParameterStore& ppParams = ppStack->GetParameters();
 
-    // ---- Config Save/Load — persists panel state as .ippc; bound path stamped into next SaveWorld. ----
+    // ---- Config Save/Load — persists panel state as .ippc; bound path stamped into next SaveScene. ----
     if (ImGui::CollapsingHeader("Config", 0))
     {
         static constexpr const char* kPPCFilter =
@@ -4548,21 +5554,33 @@ void EditorLayer::RenderPostProcessPanel()
         &ppParams.GetTonemapping().bloomStrength, 0.f, 1.f, "%.3f");
     ImGui::Separator();
 
+    // ---- AA mode selector --------------------------------------------------
+    // Drives both TAA and FXAA enabled flags via Renderer::SetAAMode. Jitter
+    // follows TAA's IsEnabled, so FXAA-only / None modes render without jitter.
+    if (m_renderer)
+    {
+        const char* kAAModes[] = { "None", "FXAA", "TAA", "FXAA + TAA" };
+        int aaMode = static_cast<int>(m_renderer->GetAAMode());
+        if (ImGui::Combo("AA Mode", &aaMode, kAAModes, IM_ARRAYSIZE(kAAModes)))
+            m_renderer->SetAAMode(static_cast<Renderer::AAMode>(aaMode));
+        ImGui::SameLine();
+        ImGui::TextDisabled("(FXAA spatial, TAA temporal, combo for both)");
+    }
+
     // ---- TAA ----------------------------------------------------------------
     if (TAAPass* taa = m_renderer ? m_renderer->GetTAAPass() : nullptr)
     {
         if (ImGui::CollapsingHeader("Temporal AA (TAA)", 0))
         {
-            bool taaOn = taa->IsEnabled();
-            if (ImGui::Checkbox("Enabled##TAA", &taaOn))
-                taa->SetEnabled(taaOn);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(off → raw HDR, no jitter)");
 
-            // History τ (s): longer=smoother, slower to react. ~0.08 fast specular, ~0.3 diffuse scenes.
-            ImGui::SliderFloat("History τ (s)", &taa->tauHistory, 0.02f, 1.0f, "%.3f");
+            // Direct history blend weight. α_diffuse = 1 - w; α_spec = α_diffuse*0.125.
+            // 0.0 ≈ TAA off (each frame fully replaced), 0.9 default (UE-class
+            // integration), 0.95 cinematic. Drop toward 0.5 for ghost-prone
+            // surfaces (foliage / curtains). Replaced the τ(seconds) slider on
+            // 2026-05-24 — see TAA_Common.hlsli cbuffer comment for rationale.
+            ImGui::SliderFloat("History weight", &taa->historyWeight, 0.0f, 0.99f, "%.3f");
             ImGui::SameLine();
-            ImGui::TextDisabled("(longer = smoother, slower to react)");
+            ImGui::TextDisabled("(higher = more history, more ghost-prone)");
 
             // Variance-clip box widths (YCoCg AABB). Lower=tighter clamp; Falcor default 1.0, 1.5 reduces distant shimmer.
             ImGui::SliderFloat("Box σ (base)",       &taa->colorBoxSigma,         0.5f, 4.0f, "%.2f");
@@ -4577,6 +5595,41 @@ void EditorLayer::RenderPostProcessPanel()
 
             // Karis 5-tap unsharp on de-jittered curr. 0=off, 0.1 default. >0.2 ringy on high-contrast edges.
             ImGui::SliderFloat("Sharpen strength", &taa->sharpenStrength, 0.0f, 0.3f, "%.2f");
+
+            // Outline-aware history weakening. OutlinePass tags rim pixels via
+            // stencil bit; TAA floors α to this value on those pixels so the
+            // outline tracks the silhouette instead of ghosting. 0 disables;
+            // 0.5 ≈ 3-frame convergence; 1.0 = no history (slightly aliased rim).
+            ImGui::SliderFloat("Outline α floor", &taa->outlineMinAlpha, 0.0f, 1.0f, "%.2f");
+        }
+    }
+
+    // ---- FXAA --------------------------------------------------------------
+    if (FXAAPass* fxaa = m_renderer ? m_renderer->GetFXAAPass() : nullptr)
+    {
+        if (ImGui::CollapsingHeader("Fast Approximate AA (FXAA)", 0))
+        {
+            ImGui::TextDisabled("Active when AA Mode is FXAA or FXAA + TAA");
+            // Quality knobs from NVIDIA FXAA 3.11 reference.
+            // qualitySubpix: subpixel softening. 0 hard edges, 0.75 default, 1 max blur.
+            ImGui::SliderFloat("Subpixel quality",     &fxaa->qualitySubpix,           0.0f, 1.0f,  "%.2f");
+            // Edge threshold: relative contrast minimum. 0.063 high quality, 0.166 default.
+            ImGui::SliderFloat("Edge threshold",       &fxaa->qualityEdgeThreshold,    0.04f, 0.4f, "%.3f");
+            // Edge threshold min: absolute floor. 0.0312 high, 0.0833 default.
+            ImGui::SliderFloat("Edge threshold (min)", &fxaa->qualityEdgeThresholdMin, 0.02f, 0.2f, "%.4f");
+        }
+    }
+
+    // ---- Outline DIAG -------------------------------------------------------
+    // TEMP: toggles to isolate which sub-pass causes the perceived "outline
+    // lag" during character motion.  See OutlinePass.h for details.
+    if (OutlinePass* op = m_renderer ? m_renderer->GetOutlinePass() : nullptr)
+    {
+        if (ImGui::CollapsingHeader("Outline DIAG", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            ImGui::Checkbox("Skip Hull (sub-pass 1)",         &op->diagSkipHull);
+            ImGui::Checkbox("Skip Screen-space (sub-pass 3)", &op->diagSkipScreenSpace);
+            ImGui::TextDisabled("Flip during motion to find which layer lags.");
         }
     }
 
@@ -4692,149 +5745,76 @@ void EditorLayer::RenderPostProcessPanel()
 
     ImGui::Separator();
 
-    // ---- Sky / Atmosphere ---------------------------------------------------
-    SkyIBLPass* sky = m_renderer ? m_renderer->GetSkyIBLPass() : nullptr;
-    if (sky && ImGui::CollapsingHeader("Sky / Atmosphere", 0))
+    // ---- Sky / Atmosphere knobs now live on AtmosphereComponent. ------------
+    // Select the Sky entity in Hierarchy to edit procedural-atmosphere fields.
+
+    // ---- Volumetric Fog -----------------------------------------------------
+    VolumetricFogPass* fogPass = m_renderer ? m_renderer->GetVolumetricFogPass() : nullptr;
+    if (fogPass && ImGui::CollapsingHeader("Volumetric Fog", 0))
     {
-        bool atmos = sky->IsAtmosphereEnabled();
-        if (ImGui::Checkbox("Procedural Atmosphere", &atmos))
-            sky->SetAtmosphereEnabled(atmos);
+        bool fogOn = fogPass->IsEnabled();
+        if (ImGui::Checkbox("Enable Volumetric Fog", &fogOn))
+            fogPass->SetEnabled(fogOn);
 
-        // Skybox source selector.
-        static const char* kSrcNames[] = { "Atmosphere", "Static Cubemap" };
-        int src = static_cast<int>(sky->GetSkyboxSource());
-        if (ImGui::Combo("Skybox Source", &src, kSrcNames, 2))
-            sky->SetSkyboxSource(static_cast<SkyIBLPass::SkyboxSource>(src));
+        float density = fogPass->GetDensity();
+        if (ImGui::SliderFloat("Fog Density", &density, 0.0f, 0.5f, "%.4f"))
+            fogPass->SetDensity(density);
 
-        ImGui::Separator();
-        ImGui::TextDisabled("Brightness");
+        float scat = fogPass->GetScattering();
+        if (ImGui::SliderFloat("Scattering", &scat, 0.0f, 2.0f, "%.2f"))
+            fogPass->SetScattering(scat);
 
-        // Master brightness — scales sun radiance for scattering/SH/prefilter/direct lighting (when TOD active).
-        float sunScale = sky->GetSunIntensityScale();
-        if (ImGui::SliderFloat("Sun Intensity", &sunScale, 0.0f, 5.0f, "%.2f x"))
-            sky->SetSunIntensityScale(sunScale);
-        ImGui::TextDisabled("Active only while Time-of-Day is enabled.");
+        float absorp = fogPass->GetAbsorption();
+        if (ImGui::SliderFloat("Absorption", &absorp, 0.0f, 0.2f, "%.4f"))
+            fogPass->SetAbsorption(absorp);
 
-        // Global IBL strength — SPECULAR IBL scalar only (post DDGI integration).
-        // Diffuse strength is governed by IndirectLightingSettings.{ddgi,skyIBL}DiffuseScale,
-        // so adjusting this slider should NOT change DDGI / Sky-fallback diffuse intensity.
-        float iblStr = sky->GetIBLStrength();
-        if (ImGui::SliderFloat("IBL Specular Strength", &iblStr, 0.0f, 3.0f, "%.2f"))
-            sky->SetIBLStrength(iblStr);
-        ImGui::TextDisabled("Affects specular IBL only. Diffuse uses DDGI/Sky scales");
-        ImGui::TextDisabled("(see Indirect Lighting Settings).");
+        float aniso = fogPass->GetAnisotropy();
+        if (ImGui::SliderFloat("Anisotropy (HG g)", &aniso, -0.99f, 0.99f, "%.2f"))
+            fogPass->SetAnisotropy(aniso);
 
-        // Flat ambient fill — constant added regardless of IBL. Zero for pure IBL, bump for stylised lifted-shadow look.
-        DirectX::XMFLOAT3 ambient = sky->GetAmbientColor();
-        if (ImGui::ColorEdit3("Flat Ambient", &ambient.x,
-                              ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR))
-            sky->SetAmbientColor(ambient);
-        ImGui::TextDisabled("Added unconditionally (independent of IBL strength).");
+        float hStart = fogPass->GetHeightStart();
+        float hFall  = fogPass->GetHeightFalloff();
+        bool hChanged = false;
+        hChanged |= ImGui::SliderFloat("Height Start", &hStart, -50.0f, 200.0f, "%.1f");
+        hChanged |= ImGui::SliderFloat("Height Falloff", &hFall, 0.0f, 1.0f, "%.4f");
+        if (hChanged) fogPass->SetHeight(hStart, hFall);
 
-        ImGui::Separator();
-        ImGui::TextDisabled("Day / Night Cycle");
+        float zNear = fogPass->GetRangeNear();
+        float zFar  = fogPass->GetRangeFar();
+        bool rChanged = false;
+        rChanged |= ImGui::SliderFloat("Froxel Near", &zNear, 0.1f, 10.0f, "%.2f");
+        rChanged |= ImGui::SliderFloat("Froxel Far",  &zFar, 10.0f, 500.0f, "%.1f");
+        if (rChanged) fogPass->SetRange(zNear, zFar);
 
-        bool tod = sky->IsTimeOfDayEnabled();
-        if (ImGui::Checkbox("Enable Time-of-Day", &tod))
-            sky->SetTimeOfDayEnabled(tod);
+        float ambContrib = fogPass->GetAmbientContribution();
+        if (ImGui::SliderFloat("Ambient Contribution", &ambContrib, 0.0f, 5.0f, "%.2f"))
+            fogPass->SetAmbient({0.4f, 0.55f, 0.85f}, ambContrib);
 
-        float t = sky->GetTimeOfDay();
-        if (ImGui::SliderFloat("Time (0=midnight, 0.5=noon)", &t, 0.0f, 1.0f, "%.3f"))
-            sky->SetTimeOfDay(t);
-
-        float spd = sky->GetTimeSpeed();
-        // Speed in "fraction of a day per second". 1/60 = 1 real minute per in-game day.
-        if (ImGui::SliderFloat("Speed (day/sec)", &spd, 0.0f, 0.5f, "%.4f"))
-            sky->SetTimeSpeed(spd);
-
-        float lat = sky->GetLatitude();
-        float latDeg = lat * 180.0f / 3.14159265f;
-        if (ImGui::SliderFloat("Latitude (deg)", &latDeg, -89.0f, 89.0f, "%.1f"))
-            sky->SetLatitude(latDeg * 3.14159265f / 180.0f);
-
-        ImGui::TextDisabled("Sun direction + color are written back into LightCB");
-        ImGui::TextDisabled("when Time-of-Day is enabled.");
-
-        // ---- Volumetric Fog ---------------------------------------------------
-        VolumetricFogPass* fogPass = m_renderer ? m_renderer->GetVolumetricFogPass() : nullptr;
-        if (fogPass)
+        // Temporal reprojection (smooths noise / amortises samples).
+        bool tempOn = fogPass->IsTemporalEnabled();
+        if (ImGui::Checkbox("Temporal Reprojection", &tempOn))
+            fogPass->SetTemporalEnabled(tempOn);
+        if (tempOn)
         {
-            ImGui::Separator();
-            ImGui::TextDisabled("Volumetric Fog");
-
-            bool fogOn = fogPass->IsEnabled();
-            if (ImGui::Checkbox("Enable Volumetric Fog", &fogOn))
-                fogPass->SetEnabled(fogOn);
-
-            float density = fogPass->GetDensity();
-            if (ImGui::SliderFloat("Fog Density", &density, 0.0f, 0.5f, "%.4f"))
-                fogPass->SetDensity(density);
-
-            float scat = fogPass->GetScattering();
-            if (ImGui::SliderFloat("Scattering", &scat, 0.0f, 2.0f, "%.2f"))
-                fogPass->SetScattering(scat);
-
-            float absorp = fogPass->GetAbsorption();
-            if (ImGui::SliderFloat("Absorption", &absorp, 0.0f, 0.2f, "%.4f"))
-                fogPass->SetAbsorption(absorp);
-
-            float aniso = fogPass->GetAnisotropy();
-            if (ImGui::SliderFloat("Anisotropy (HG g)", &aniso, -0.99f, 0.99f, "%.2f"))
-                fogPass->SetAnisotropy(aniso);
-
-            float hStart = fogPass->GetHeightStart();
-            float hFall  = fogPass->GetHeightFalloff();
-            bool hChanged = false;
-            hChanged |= ImGui::SliderFloat("Height Start", &hStart, -50.0f, 200.0f, "%.1f");
-            hChanged |= ImGui::SliderFloat("Height Falloff", &hFall, 0.0f, 1.0f, "%.4f");
-            if (hChanged) fogPass->SetHeight(hStart, hFall);
-
-            float zNear = fogPass->GetRangeNear();
-            float zFar  = fogPass->GetRangeFar();
-            bool rChanged = false;
-            rChanged |= ImGui::SliderFloat("Froxel Near", &zNear, 0.1f, 10.0f, "%.2f");
-            rChanged |= ImGui::SliderFloat("Froxel Far",  &zFar, 10.0f, 500.0f, "%.1f");
-            if (rChanged) fogPass->SetRange(zNear, zFar);
-
-            float ambContrib = fogPass->GetAmbientContribution();
-            if (ImGui::SliderFloat("Ambient Contribution", &ambContrib, 0.0f, 5.0f, "%.2f"))
-                fogPass->SetAmbient({0.4f, 0.55f, 0.85f}, ambContrib);
-
-            // Temporal reprojection (smooths noise / amortises samples).
-            bool tempOn = fogPass->IsTemporalEnabled();
-            if (ImGui::Checkbox("Temporal Reprojection", &tempOn))
-                fogPass->SetTemporalEnabled(tempOn);
-            if (tempOn)
-            {
-                float tAlpha = fogPass->GetTemporalAlpha();
-                if (ImGui::SliderFloat("Temporal Alpha", &tAlpha, 0.01f, 1.0f, "%.3f"))
-                    fogPass->SetTemporalAlpha(tAlpha);
-                ImGui::TextDisabled("Lower = more smoothing, slower to react.");
-            }
-
-            ImGui::TextDisabled("Apply pass blends scattering between Lighting & post-process.");
-
-            // ---- Live diagnostic — verifies VolumetricLightComponent is reaching the shader. ----
-            ImGui::Separator();
-            ImGui::TextDisabled("Live State (from scene)");
-            float sunStr = fogPass->GetSunStrengthDebug();
-            const auto&  sd = fogPass->GetSunDirDebug();
-            const auto&  sc = fogPass->GetSunColorDebug();
-            ImGui::Text("Sun Strength: %.3f %s", sunStr,
-                        sunStr > 0.001f ? "[ACTIVE]" : "[OFF — add VolumetricLightComponent]");
-            ImGui::Text("Sun Dir:  (%.2f, %.2f, %.2f)", sd.x, sd.y, sd.z);
-            ImGui::Text("Sun Color:(%.2f, %.2f, %.2f)", sc.x, sc.y, sc.z);
-            ImGui::Text("Volumetric Lights: %u", fogPass->GetVolumetricLightCount());
+            float tAlpha = fogPass->GetTemporalAlpha();
+            if (ImGui::SliderFloat("Temporal Alpha", &tAlpha, 0.01f, 1.0f, "%.3f"))
+                fogPass->SetTemporalAlpha(tAlpha);
+            ImGui::TextDisabled("Lower = more smoothing, slower to react.");
         }
 
-        ImGui::Separator();
-        ImGui::TextDisabled("Aerial Perspective (distance fog)");
+        ImGui::TextDisabled("Apply pass blends scattering between Lighting & post-process.");
 
-        bool apOn = sky->IsAerialCompositeEnabled();
-        if (ImGui::Checkbox("Enable Aerial Perspective", &apOn))
-            sky->SetAerialCompositeEnabled(apOn);
-        ImGui::TextDisabled("Off by default: requires scene to use 1 unit = 1 metre");
-        ImGui::TextDisabled("so distKm mapping in the shader is correct.");
+        // Live diagnostic — verifies VolumetricLightComponent is reaching the shader.
+        ImGui::Separator();
+        ImGui::TextDisabled("Live State (from scene)");
+        float sunStr = fogPass->GetSunStrengthDebug();
+        const auto&  sd = fogPass->GetSunDirDebug();
+        const auto&  sc = fogPass->GetSunColorDebug();
+        ImGui::Text("Sun Strength: %.3f %s", sunStr,
+                    sunStr > 0.001f ? "[ACTIVE]" : "[OFF — add VolumetricLightComponent]");
+        ImGui::Text("Sun Dir:  (%.2f, %.2f, %.2f)", sd.x, sd.y, sd.z);
+        ImGui::Text("Sun Color:(%.2f, %.2f, %.2f)", sc.x, sc.y, sc.z);
+        ImGui::Text("Volumetric Lights: %u", fogPass->GetVolumetricLightCount());
     }
 
     ImGui::Separator();
@@ -5312,13 +6292,236 @@ namespace
     }
 } // namespace
 
+// ---------------------------------------------------------------------------
+// DrawScriptExposedVars — runtime-generated inspector for a Logic script's
+// editor-exposed variables. The schema (types/defaults/ranges) comes from the
+// script's `exposed` table via ScriptSystem; the per-entity values live on the
+// ScriptComponent's `vars` override map and serialize with the scene. Edits in
+// Play mode are pushed onto the live Lua instance immediately.
+// ---------------------------------------------------------------------------
+void EditorLayer::DrawScriptExposedVars(ScriptComponent& sc, World* /*world*/, Entity e)
+{
+    if (!m_scriptSys || sc.scriptPath.empty()) return;
+
+    const std::vector<ScriptVarDesc>& schema = m_scriptSys->GetExposedSchema(sc.scriptPath);
+
+    ImGui::Separator();
+    if (schema.empty())
+    {
+        ImGui::TextDisabled("No exposed variables");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Declare a `T.exposed = { ... }` table in the script to surface tunable values here.");
+        return;
+    }
+    ImGui::TextDisabled("Exposed Variables");
+
+    // Map an asset extension to the drag-drop payload the Resource panel emits.
+    auto payloadForExt = [](const std::string& ext) -> const char* {
+        if (ext == ".itex" || ext == ".dds" || ext == ".png" || ext == ".tga") return "ITEX_PATH";
+        if (ext == ".imat")                       return "IMAT_PATH";
+        if (ext == ".ianim")                      return "IANIM_PATH";
+        if (ext == ".iskel")                      return "ISKEL_PATH";
+        if (ext == ".iscn")                       return "ISCN_PATH";
+        if (ext == ".ipfb" || ext == ".prefab")   return "IPFB_PATH";
+        if (ext == ".lua")                        return "ILUA_PATH";
+        if (ext == ".hlsl" || ext == ".ihlsl")    return "IHLSL_PATH";
+        return nullptr;
+    };
+
+    const bool playing = (m_playState != ViewportPlayState::Stopped);
+    const float btnW   = ImGui::GetFrameHeight();
+    bool anyChanged    = false;
+
+    for (const ScriptVarDesc& d : schema)
+    {
+        ImGui::PushID(d.name.c_str());
+
+        const bool        overridden = (sc.vars.find(d.name) != sc.vars.end());
+        const ScriptVarValue cur     = ResolveScriptVar(d, sc.vars);
+        const char* label = d.label.empty() ? d.name.c_str() : d.label.c_str();
+
+        ScriptVarValue next    = cur;
+        bool           changed = false;
+
+        // Reserve room for the trailing reset button (checkbox ignores width).
+        if (d.type != ScriptVarType::Bool)
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - btnW - ImGui::GetStyle().ItemSpacing.x);
+
+        switch (d.type)
+        {
+        case ScriptVarType::Float:
+        {
+            float v = cur.data.f;
+            if (d.hasMin && d.hasMax)
+                changed = ImGui::SliderFloat(label, &v, d.minVal, d.maxVal);
+            else
+                changed = ImGui::DragFloat(label, &v, d.speed > 0.f ? d.speed : 0.01f,
+                                           d.hasMin ? d.minVal : 0.f, d.hasMax ? d.maxVal : 0.f);
+            if (changed) next = ScriptVarValue::MakeFloat(v);
+        } break;
+        case ScriptVarType::Int:
+        {
+            int v = cur.data.i;
+            if (d.hasMin && d.hasMax)
+                changed = ImGui::SliderInt(label, &v, (int)d.minVal, (int)d.maxVal);
+            else
+                changed = ImGui::DragInt(label, &v, d.speed > 0.f ? d.speed : 1.f,
+                                         d.hasMin ? (int)d.minVal : 0, d.hasMax ? (int)d.maxVal : 0);
+            if (changed) next = ScriptVarValue::MakeInt(v);
+        } break;
+        case ScriptVarType::Bool:
+        {
+            bool v = cur.data.b;
+            changed = ImGui::Checkbox(label, &v);
+            if (changed) next = ScriptVarValue::MakeBool(v);
+        } break;
+        case ScriptVarType::Float3:
+        {
+            float v[3] = { cur.data.v3[0], cur.data.v3[1], cur.data.v3[2] };
+            changed = ImGui::DragFloat3(label, v, d.speed > 0.f ? d.speed : 0.01f,
+                                        d.hasMin ? d.minVal : 0.f, d.hasMax ? d.maxVal : 0.f);
+            if (changed) next = ScriptVarValue::MakeFloat3(v[0], v[1], v[2]);
+        } break;
+        case ScriptVarType::Color:
+        {
+            float v[3] = { cur.data.v3[0], cur.data.v3[1], cur.data.v3[2] };
+            ImGuiColorEditFlags flags = ImGuiColorEditFlags_Float;
+            if (d.hdr) flags |= ImGuiColorEditFlags_HDR;
+            changed = ImGui::ColorEdit3(label, v, flags);
+            if (changed) next = ScriptVarValue::MakeColor(v[0], v[1], v[2]);
+        } break;
+        case ScriptVarType::String:
+        {
+            char buf[512];
+            strncpy_s(buf, cur.str.c_str(), _TRUNCATE);
+            if (ImGui::InputText(label, buf, sizeof(buf)))
+            {
+                next = ScriptVarValue::MakeString(buf);
+                changed = true;
+            }
+        } break;
+        case ScriptVarType::Asset:
+        {
+            char buf[512];
+            strncpy_s(buf, cur.str.c_str(), _TRUNCATE);
+            if (ImGui::InputText(label, buf, sizeof(buf)))
+            {
+                next = ScriptVarValue::MakeAsset(buf);
+                changed = true;
+            }
+            if (const char* payload = payloadForExt(d.assetExt))
+            {
+                if (ImGui::BeginDragDropTarget())
+                {
+                    if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(payload))
+                    {
+                        const char* dropped = static_cast<const char*>(p->Data);
+                        if (dropped && *dropped) { next = ScriptVarValue::MakeAsset(dropped); changed = true; }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+            }
+        } break;
+        case ScriptVarType::Entity:
+        {
+            int id = (int)cur.data.entity;
+            if (ImGui::DragInt(label, &id, 0.2f, 0, 0))
+            {
+                next = ScriptVarValue::MakeEntity((uint32_t)(id < 0 ? 0 : id));
+                changed = true;
+            }
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ENTITY"))
+                {
+                    const Entity de = *static_cast<const Entity*>(p->Data);
+                    next = ScriptVarValue::MakeEntity((uint32_t)de);
+                    changed = true;
+                }
+                ImGui::EndDragDropTarget();
+            }
+        } break;
+        }
+
+        if (!d.tooltip.empty() && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", d.tooltip.c_str());
+
+        // Trailing reset-to-default button (enabled only when this entity has
+        // an override stored for the variable).
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!overridden);
+        const bool resetClicked = ImGui::Button("R", ImVec2(btnW, 0));
+        ImGui::EndDisabled();
+        if (overridden && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Reset '%s' to default", d.name.c_str());
+
+        ImGui::PopID();
+
+        if (changed)            // widget edit → store / refresh the per-entity override
+        {
+            sc.vars[d.name] = next;
+            anyChanged = true;
+        }
+        else if (resetClicked)  // drop the override → falls back to schema default
+        {
+            sc.vars.erase(d.name);
+            anyChanged = true;
+        }
+    }
+
+    if (anyChanged && playing)
+        m_scriptSys->ApplyExposedVars(e, sc.vars);
+}
+
 // ---- RegisterDefaultEditors — all built-in component editor + tag registrations. Call once after SetRenderer(). ----
 void EditorLayer::RegisterDefaultEditors()
 {
     Renderer* renderer = m_renderer; // captured by lambdas below
 
-    // Pure descriptor — yaw/pitch sliders, FOV via angle conversion, etc.
+    // Pure descriptor — FOV via angle conversion, near/far planes.
     RegisterReflectedComponent<CameraComponent>("Camera", /*priority*/ 5);
+
+    // FPS controller state — yaw/pitch sliders + mouse/move tuning. The
+    // camera pose itself is edited through the Local Transform component.
+    // followTarget is an AttachmentRef — picker rendered here in postDraw
+    // (REFLECT_BEGIN intentionally omits it; see ComponentReflection.h).
+    RegisterReflectedComponent<CameraControllerComponent>(
+        "Camera Controller", /*priority*/ 6,
+        [](CameraControllerComponent& c, World* w, Entity e)
+    {
+        if (!w) return;
+        if (c.mode != CameraControllerComponent::Mode::Free)
+            Editor::DrawAttachmentRef("Follow Target", *w, e, c.followTarget);
+    });
+
+    // ---- Camera stack pipeline (DesignMd/camera_stack_system.md) ---------
+    RegisterReflectedComponent<VirtualCameraComponent>("Virtual Camera (VCam)", /*priority*/ 7);
+    RegisterReflectedComponent<CameraPoseComponent>   ("Camera Pose",           /*priority*/ 8);
+    RegisterReflectedComponent<VCamPriorityComponent> ("VCam Priority",         /*priority*/ 9);
+    RegisterReflectedComponent<VCamBlendComponent>    ("VCam Blend",            /*priority*/ 10);
+    RegisterReflectedComponent<FollowCameraComponent>(
+        "Follow Camera", /*priority*/ 11,
+        [](FollowCameraComponent& fc, World* w, Entity e)
+    {
+        if (w) Editor::DrawAttachmentRef("Target", *w, e, fc.target);
+    });
+    RegisterReflectedComponent<AimCameraComponent>(
+        "Aim Camera", /*priority*/ 12,
+        [](AimCameraComponent& ac, World* w, Entity e)
+    {
+        if (w) Editor::DrawAttachmentRef("Target", *w, e, ac.target);
+    });
+    RegisterReflectedComponent<CameraShakeComponent>  ("Camera Shake",          /*priority*/ 13);
+    RegisterReflectedComponent<LiveCameraComponent>   ("Live Camera (read-only)", /*priority*/ 14);
+
+    // ---- Identity (DesignMd/entity_persistence_architecture.md) ---------
+    // GuidComponent is intentionally NOT registered in the Inspector — it
+    // has no user-editable fields (regenerating breaks every existing ref)
+    // and is surfaced via the [guid:xxxxxxxx] badge in the Inspector
+    // header instead. BindAndStamp auto-adds the component whenever an
+    // AttachmentRef is dropped onto, so users never need to add it
+    // manually either.
+    RegisterComponentTag<PersistentTag>("Persistent (save-game)");
 
     // LocalTransform — descriptor with custom Euler-degree widget for rotation.
     RegisterReflectedComponent<LocalTransform>("Local Transform", /*priority*/ 0);
@@ -5354,9 +6557,97 @@ void EditorLayer::RegisterDefaultEditors()
 
     // Collider — shape-conditional visibility for halfExtents/radius/halfHeight.
     RegisterReflectedComponent<ColliderComponent>("Collider", /*priority*/ 21);
+    // AI strategic / tactical / sensing components grouped at the old
+    // NavAgent slot (22). Order matters for the inspector list — AIIntent
+    // (strategic, top) → NavAgent (tactical, mid) → Perception (sensing).
+    RegisterReflectedComponent<AIIntentComponent> ("AI Intent",   /*priority*/ 22);
+    RegisterReflectedComponent<NavAgentComponent> ("NavAgent",    /*priority*/ 22);
+    RegisterReflectedComponent<PerceptionComponent>("Perception", /*priority*/ 22);
+
+    // CharacterControllerComponent — KCC tuning. postDraw shows live ground
+    // state + velocity so authors can verify capsule sits on the floor while
+    // tweaking radius/halfHeight from the Inspector.
+    RegisterReflectedComponent<CharacterControllerComponent>("Character Controller",
+        /*priority*/ 23,
+        [](CharacterControllerComponent& cc, World* /*world*/, Entity /*e*/)
+        {
+            ImGui::Separator();
+            ImGui::TextDisabled("Runtime state");
+            ImGui::Text("Grounded: %s%s", cc.isGrounded ? "yes" : "no",
+                        (cc.isGrounded != cc.wasGrounded) ? " (changed)" : "");
+            const float horizSq = cc.velocity.x * cc.velocity.x
+                                + cc.velocity.z * cc.velocity.z;
+            ImGui::Text("Velocity: %.2f, %.2f, %.2f  (|h|=%.2f)",
+                        cc.velocity.x, cc.velocity.y, cc.velocity.z,
+                        sqrtf(horizSq));
+            ImGui::Text("Time In Air: %.2fs", cc.timeInAir);
+            if (cc.groundEntity != NullEntity)
+                ImGui::Text("Ground Entity: %u  (normal %.2f, %.2f, %.2f)",
+                            cc.groundEntity, cc.groundNormal.x, cc.groundNormal.y, cc.groundNormal.z);
+            else
+                ImGui::TextDisabled("Airborne — no ground body");
+        });
+
+    // PlayerComponent — gameplay-side tuning.
+    RegisterReflectedComponent<PlayerComponent>(
+        "Player", /*priority*/ 24,
+        [](PlayerComponent& pc, World* w, Entity e)
+    {
+        if (w) Editor::DrawAttachmentRef("Camera Entity (empty = main)",
+                                         *w, e, pc.cameraEntity);
+    });
 
     // MeshHandle — primitive picker driven by descriptor enum.
     RegisterReflectedComponent<MeshHandle>("Mesh");
+
+    // VideoComponent — descriptor handles every field; postDraw appends the
+    // play / pause / stop / restart buttons + seek slider + read-only
+    // debug stats (clock, decoded PTS, frames).
+    RegisterReflectedComponent<VideoComponent>("Video",
+        /*priority*/ 50,
+        [](VideoComponent& vc, World*, Entity)
+        {
+            ImGui::Separator();
+            ImGui::Text("Transport");
+            if (ImGui::Button("Play"))    Video::Play(vc);     ImGui::SameLine();
+            if (ImGui::Button("Pause"))   Video::Pause(vc);    ImGui::SameLine();
+            if (ImGui::Button("Stop"))    Video::Stop(vc);     ImGui::SameLine();
+            if (ImGui::Button("Restart")) Video::Restart(vc);
+
+            // Seek slider — uses frameSource duration when known, else a
+            // generous default of 300 s so the slider still has a useful
+            // range for live / unknown-length streams.
+            double duration = -1.0;
+            if (vc.frameSource)        duration = vc.frameSource->GetDurationSeconds();
+            else if (vc.decodedFrameSource)
+                                       duration = vc.decodedFrameSource->GetDurationSeconds();
+            float maxT = (duration > 0.0) ? (float)duration : 300.0f;
+            float clock = (float)vc.clockSeconds;
+            if (ImGui::SliderFloat("Seek (s)", &clock, 0.f, maxT, "%.3f s"))
+                Video::Seek(vc, (double)clock);
+
+            ImGui::Separator();
+            // Active decode path — derived from which source is set.
+            const char* pathLabel = "(no source — author-driven dpb)";
+            if      (vc.decodedFrameSource) pathLabel = "Decoded source (FFmpeg / Mp4FrameSource)";
+            else if (vc.frameSource)        pathLabel = "Bitstream source (engine D3D12 video decoder)";
+            ImGui::TextDisabled("Decode path     : %s", pathLabel);
+            ImGui::TextDisabled("Clock           : %.3f s", vc.clockSeconds);
+            ImGui::TextDisabled("Last decoded PTS: %.3f s", vc.lastDecodedPts);
+            ImGui::TextDisabled("Frames decoded  : %llu",
+                                (unsigned long long)vc.framesDecoded);
+            ImGui::TextDisabled("Current DPB slot: %u / %zu",
+                                vc.currentDpbSlot, vc.dpb.size());
+            ImGui::TextDisabled("Decoder handle  : %u",
+                                vc.decoder.handle_id);
+        });
+
+    // VisibilityComponent — flag-bits widget (Visible / Cast Shadow / Render In
+    // Main Pass) + viewMask + read-only inheritedHidden. Pinned above Local
+    // Transform (priority -10) and starts collapsed because it's rarely edited
+    // per-entity once authored.
+    RegisterReflectedComponent<VisibilityComponent>("Visibility", /*priority*/ -10);
+    SetComponentDefaultCollapsed<VisibilityComponent>(true);
 
     // UIRootComponent — one entity per HUD/menu; widget tree built in C++/Lua, not ECS-editable.
     RegisterReflectedComponent<UI::UIRootComponent>("UI Root", /*priority*/ 95);
@@ -5377,12 +6668,22 @@ void EditorLayer::RegisterDefaultEditors()
         /*priority*/ 100,
         [](SkyboxComponent& sc, World*, Entity)
         {
-            ImGui::TextDisabled("(IBL Specular Strength: Post Processing -> Sky / Atmosphere.");
-            ImGui::TextDisabled(" Diffuse scales: Indirect Lighting Settings.)");
+            ImGui::TextDisabled("(Atmosphere knobs live on AtmosphereComponent.)");
             ImGui::TextDisabled("Irradiance GPU: %llu", sc.irradianceGpuHandle);
             ImGui::TextDisabled("Radiance GPU:   %llu", sc.radianceGpuHandle);
             ImGui::TextDisabled("Skybox GPU:     %llu", sc.skyboxGpuHandle);
         });
+
+    // Atmosphere — all procedural sky knobs (was Post Processing -> Sky / Atmosphere).
+    RegisterReflectedComponent<AtmosphereComponent>("Atmosphere",     /*priority*/ 101);
+    // Time-of-Day — singleton: TODConfig drives the cycle, TODOutput shows computed state.
+    RegisterReflectedComponent<TODConfigComponent>  ("Time-of-Day",   /*priority*/ 102);
+    RegisterReflectedComponent<TODOutputComponent>  ("TOD Output",    /*priority*/ 103);
+    // Sun / Moon tags — attach to a directional LightData entity to put it under TOD control.
+    RegisterReflectedComponent<SunLightTag>         ("Sun Light Tag", /*priority*/ 104);
+    RegisterReflectedComponent<MoonLightTag>        ("Moon Light Tag",/*priority*/ 105);
+    // Volumetric clouds — author tunables on the Sky entity; TOD drives sun direction/color.
+    RegisterReflectedComponent<CloudComponent>      ("Volumetric Clouds", /*priority*/ 106);
 
     // Terrain — heightmap + 4 PBR layers; path edits trigger TextureSystem rebind in BuildScene_SyncTerrain.
     // Numeric fields feed per-frame TerrainParamsCB so changes show next frame (no reimport).
@@ -5638,6 +6939,11 @@ void EditorLayer::RegisterDefaultEditors()
             }
         });
 
+    // FootIKComponent — opt-in foot ground snap for PMX-rigged characters.
+    // Auto-detects left/right foot IK chains on first tick; designers tweak
+    // raycast range + offset from here. Priority adjacent to Skeleton.
+    RegisterReflectedComponent<FootIKComponent>("Foot IK", /*priority*/ 31);
+
     // AnimationComponent — descriptor for paused/looping/speed; clip combos + scrub sliders need ClipLibrary (postDraw).
     RegisterReflectedComponent<AnimationComponent>("Animation",
         /*priority*/ 30,
@@ -5708,15 +7014,27 @@ void EditorLayer::RegisterDefaultEditors()
         });
 
     // MorphComponent — descriptor for paused/looping; clip combo + weight inspector in postDraw.
+    // Manual mode (no clip bound) lets the user drag mesh-target weights directly to
+    // author multi-morph blends without needing an animation.
     RegisterReflectedComponent<MorphComponent>("Morph",
         /*priority*/ 35,
         [renderer](MorphComponent& morph, World* world, Entity entity)
         {
-            if (!renderer) return;
+            if (!renderer || !world) return;
             const MorphClipLibrary& morphLib  = renderer->GetMorphClipLibrary();
             const uint32_t          clipCount = morphLib.Count();
+
+            // Resolve the skeleton asset for this entity (MorphComponent lives on
+            // the skeleton root, which also carries SkeletonComponent).
+            const SkeletonAsset* skelAsset = nullptr;
+            {
+                auto* sc = world->GetComponent<SkeletonComponent>(entity);
+                if (sc && sc->assetIndex < renderer->GetSkeletonRegistry().Count())
+                    skelAsset = &renderer->GetSkeletonRegistry().Get(sc->assetIndex);
+            }
+
             auto clipLabel = [&](uint32_t idx) -> std::string {
-                if (idx == kInvalidClipIndex) return "(none)";
+                if (idx == kInvalidClipIndex) return "(none - manual)";
                 if (idx >= clipCount)         return "(invalid)";
                 const MorphClipAsset& c = morphLib.Get(idx);
                 char buf[64];
@@ -5725,17 +7043,25 @@ void EditorLayer::RegisterDefaultEditors()
                 return buf;
             };
             ImGui::TextDisabled("Morph Clip");
-            if (clipCount == 0)
-            {
-                ImGui::TextDisabled("No morph clips loaded. Drag a .ianim with morph data.");
-            }
-            else
             {
                 const std::string cur = clipLabel(morph.primaryMorphClip);
                 if (ImGui::BeginCombo("##morph_clip", cur.c_str()))
                 {
-                    if (ImGui::Selectable("(none)", morph.primaryMorphClip == kInvalidClipIndex))
+                    if (ImGui::Selectable("(none - manual)",
+                                          morph.primaryMorphClip == kInvalidClipIndex))
+                    {
                         morph.primaryMorphClip = kInvalidClipIndex;
+                        // Re-key weights to mesh-target indexing for manual mode;
+                        // clip-indexed values left over from a previous clip would
+                        // land on the wrong morph targets, so reset them.
+                        if (skelAsset)
+                        {
+                            morph.count = std::min<uint32_t>(skelAsset->morphTargetCount,
+                                                              MorphComponent::MAX);
+                            for (uint32_t i = 0; i < morph.count; ++i)
+                                morph.weights[i] = 0.f;
+                        }
+                    }
                     for (uint32_t i = 0; i < clipCount; ++i)
                     {
                         const bool sel = (morph.primaryMorphClip == i);
@@ -5746,51 +7072,88 @@ void EditorLayer::RegisterDefaultEditors()
                     ImGui::EndCombo();
                 }
             }
-            const bool hasAnim = world && world->HasComponent<AnimationComponent>(entity);
-            if (!hasAnim && morph.primaryMorphClip != kInvalidClipIndex
-                         && morph.primaryMorphClip < clipCount)
+
+            const bool hasClip = (morph.primaryMorphClip != kInvalidClipIndex
+                               && morph.primaryMorphClip < clipCount);
+            const bool hasAnim = world->HasComponent<AnimationComponent>(entity);
+
+            if (hasClip && !hasAnim)
             {
                 const float dur = morphLib.Get(morph.primaryMorphClip).duration;
                 ImGui::SliderFloat("Time##mt", &morph.time, 0.f,
                                    dur > 0.f ? dur : 1.f, "%.3f s");
             }
-            else if (hasAnim)
+            else if (hasClip && hasAnim)
             {
                 ImGui::TextDisabled("Time synced to AnimationComponent");
             }
+
             ImGui::Separator();
+
+            // ---- Manual mode: drag any mesh morph target ----------------------
+            if (!hasClip)
+            {
+                if (!skelAsset || skelAsset->morphTargetCount == 0)
+                {
+                    ImGui::TextDisabled("(skeleton has no morph targets)");
+                    return;
+                }
+                const uint32_t n = std::min<uint32_t>(skelAsset->morphTargetCount,
+                                                      MorphComponent::MAX);
+                // Ensure count is sized so the skinning subsystem picks weights up.
+                if (morph.count < n) morph.count = n;
+
+                ImGui::TextDisabled("Mesh Morph Targets (%u) - drag to blend:", n);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Reset All##morph_reset"))
+                {
+                    for (uint32_t i = 0; i < n; ++i) morph.weights[i] = 0.f;
+                }
+
+                static ImGuiTextFilter morphFilter;
+                morphFilter.Draw("Filter##morph_filter", 180.f);
+
+                for (uint32_t i = 0; i < n; ++i)
+                {
+                    const char* nm = skelAsset->morphTargetNames[i][0]
+                                     ? skelAsset->morphTargetNames[i] : "(unnamed)";
+                    if (!morphFilter.PassFilter(nm)) continue;
+
+                    char lbl[96];
+                    snprintf(lbl, sizeof(lbl), "%s##mm%u", nm, i);
+                    ImGui::SliderFloat(lbl, &morph.weights[i], 0.f, 1.f);
+                }
+                return;
+            }
+
+            // ---- Clip mode: show sampled weights (editable only when paused) --
             if (morph.count == 0)
             {
                 ImGui::TextDisabled("(weights not yet sampled - play to see values)");
+                return;
             }
-            else
+            ImGui::TextDisabled("Morph Weights (%u channels):", morph.count);
+            const MorphClipAsset& asset  = morphLib.Get(morph.primaryMorphClip);
+            const bool            canEdit = morph.paused && !hasAnim;
+            for (uint32_t i = 0; i < morph.count; ++i)
             {
-                ImGui::TextDisabled("Morph Weights (%u channels):", morph.count);
-                const MorphClipAsset* asset = nullptr;
-                if (morph.primaryMorphClip != kInvalidClipIndex
-                    && morph.primaryMorphClip < clipCount)
-                    asset = &morphLib.Get(morph.primaryMorphClip);
-                const bool canEdit = morph.paused && !hasAnim;
-                for (uint32_t i = 0; i < morph.count; ++i)
+                const char* nm = (i < asset.morphCount && asset.morphNames[i][0])
+                                 ? asset.morphNames[i] : "(unnamed)";
+                if (canEdit)
                 {
-                    const char* nm = (asset && i < asset->morphCount && asset->morphNames[i][0])
-                                     ? asset->morphNames[i] : "(unnamed)";
-                    if (canEdit)
-                    {
-                        char lbl[80];
-                        snprintf(lbl, sizeof(lbl), "[%u] %s", i, nm);
-                        ImGui::SliderFloat(lbl, &morph.weights[i], 0.f, 1.f);
-                    }
-                    else
-                    {
-                        char ov[80];
-                        snprintf(ov, sizeof(ov), "[%u] %s  %.3f", i, nm, morph.weights[i]);
-                        ImGui::ProgressBar(morph.weights[i], ImVec2(-1.f, 0.f), ov);
-                    }
+                    char lbl[96];
+                    snprintf(lbl, sizeof(lbl), "[%u] %s##cw%u", i, nm, i);
+                    ImGui::SliderFloat(lbl, &morph.weights[i], 0.f, 1.f);
                 }
-                if (!canEdit)
-                    ImGui::TextDisabled("(pause morph + remove AnimComp to manually edit weights)");
+                else
+                {
+                    char ov[96];
+                    snprintf(ov, sizeof(ov), "[%u] %s  %.3f", i, nm, morph.weights[i]);
+                    ImGui::ProgressBar(morph.weights[i], ImVec2(-1.f, 0.f), ov);
+                }
             }
+            if (!canEdit)
+                ImGui::TextDisabled("(pause + no AnimComp to edit, or switch clip to (none) for manual)");
         },
         /*requires*/ [](World& w, Entity e) -> bool {
             return w.HasComponent<SkeletonComponent>(e);
@@ -5912,8 +7275,12 @@ void EditorLayer::RegisterDefaultEditors()
             return w.HasComponent<ChainPhysicsComponent>(e);
         });
 
-    // ScriptComponent — enabled + scriptPath; opts into ILUA_PATH drag-drop via REFLECT_STRING_DROP.
-    RegisterReflectedComponent<ScriptComponent>("Script", /*priority*/ 50);
+    // ScriptComponent — enabled + scriptPath (ILUA_PATH drag-drop) plus a
+    // runtime-generated UI for the Logic script's editor-exposed variables.
+    RegisterReflectedComponent<ScriptComponent>("Script", /*priority*/ 50,
+        [this](ScriptComponent& sc, World* w, Entity e) {
+            DrawScriptExposedVars(sc, w, e);
+        });
 
     // SocketComponent — bone combos need live skeleton lookup; full custom postDraw.
     RegisterReflectedComponent<SocketComponent>("Sockets",
@@ -5974,11 +7341,20 @@ void EditorLayer::RegisterDefaultEditors()
 
                     DirectX::XMFLOAT3 offPos{
                         s.localOffset._41, s.localOffset._42, s.localOffset._43 };
-                    if (ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -10.f, 10.f, "%.3f"))
+                    bool offChanged = false;
+                    offChanged |= ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -10.f, 10.f, "%.3f");
+                    offChanged |= ImGui::DragFloat3("Rotation (deg)", &s.rotationEulerDeg.x,
+                                                    0.5f, -360.f, 360.f, "%.2f");
+                    if (offChanged)
                     {
-                        s.localOffset._41 = offPos.x;
-                        s.localOffset._42 = offPos.y;
-                        s.localOffset._43 = offPos.z;
+                        using namespace DirectX;
+                        const XMVECTOR q = XMQuaternionRotationRollPitchYaw(
+                            XMConvertToRadians(s.rotationEulerDeg.x),
+                            XMConvertToRadians(s.rotationEulerDeg.y),
+                            XMConvertToRadians(s.rotationEulerDeg.z));
+                        XMMATRIX M = XMMatrixRotationQuaternion(q);
+                        M.r[3] = XMVectorSet(offPos.x, offPos.y, offPos.z, 1.0f);
+                        XMStoreFloat4x4(&s.localOffset, M);
                     }
 
                     if (ImGui::Button("Remove"))
@@ -6023,11 +7399,20 @@ void EditorLayer::RegisterDefaultEditors()
 
             DirectX::XMFLOAT3 offPos{
                 fe->localOffset._41, fe->localOffset._42, fe->localOffset._43 };
-            if (ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -100.f, 100.f, "%.3f"))
+            bool offChanged = false;
+            offChanged |= ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -100.f, 100.f, "%.3f");
+            offChanged |= ImGui::DragFloat3("Rotation (deg)", &fe->rotationEulerDeg.x,
+                                            0.5f, -360.f, 360.f, "%.2f");
+            if (offChanged)
             {
-                fe->localOffset._41 = offPos.x;
-                fe->localOffset._42 = offPos.y;
-                fe->localOffset._43 = offPos.z;
+                using namespace DirectX;
+                const XMVECTOR q = XMQuaternionRotationRollPitchYaw(
+                    XMConvertToRadians(fe->rotationEulerDeg.x),
+                    XMConvertToRadians(fe->rotationEulerDeg.y),
+                    XMConvertToRadians(fe->rotationEulerDeg.z));
+                XMMATRIX M = XMMatrixRotationQuaternion(q);
+                M.r[3] = XMVectorSet(offPos.x, offPos.y, offPos.z, 1.0f);
+                XMStoreFloat4x4(&fe->localOffset, M);
             }
         });
 
@@ -6077,11 +7462,20 @@ void EditorLayer::RegisterDefaultEditors()
 
             DirectX::XMFLOAT3 offPos{
                 fs->localOffset._41, fs->localOffset._42, fs->localOffset._43 };
-            if (ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -100.f, 100.f, "%.3f"))
+            bool offChanged = false;
+            offChanged |= ImGui::DragFloat3("Offset", &offPos.x, 0.01f, -100.f, 100.f, "%.3f");
+            offChanged |= ImGui::DragFloat3("Rotation (deg)", &fs->rotationEulerDeg.x,
+                                            0.5f, -360.f, 360.f, "%.2f");
+            if (offChanged)
             {
-                fs->localOffset._41 = offPos.x;
-                fs->localOffset._42 = offPos.y;
-                fs->localOffset._43 = offPos.z;
+                using namespace DirectX;
+                const XMVECTOR q = XMQuaternionRotationRollPitchYaw(
+                    XMConvertToRadians(fs->rotationEulerDeg.x),
+                    XMConvertToRadians(fs->rotationEulerDeg.y),
+                    XMConvertToRadians(fs->rotationEulerDeg.z));
+                XMMATRIX M = XMMatrixRotationQuaternion(q);
+                M.r[3] = XMVectorSet(offPos.x, offPos.y, offPos.z, 1.0f);
+                XMStoreFloat4x4(&fs->localOffset, M);
             }
         });
 
@@ -6090,7 +7484,6 @@ void EditorLayer::RegisterDefaultEditors()
     RegisterComponentTag<Parent>               ("Parent");
     RegisterComponentTag<Children>             ("Children");
     RegisterComponentTag<SceneNodeTag>         ("Scene Node");
-    RegisterComponentTag<Visibility>           ("Visibility");
     RegisterComponentTag<RenderLayer>          ("Render Layer");
     RegisterComponentTag<WorldAabb>            ("World AABB");
     RegisterComponentTag<MeshLibRef>           ("Mesh Ref");
@@ -6455,6 +7848,28 @@ void EditorLayer::RegisterDefaultEditors()
                                 tc.trailSlot);
         });
 
+    // Timeline — AnimNotify tracks. Uses the raw RegisterComponentEditor
+    // path (no Reflect::Descriptor) because the nested vector<Track> with
+    // PropertyBag values doesn't map cleanly onto REFLECT_FLOAT / REFLECT_
+    // STRING etc. The full track/notify UI lives in the Timeline Editor
+    // panel; this row just gives a one-line summary + a button to open it.
+    RegisterComponentEditor<TimelineComponent>("Timeline",
+        [this](void* ptr, World*, Entity) {
+            auto& tl = *static_cast<TimelineComponent*>(ptr);
+            size_t numNotifies = 0, numStates = 0;
+            for (const auto& tr : tl.tracks) {
+                numNotifies += tr.notifies.size();
+                numStates   += tr.states.size();
+            }
+            ImGui::Text("%zu tracks, %zu notifies, %zu states",
+                        tl.tracks.size(), numNotifies, numStates);
+            ImGui::Text("Duration: %.2fs", tl.clipDuration);
+            ImGui::TextDisabled("Last observed time: %.3fs", tl.lastObservedTime);
+            if (ImGui::Button("Open Timeline Editor"))
+                m_showTimeline = true;
+        },
+        /*priority*/ 63);
+
     // BeamComponent — descriptor for globals + control points; postDraw seeds default + shader hint.
     RegisterReflectedComponent<BeamComponent>("Beam (Procedural Tube)",
         /*priority*/ 63,
@@ -6486,8 +7901,84 @@ void EditorLayer::RegisterDefaultEditors()
     // AIComponent — descriptor for enabled/tickInterval; postDraw walks BTInstance trace via BTAsset lookup.
     RegisterReflectedComponent<AIComponent>("AI (Behavior Tree)",
         /*priority*/ 65,
-        [](AIComponent& ai, World*, Entity)
+        [aiSys = &m_aiSys](AIComponent& ai, World*, Entity)
         {
+            // BT slot — drag a .bt.lua file from the Resource panel onto
+            // this button to attach. Shows the current path (or a hint when
+            // empty); right-click clears. Loading goes through
+            // AISystem::AcquireTree so the tree is cached by path.
+            const std::string& path = ai.treePath;
+            const char* label = path.empty()
+                ? "Drop .bt.lua here..."
+                : path.c_str();
+
+            ImGui::PushID("##aiTreeSlot");
+            // Use a wide button so the drop zone is obvious.
+            const ImVec2 slotSize(-FLT_MIN, 0);
+            ImGui::Button(label, slotSize);
+
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* p =
+                        ImGui::AcceptDragDropPayload("ILUA_PATH"))
+                {
+                    const char* dropped = static_cast<const char*>(p->Data);
+                    if (*aiSys && dropped && *dropped)
+                    {
+                        if (auto tree = (*aiSys)->AcquireTree(dropped))
+                        {
+                            ai.tree     = tree;
+                            ai.treePath = dropped;
+                            if (!ai.instance)
+                                ai.instance = std::make_unique<AI::BTInstance>();
+                            LOG_INFO("AI: attached '%s' to entity", dropped);
+                        }
+                        else
+                        {
+                            LOG_ERROR("AI: AcquireTree failed for '%s' "
+                                      "(not a valid .bt.lua?)", dropped);
+                        }
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+
+            // Right-click → detach.
+            if (ImGui::BeginPopupContextItem("##aiTreeCtx"))
+            {
+                if (ImGui::MenuItem("Detach", nullptr, false, !path.empty()))
+                {
+                    ai.tree.reset();
+                    ai.instance.reset();
+                    ai.treePath.clear();
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+
+            // Status line — what's currently attached + a Reload button so
+            // edits to the .bt.lua hot-reload without re-drag.
+            if (!path.empty())
+            {
+                ImGui::SameLine(0, 4);
+                ImGui::BeginDisabled(!(*aiSys));
+                if (ImGui::SmallButton("Reload"))
+                {
+                    // ReloadTree forces a re-parse and updates the path-cache,
+                    // so subsequent AcquireTree calls (other entities, scene
+                    // load) get the fresh tree. Existing aliased shared_ptrs
+                    // keep their stale copy until they re-acquire.
+                    if (auto tree = (*aiSys)->ReloadTree(path))
+                    {
+                        ai.tree = tree;
+                        if (!ai.instance)
+                            ai.instance = std::make_unique<AI::BTInstance>();
+                        LOG_INFO("AI: reloaded '%s'", path.c_str());
+                    }
+                }
+                ImGui::EndDisabled();
+            }
+
             if (!ai.tree || !ai.instance || ai.instance->trace.empty()) return;
             ImGui::Separator();
             ImGui::TextDisabled("Last Tick Trace (%zu nodes)",
@@ -6541,6 +8032,10 @@ void EditorLayer::RegisterDefaultEditors()
                         else if constexpr (std::is_same_v<T, float>)       ImGui::TextUnformatted("float");
                         else if constexpr (std::is_same_v<T, std::string>) ImGui::TextUnformatted("string");
                         else if constexpr (std::is_same_v<T, Entity>)      ImGui::TextUnformatted("Entity");
+                        else if constexpr (std::is_same_v<T, std::vector<DirectX::XMFLOAT3>>)
+                            ImGui::TextUnformatted("vec3[]");
+                        else if constexpr (std::is_same_v<T, std::vector<std::string>>)
+                            ImGui::TextUnformatted("string[]");
                         else                                               ImGui::TextUnformatted("vec3");
                     }, kv.second);
                     ImGui::TableNextColumn();
@@ -6561,6 +8056,22 @@ void EditorLayer::RegisterDefaultEditors()
                             if (ImGui::DragInt("##v", &e, 1.f, 0, INT_MAX))
                                 v = static_cast<Entity>(e);
                         }
+                        else if constexpr (std::is_same_v<T, std::vector<DirectX::XMFLOAT3>>)
+                        {
+                            // Per-element drag would be enormous; show a
+                            // count summary + a "View" disclosure (not yet
+                            // implemented — arrays are typically authored
+                            // in the BT file, not the inspector).
+                            char buf[48];
+                            snprintf(buf, sizeof(buf), "[%zu pts]", v.size());
+                            ImGui::TextUnformatted(buf);
+                        }
+                        else if constexpr (std::is_same_v<T, std::vector<std::string>>)
+                        {
+                            char buf[64];
+                            snprintf(buf, sizeof(buf), "[%zu strs]", v.size());
+                            ImGui::TextUnformatted(buf);
+                        }
                         else
                         {
                             ImGui::DragFloat3("##v", &v.x, 0.01f);
@@ -6572,67 +8083,415 @@ void EditorLayer::RegisterDefaultEditors()
             }
         });
 
-    // ---- Category assignments — popup groups submenus; unset ones default to "Misc". Order via kCategoryOrder. ----
+    // ---- Category assignments — popup groups submenus; unset ones default to
+    //      "Misc". Submenu order is driven by kCategoryOrder in the Add Component
+    //      popup. Every addable component should appear here exactly once so none
+    //      silently fall into "Misc". (Tags registered via RegisterComponentTag
+    //      have no Add entry and are intentionally absent.) ----
 
-    SetComponentCategory<LocalTransform>            ("Transform");
+    // -- Transform --
+    SetComponentCategory<LocalTransform>                  ("Transform");
 
-    SetComponentCategory<CameraComponent>           ("Camera");
+    // -- Rendering -- (renderable surfaces / visibility)
+    SetComponentCategory<MeshHandle>                      ("Rendering");
+    SetComponentCategory<VisibilityComponent>             ("Rendering");
+    SetComponentCategory<VideoComponent>                  ("Rendering");
 
-    SetComponentCategory<MeshHandle>                ("Rendering");
-    SetComponentCategory<SkyboxComponent>           ("Rendering");
-
+    // -- Lighting -- (light sources + global illumination)
     SetComponentCategory<LightData>                       ("Lighting");
     SetComponentCategory<VolumetricLightComponent>        ("Lighting");
     SetComponentCategory<ReflectionProbeComponent>        ("Lighting");
     SetComponentCategory<DDGIVolumeComponent>             ("Lighting");
     SetComponentCategory<IndirectLightingSettingsComponent>("Lighting");
 
-    SetComponentCategory<RigidBodyComponent>        ("Physics");
-    SetComponentCategory<ColliderComponent>         ("Physics");
-    SetComponentCategory<ChainPhysicsComponent>     ("Physics");
-    SetComponentCategory<CapsuleColliderComponent>  ("Physics");
+    // -- Environment -- (sky / atmosphere / time-of-day / terrain)
+    SetComponentCategory<SkyboxComponent>                 ("Environment");
+    SetComponentCategory<AtmosphereComponent>             ("Environment");
+    SetComponentCategory<TODConfigComponent>              ("Environment");
+    SetComponentCategory<TODOutputComponent>              ("Environment");
+    SetComponentCategory<SunLightTag>                     ("Environment");
+    SetComponentCategory<MoonLightTag>                    ("Environment");
+    SetComponentCategory<CloudComponent>                  ("Environment");
+    SetComponentCategory<TerrainComponent>                ("Environment");
 
-    SetComponentCategory<SkeletonComponent>         ("Animation");
-    SetComponentCategory<SkeletonRef>               ("Animation");
-    SetComponentCategory<AnimationComponent>        ("Animation");
-    SetComponentCategory<MorphComponent>            ("Animation");
-    SetComponentCategory<SocketComponent>           ("Animation");
+    // -- Camera -- (lens + controllers + VCam stack)
+    SetComponentCategory<CameraComponent>                 ("Camera");
+    SetComponentCategory<CameraControllerComponent>       ("Camera");
+    SetComponentCategory<VirtualCameraComponent>          ("Camera");
+    SetComponentCategory<CameraPoseComponent>             ("Camera");
+    SetComponentCategory<VCamPriorityComponent>           ("Camera");
+    SetComponentCategory<VCamBlendComponent>              ("Camera");
+    SetComponentCategory<FollowCameraComponent>           ("Camera");
+    SetComponentCategory<AimCameraComponent>              ("Camera");
+    SetComponentCategory<CameraShakeComponent>            ("Camera");
+    SetComponentCategory<LiveCameraComponent>             ("Camera");
 
-    SetComponentCategory<DecalComponent>            ("VFX");
-    SetComponentCategory<ParticleEmitterComponent>  ("VFX");
-    SetComponentCategory<TrailComponent>            ("VFX");
-    SetComponentCategory<BeamComponent>             ("VFX");
+    // -- Animation -- (skeletons / clips / morphs / sockets / IK / timeline)
+    SetComponentCategory<SkeletonComponent>               ("Animation");
+    SetComponentCategory<SkeletonRef>                     ("Animation");
+    SetComponentCategory<AnimationComponent>              ("Animation");
+    SetComponentCategory<MorphComponent>                  ("Animation");
+    SetComponentCategory<SocketComponent>                 ("Animation");
+    SetComponentCategory<FootIKComponent>                 ("Animation");
+    SetComponentCategory<TimelineComponent>               ("Animation");
 
-    SetComponentCategory<ECS::VolumeComponent>      ("Post-Process");
+    // -- Physics -- (rigid bodies / colliders / chains)
+    SetComponentCategory<RigidBodyComponent>              ("Physics");
+    SetComponentCategory<ColliderComponent>               ("Physics");
+    SetComponentCategory<CapsuleColliderComponent>        ("Physics");
+    SetComponentCategory<ChainPhysicsComponent>           ("Physics");
 
-    SetComponentCategory<ScriptComponent>           ("AI / Script");
-    SetComponentCategory<AIComponent>               ("AI / Script");
-    SetComponentCategory<BlackboardComponent>       ("AI / Script");
+    // -- Gameplay -- (character motor + player state)
+    SetComponentCategory<CharacterControllerComponent>    ("Gameplay");
+    SetComponentCategory<PlayerComponent>                 ("Gameplay");
 
-    SetComponentCategory<FollowEntityComponent>     ("Attachment");
-    SetComponentCategory<FollowSocketComponent>     ("Attachment");
+    // -- VFX -- (decals / particles / trails / beams)
+    SetComponentCategory<DecalComponent>                  ("VFX");
+    SetComponentCategory<ParticleEmitterComponent>        ("VFX");
+    SetComponentCategory<TrailComponent>                  ("VFX");
+    SetComponentCategory<BeamComponent>                   ("VFX");
+
+    // -- Post-Process --
+    SetComponentCategory<ECS::VolumeComponent>            ("Post-Process");
+
+    // -- UI -- (screen-space + world-space widgets)
+    SetComponentCategory<UI::UIRootComponent>             ("UI");
+    SetComponentCategory<UI::UIScreenSpaceComponent>      ("UI");
+    SetComponentCategory<UI::UIImageComponent>            ("UI");
+    SetComponentCategory<UI::UITextComponent>             ("UI");
+    SetComponentCategory<UI::UIBarComponent>              ("UI");
+    SetComponentCategory<UI::WorldSpaceUIComponent>       ("UI");
+    SetComponentCategory<UI::WorldUIBarComponent>         ("UI");
+    SetComponentCategory<UI::WorldUITextComponent>        ("UI");
+    SetComponentCategory<UI::WorldUIImageComponent>       ("UI");
+    SetComponentCategory<UI::DamageNumberComponent>       ("UI");
+
+    // -- AI / Script -- (strategic/tactical/sensing AI + behavior tree + Lua)
+    SetComponentCategory<AIIntentComponent>               ("AI / Script");
+    SetComponentCategory<NavAgentComponent>               ("AI / Script");
+    SetComponentCategory<PerceptionComponent>             ("AI / Script");
+    SetComponentCategory<AIComponent>                     ("AI / Script");
+    SetComponentCategory<BlackboardComponent>             ("AI / Script");
+    SetComponentCategory<ScriptComponent>                 ("AI / Script");
+
+    // -- Attachment -- (follow entity / socket)
+    SetComponentCategory<FollowEntityComponent>           ("Attachment");
+    SetComponentCategory<FollowSocketComponent>           ("Attachment");
 }
 
-// ---- RenderTimelinePanel — Animation timeline editor (dockable floating window) ----
+// ---- RenderTimelinePanel — Animation timeline editor (dockable) ----
+// Two tabs:
+//   * "Clip Asset (.ianim)" — Unreal AnimSequence-style: edit AnimNotify
+//     tracks that live ON the animation clip. Save round-trips to disk.
+//   * "Entity Timeline"     — legacy per-entity TimelineComponent editing.
+// The shared NotifyTrackEditor drives both; only its target differs.
 void EditorLayer::RenderTimelinePanel()
 {
-    // Ensure AnimationClipSystem is wired for drag-and-drop .ianim loading
-    m_timelineEditor.SetAnimationClipSystem(m_animClipSys);
+    ImGui::SetNextWindowSize(ImVec2(960, 380), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Animation Timeline", &m_showTimeline)) { ImGui::End(); return; }
 
-    ImGui::SetNextWindowSize(ImVec2(900, 300), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Timeline Editor", &m_showTimeline))
+    // Drive the curve editor's read-only playback off our own clock; never let
+    // it self-advance (the notify editor owns the preview clock).
+    m_curveEditor.SetAnimationClipSystem(m_animClipSys);
+
+    if (ImGui::BeginTabBar("##animTimelineTabs"))
     {
-        ImGui::End();
-        return;
+        if (ImGui::BeginTabItem("Clip Asset (.ianim)"))
+        {
+            RenderClipAssetTab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Entity Timeline"))
+        {
+            RenderEntityTimelineTab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
     }
-
-    float dt = ImGui::GetIO().DeltaTime;
-    m_timelineEditor.Draw(dt);
 
     ImGui::End();
 }
 
+// ---- Clip-asset tab: edit notify tracks stored ON the .ianim clip ----------
+void EditorLayer::RenderClipAssetTab()
+{
+    // ---- Poll a pending async load ----
+    if (m_animEditHandle.packed != 0 && !m_animEditReady && m_animClipSys
+        && m_animClipSys->IsReady(m_animEditHandle))
+    {
+        m_animEditReady = true;
+        m_animEditClipIdx = 0;
+        m_animEditClipMirrored = -1;     // force a scratch refresh below
+        if (const Resource::AnimationResource* res = m_animClipSys->GetResource(m_animEditHandle))
+            m_curveEditor.LoadFromAnimationResource(*res);
+    }
+
+    // ---- Toolbar: path + load + save ----
+    ImGui::SetNextItemWidth(360.f);
+    ImGui::InputTextWithHint("##animpath", "asset/anim/clip.ianim",
+                             m_animPathInput, sizeof(m_animPathInput));
+    ImGui::SameLine();
+    if (ImGui::Button("Load") && m_animPathInput[0])
+        LoadAnimForEdit(m_animPathInput);
+    ImGui::SameLine();
+    if (ImGui::Button("Save"))
+    {
+        if (SaveAnimEdit()) m_animSaveStatus = "Saved " + m_animEditPath;
+        else                m_animSaveStatus = "Save failed";
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Re-serialize the loaded .ianim (bones/morphs untouched, notify tracks updated)");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(drag a .ianim from the asset browser here)");
+
+    // Window-wide drag-drop target for .ianim files.
+    if (ImGui::BeginDragDropTarget())
+    {
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("IANIM_PATH"))
+        {
+            const char* path = static_cast<const char*>(p->Data);
+            if (path && path[0]) LoadAnimForEdit(path);
+        }
+        ImGui::EndDragDropTarget();
+    }
+
+    if (!m_animSaveStatus.empty())
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.6f, 1.f, 0.6f, 1.f), "%s", m_animSaveStatus.c_str());
+    }
+
+    if (m_animEditHandle.packed == 0)
+    {
+        ImGui::Separator();
+        ImGui::TextDisabled("No clip loaded. Drag a .ianim here or type a path and press Load.");
+        return;
+    }
+    if (!m_animEditReady)
+    {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.f, 1.f, 0.3f, 1.f), "Loading %s ...", m_animEditPath.c_str());
+        return;
+    }
+
+    // Borrowed pointer, re-fetched every frame (never stored across frames, so
+    // the "do NOT store" contract holds). Safe to hold through this function:
+    // the editor runs single-threaded in the Render phase, after the frame's
+    // AnimationClipSystem::Tick, and nothing here loads/unloads a resource that
+    // could reallocate ResourceManager storage mid-call.
+    Resource::AnimationResource* res =
+        m_animClipSys ? m_animClipSys->GetResourceMutable(m_animEditHandle) : nullptr;
+    if (!res || res->clips.empty())
+    {
+        ImGui::Separator();
+        ImGui::TextDisabled("Loaded resource has no bone clips.");
+        return;
+    }
+
+    // ---- Clip selector (resources can hold multiple clips) ----
+    m_animEditClipIdx = std::clamp(m_animEditClipIdx, 0, (int)res->clips.size() - 1);
+    if (res->clips.size() > 1)
+    {
+        if (ImGui::BeginCombo("Clip", res->clips[m_animEditClipIdx].name))
+        {
+            for (int i = 0; i < (int)res->clips.size(); ++i)
+            {
+                const bool sel = (i == m_animEditClipIdx);
+                if (ImGui::Selectable(res->clips[i].name[0] ? res->clips[i].name : "(unnamed)", sel))
+                {
+                    // Don't reset m_animEditClipMirrored here — the sync block
+                    // below detects the index change, flushes the OLD clip's
+                    // edits back first, then re-points the scratch at the new
+                    // clip. Resetting to -1 would lose the old-clip identity
+                    // and silently discard its unsaved edits.
+                    m_animEditClipIdx = i;
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    else
+    {
+        ImGui::Text("Clip: %s", res->clips[0].name[0] ? res->clips[0].name : "(unnamed)");
+    }
+
+    Resource::AnimClipData& clip = res->clips[m_animEditClipIdx];
+
+    // ---- Sync scratch <-> clip ----
+    // On (re)select, pull the clip's notify tracks into the scratch
+    // TimelineComponent the NotifyTrackEditor edits. Re-pointing the editor's
+    // target resets its undo/selection state, which is what we want per clip.
+    if (m_animEditClipMirrored != m_animEditClipIdx)
+    {
+        // Flush the PREVIOUSLY-edited clip's scratch edits back first, or
+        // switching clips would silently discard unsaved edits to the old one.
+        if (m_animEditClipMirrored >= 0 &&
+            m_animEditClipMirrored < (int)res->clips.size())
+        {
+            res->clips[m_animEditClipMirrored].notifyTracks = m_clipScratch.tracks;
+            res->clips[m_animEditClipMirrored].nextNotifyId = m_clipScratch.nextNotifyId;
+        }
+
+        m_clipScratch.tracks       = clip.notifyTracks;
+        m_clipScratch.clipDuration = clip.duration;
+        m_clipScratch.nextNotifyId = clip.nextNotifyId;
+        m_clipScratch.lastObservedTime = -1.f;
+        m_animEditClipMirrored = m_animEditClipIdx;
+        m_notifyTrackEditor.SetTarget(nullptr);             // force a clean re-arm
+        m_notifyTrackEditor.SetTarget(&m_clipScratch);
+    }
+
+    // ---- Preview options ----
+    ImGui::Checkbox("Preview on selected entity", &m_animPreviewOnEntity);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("While Play is active, drive the selected entity's animation\n"
+                          "time and fire this clip's notifies through the real runtime path.");
+    ImGui::SameLine();
+    ImGui::Checkbox("Show bone curves", &m_animShowCurves);
+
+    // Editing context: only bind to an entity when the user opted in. Resolve
+    // the skeleton-owning entity (mesh children reference it via SkeletonRef);
+    // AnimationComponent + SkeletonComponent live on that root.
+    Entity previewEnt = NullEntity;
+    if (m_animPreviewOnEntity && m_world && m_selectedEntity != NullEntity)
+    {
+        previewEnt = m_selectedEntity;
+        if (auto* ref = m_world->GetComponent<SkeletonRef>(previewEnt))
+            if (ref->entity != NullEntity) previewEnt = ref->entity;
+    }
+    // Re-arm the editor target every frame: the Entity-timeline tab may have
+    // pointed the shared NotifyTrackEditor at a different TimelineComponent, so
+    // this isn't redundant — it reclaims the editor for the clip scratch.
+    m_notifyTrackEditor.SetTarget(&m_clipScratch);
+    m_notifyTrackEditor.SetEditingEntity(previewEnt, m_world);
+
+    // ---- The notify track editor (body only — we own the window) ----
+    m_notifyTrackEditor.Render();
+
+    // ---- Write scratch edits back into the clip asset (in memory) ----
+    clip.notifyTracks = m_clipScratch.tracks;
+    clip.nextNotifyId = m_clipScratch.nextNotifyId;
+
+    // ---- Live preview: make the entity actually PLAY the edited clip --------
+    // Bind this resource to the entity's skeleton (cached after the first call)
+    // to get the contiguous ClipLibrary range, point primaryClip at the clip we
+    // are editing (firstLib + local index), and stamp the edited notify tracks
+    // onto that library clip. This guarantees previewed clip == edited clip even
+    // for multi-clip resources, and TimelineSystem's clip-authoritative path
+    // then fires exactly what the editor shows. Notifies are skeleton-
+    // independent, so the stamp is a straight copy.
+    if (previewEnt != NullEntity && m_renderer && m_animClipSys)
+    {
+        auto* anim = m_world->GetComponent<AnimationComponent>(previewEnt);
+        auto* skel = m_world->GetComponent<SkeletonComponent>(previewEnt);
+        SkeletonRegistry& skelReg = m_renderer->GetSkeletonRegistry();
+        if (anim && skel && skel->assetIndex != kInvalidAnimHandle
+            && skel->assetIndex < skelReg.Count())
+        {
+            const SkeletonAsset& sk = skelReg.Get(skel->assetIndex);
+            ClipLibrary& lib = m_renderer->GetClipLibrary();
+            const uint32_t firstLib =
+                m_animClipSys->BindToSkeleton(m_animEditHandle, sk, lib);
+            if (firstLib != kInvalidClipIndex)
+            {
+                const uint32_t libIdx = firstLib + static_cast<uint32_t>(m_animEditClipIdx);
+                if (libIdx < lib.Count())
+                {
+                    anim->primaryClip = libIdx;
+                    lib.GetMutable(libIdx).notifyTracks = clip.notifyTracks;
+                }
+            }
+        }
+    }
+
+    // ---- Optional read-only bone-curve overlay (Unreal-style combined view) ----
+    if (m_animShowCurves)
+    {
+        ImGui::Separator();
+        if (ImGui::CollapsingHeader("Bone Curves (read-only)", ImGuiTreeNodeFlags_DefaultOpen))
+        {
+            // Mirror the notify editor's preview time onto the curve scrubber so
+            // the two views stay aligned; never let the curve editor self-play.
+            m_curveEditor.GetClip().isPlaying   = false;
+            m_curveEditor.GetClip().currentTime = m_notifyTrackEditor.GetPreviewTime();
+            ImGui::BeginChild("##curveOverlay", ImVec2(0, 240.f), true);
+            m_curveEditor.Draw(0.f);
+            ImGui::EndChild();
+        }
+    }
+}
+
+// ---- Entity-timeline tab: legacy per-entity TimelineComponent editing ------
+void EditorLayer::RenderEntityTimelineTab()
+{
+    TimelineComponent* tl = nullptr;
+    if (m_world && m_selectedEntity != NullEntity) {
+        tl = m_world->GetComponent<TimelineComponent>(m_selectedEntity);
+        if (!tl && m_world->GetComponent<AnimationComponent>(m_selectedEntity)) {
+            TimelineComponent fresh;
+            fresh.clipDuration = 2.f;
+            m_world->AddComponent<TimelineComponent>(m_selectedEntity, std::move(fresh));
+            tl = m_world->GetComponent<TimelineComponent>(m_selectedEntity);
+        }
+    }
+
+    ImGui::TextDisabled("Per-entity override tracks (additive to clip-authored notifies).");
+    m_notifyTrackEditor.SetTarget(tl);
+    m_notifyTrackEditor.SetEditingEntity(m_selectedEntity, m_world);
+    m_notifyTrackEditor.Render();
+}
+
+// ---- LoadAnimForEdit — begin async acquire of a .ianim for editing ---------
+void EditorLayer::LoadAnimForEdit(const std::string& path)
+{
+    if (!m_animClipSys) return;
+
+    // Release any previously-held edit handle so its refcount drops.
+    if (m_animEditHandle.packed != 0)
+        m_animClipSys->ReleaseClip(m_animEditHandle);
+
+    m_animEditPath    = path;
+    m_animEditHandle  = m_animClipSys->AcquireClip(path);
+    m_animEditReady   = false;
+    m_animEditClipIdx = 0;
+    m_animEditClipMirrored = -1;
+    m_animSaveStatus.clear();
+    // Keep the manual-path box in sync with drag-drop loads.
+    std::snprintf(m_animPathInput, sizeof(m_animPathInput), "%s", path.c_str());
+
+    // Ready immediately if cached.
+    if (m_animClipSys->IsReady(m_animEditHandle))
+    {
+        m_animEditReady = true;
+        if (const Resource::AnimationResource* res = m_animClipSys->GetResource(m_animEditHandle))
+            m_curveEditor.LoadFromAnimationResource(*res);
+    }
+}
+
+// ---- SaveAnimEdit — re-serialize the edited resource back to .ianim --------
+bool EditorLayer::SaveAnimEdit()
+{
+    if (!m_animClipSys || m_animEditHandle.packed == 0 || m_animEditPath.empty())
+        return false;
+    Resource::AnimationResource* res = m_animClipSys->GetResourceMutable(m_animEditHandle);
+    if (!res) return false;
+
+    const std::vector<uint8_t> blob = Resource::SerializeAnimation(*res);
+    if (blob.empty()) return false;
+
+    std::ofstream out(m_animEditPath, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(blob.data()),
+              static_cast<std::streamsize>(blob.size()));
+    return out.good();
+}
+
 // ---- RenderProfilerPanel — GPU/CPU timing with smoothing & history graph ----
+//
+// GPU costs are reported per-queue (Graphics vs Compute) and "Effective Frame"
+// is the critical path = max(graphics, compute), since the two queues execute
+// in parallel between cross-queue fences. The legacy `Total = sum of all
+// regions` is still displayed below the effective number for reference.
 void EditorLayer::RenderProfilerPanel()
 {
     // ---- Update smoothed values & ring buffer history ----
@@ -6642,26 +8501,40 @@ void EditorLayer::RenderProfilerPanel()
     if (m_cpuSmoothed < 0.001f) m_cpuSmoothed = m_cpuFrameMs; // first frame init
     m_cpuSmoothed += alpha * (m_cpuFrameMs - m_cpuSmoothed);
 
-    // GPU EMA
-    float rawGpuMs = 0.f;
+    // GPU EMA — track total, per-queue, and effective frame separately.
+    float rawTotalMs     = 0.f;
+    float rawGraphicsMs  = 0.f;
+    float rawComputeMs   = 0.f;
+    float rawEffectiveMs = 0.f;
     if (m_gpuProfiler && m_gpuProfiler->hasResults)
-        rawGpuMs = m_gpuProfiler->totalGpuMs;
-    if (m_gpuSmoothed < 0.001f) m_gpuSmoothed = rawGpuMs;
-    m_gpuSmoothed += alpha * (rawGpuMs - m_gpuSmoothed);
+    {
+        rawTotalMs     = m_gpuProfiler->totalGpuMs;
+        rawGraphicsMs  = m_gpuProfiler->perQueueTotalMs[GPUProfiler::kQueueGraphics];
+        rawComputeMs   = m_gpuProfiler->perQueueTotalMs[GPUProfiler::kQueueCompute];
+        rawEffectiveMs = m_gpuProfiler->effectiveFrameMs;
+    }
+    auto ema = [&](float& smoothed, float raw) {
+        if (smoothed < 0.001f) smoothed = raw;
+        smoothed += alpha * (raw - smoothed);
+    };
+    ema(m_gpuSmoothed,          rawTotalMs);
+    ema(m_gpuEffectiveSmoothed, rawEffectiveMs);
+    ema(m_gpuGraphicsSmoothed,  rawGraphicsMs);
+    ema(m_gpuComputeSmoothed,   rawComputeMs);
 
-    // Push into ring buffer
+    // Push into ring buffer — gpu history tracks the effective frame so the
+    // graph shows actual wall-clock GPU work rather than sum-of-overlap.
     m_cpuHistory[m_historyOffset] = m_cpuFrameMs;
-    m_gpuHistory[m_historyOffset] = rawGpuMs;
+    m_gpuHistory[m_historyOffset] = rawEffectiveMs;
     m_historyOffset = (m_historyOffset + 1) % kProfilerHistoryLen;
     if (m_statFrameCount < kProfilerHistoryLen) ++m_statFrameCount;
 
-    // Per-pass EMA
+    // Per-pass EMA — also stash the queue type so we can section by queue.
     if (m_gpuProfiler && m_gpuProfiler->hasResults)
     {
         for (uint32_t i = 0; i < m_gpuProfiler->resultCount; ++i)
         {
             const auto& r = m_gpuProfiler->results[i];
-            // Find or allocate pass slot
             int slot = -1;
             for (int s = 0; s < m_passStatsCount; ++s)
             {
@@ -6670,11 +8543,15 @@ void EditorLayer::RenderProfilerPanel()
             if (slot < 0 && m_passStatsCount < kMaxProfilerPasses)
             {
                 slot = m_passStatsCount++;
-                m_passStats[slot].name = r.name;
+                m_passStats[slot].name       = r.name;
                 m_passStats[slot].smoothedMs = r.gpuMs;
+                m_passStats[slot].queueType  = r.queueType;
             }
             if (slot >= 0)
+            {
                 m_passStats[slot].smoothedMs += alpha * (r.gpuMs - m_passStats[slot].smoothedMs);
+                m_passStats[slot].queueType   = r.queueType; // refresh in case a pass migrated queues
+            }
         }
     }
 
@@ -6720,39 +8597,67 @@ void EditorLayer::RenderProfilerPanel()
     }
 
     // ---- GPU section ----
-    if (ImGui::CollapsingHeader("GPU", 0))
+    if (ImGui::CollapsingHeader("GPU", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        ImGui::Text("Total:  %.2f ms", m_gpuSmoothed);
-        ImGui::Text("Avg: %.2f ms   Min: %.2f ms   Max: %.2f ms",
+        // Headline: effective frame (critical path) + per-queue breakdown.
+        ImGui::Text("Effective Frame: %.2f ms   (= max(Gfx, Compute))",
+                    m_gpuEffectiveSmoothed);
+        ImGui::Text("  Graphics Queue:  %.2f ms", m_gpuGraphicsSmoothed);
+        ImGui::Text("  Compute Queue:   %.2f ms", m_gpuComputeSmoothed);
+        ImGui::TextDisabled("Sum (overlapping):  %.2f ms", m_gpuSmoothed);
+        ImGui::Text("Effective Avg: %.2f   Min: %.2f   Max: %.2f ms",
                     m_gpuAvg, m_gpuMin, m_gpuMax);
 
-        // PlotLines
+        // PlotLines on effective frame
         float plotBuf[kProfilerHistoryLen];
         for (int i = 0; i < kProfilerHistoryLen; ++i)
             plotBuf[i] = m_gpuHistory[(m_historyOffset + i) % kProfilerHistoryLen];
 
         char overlay[32];
-        snprintf(overlay, sizeof(overlay), "%.1f ms", m_gpuSmoothed);
+        snprintf(overlay, sizeof(overlay), "%.1f ms", m_gpuEffectiveSmoothed);
         ImGui::PlotLines("##gpu_graph", plotBuf, kProfilerHistoryLen,
                          0, overlay, 0.f, m_gpuMax * 1.2f, ImVec2(-1, 60));
 
         ImGui::Separator();
 
-        // Per-pass smoothed bars
         if (m_gpuProfiler && m_gpuProfiler->hasResults)
         {
-            const float barMax = (m_gpuSmoothed > 0.01f) ? m_gpuSmoothed : 1.0f;
-            for (int s = 0; s < m_passStatsCount; ++s)
+            // Section per queue. Bars normalised against the queue's own
+            // total so a small compute-queue cost isn't visually swamped by
+            // a large graphics-queue frame.
+            auto renderQueueSection = [&](const char* header,
+                                          uint8_t queueType,
+                                          float queueTotalMs)
             {
-                const auto& ps = m_passStats[s];
-                if (!ps.name) continue;
-                float frac = ps.smoothedMs / barMax;
-                if (frac > 1.f) frac = 1.f;
+                bool open = ImGui::TreeNodeEx(header,
+                    ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed,
+                    "%s — %.2f ms", header, queueTotalMs);
+                if (!open) return;
 
-                char label[64];
-                snprintf(label, sizeof(label), "%s: %.2f ms", ps.name, ps.smoothedMs);
-                ImGui::ProgressBar(frac, ImVec2(-1, 0), label);
-            }
+                const float barMax = (queueTotalMs > 0.01f) ? queueTotalMs : 1.0f;
+                for (int s = 0; s < m_passStatsCount; ++s)
+                {
+                    const auto& ps = m_passStats[s];
+                    if (!ps.name) continue;
+                    if (ps.queueType != queueType) continue;
+
+                    float frac = ps.smoothedMs / barMax;
+                    if (frac > 1.f) frac = 1.f;
+
+                    char label[80];
+                    snprintf(label, sizeof(label), "%s: %.2f ms",
+                             ps.name, ps.smoothedMs);
+                    ImGui::ProgressBar(frac, ImVec2(-1, 0), label);
+                }
+                ImGui::TreePop();
+            };
+
+            renderQueueSection("Graphics Queue",
+                               GPUProfiler::kQueueGraphics,
+                               m_gpuGraphicsSmoothed);
+            renderQueueSection("Compute Queue",
+                               GPUProfiler::kQueueCompute,
+                               m_gpuComputeSmoothed);
         }
         else
         {

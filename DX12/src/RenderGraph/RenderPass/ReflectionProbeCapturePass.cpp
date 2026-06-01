@@ -36,7 +36,6 @@ namespace
         float    curViewProjNoJitter[16];   // = viewProj
         float    sunDir[3];     float pad0;
         float    sunColor[3];   float pad1;
-        float    ambient[3];    float pad2;
         float    cameraPos[3];  float pad3;
     };
     static_assert(sizeof(CaptureCB) <= kCBSlotStride, "CaptureCB exceeds 256-byte slot");
@@ -276,7 +275,6 @@ void ReflectionProbeCapturePass::DrawSceneFace(RHI::CommandList cl,
         std::memcpy(cb.curViewProjNoJitter, &vp, sizeof(vp));
         cb.sunDir[0]    = ctx.sunDir.x;   cb.sunDir[1]    = ctx.sunDir.y;   cb.sunDir[2]    = ctx.sunDir.z;
         cb.sunColor[0]  = ctx.sunColor.x; cb.sunColor[1]  = ctx.sunColor.y; cb.sunColor[2]  = ctx.sunColor.z;
-        cb.ambient[0]   = ctx.ambient.x;  cb.ambient[1]   = ctx.ambient.y;  cb.ambient[2]   = ctx.ambient.z;
         cb.cameraPos[0] = ctx.probePos.x; cb.cameraPos[1] = ctx.probePos.y; cb.cameraPos[2] = ctx.probePos.z;
         std::memcpy(static_cast<uint8_t*>(m_captureCBMapped) + face * kCBSlotStride,
                     &cb, sizeof(cb));

@@ -186,14 +186,8 @@ void ParticleRenderPass::Init(IGraphicsDevice& gfx)
     }
 
     // Per-frame render CB (root CBV at b2 space0, 256B aligned).
-    RHI::GPUBufferDesc cbd{};
-    cbd.size       = 256;
-    cbd.usage      = RHI::Usage::UPLOAD;
-    cbd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(cbd, m_renderCB))
-        m_renderCBMapped = gfx.MapBuffer(m_renderCB);
-    if (!m_renderCBMapped)
-        LOG_ERROR("ParticleRenderPass: render CB map failed");
+    if (!m_renderCB.Create(gfx, "ParticleRenderPass.RenderCB"))
+        LOG_ERROR("ParticleRenderPass: render CB create failed");
 
     // s0: linear-wrap sampler for optional texture.
     RHI::SamplerDesc sd;  // defaults: MIN_MAG_MIP_LINEAR, WRAP
@@ -205,27 +199,30 @@ void ParticleRenderPass::Init(IGraphicsDevice& gfx)
 
 RHI::CommandList ParticleRenderPass::Execute(RHI::CommandList cl)
 {
-    if (!m_sys || !m_pso.IsValid() || !m_renderCBMapped) return cl;
+    if (!m_sys || !m_pso.IsValid() || !m_renderCB.IsValid()) return cl;
+
+    auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
 
     // Pack per-frame camera data into the CB. Matrix is transposed for the
     // HLSL row-vector convention (VS does `mul(pos, viewProj)` with row
     // semantics, so the GPU layout wants column-major == CPU transposed).
     using namespace DirectX;
-    RenderCB cb{};
-    XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
-    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
-                    XMMatrixTranspose(vp));
-    cb.camRight[0]  = m_camRight.x;
-    cb.camRight[1]  = m_camRight.y;
-    cb.camRight[2]  = m_camRight.z;
-    cb.camUp[0]     = m_camUp.x;
-    cb.camUp[1]     = m_camUp.y;
-    cb.camUp[2]     = m_camUp.z;
-    cb.particleSize = m_particleSize;
-    cb._pad         = 0.0f;
-    std::memcpy(m_renderCBMapped, &cb, sizeof(cb));
-
-    auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
+    if (auto* slot = m_renderCB.Current(gfx))
+    {
+        RenderCB cb{};
+        XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
+        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
+                        XMMatrixTranspose(vp));
+        cb.camRight[0]  = m_camRight.x;
+        cb.camRight[1]  = m_camRight.y;
+        cb.camRight[2]  = m_camRight.z;
+        cb.camUp[0]     = m_camUp.x;
+        cb.camUp[1]     = m_camUp.y;
+        cb.camUp[2]     = m_camUp.z;
+        cb.particleSize = m_particleSize;
+        cb._pad         = 0.0f;
+        *slot = cb;
+    }
 
     // Bind the HDR RTV with GBuffer depth (read-only depth test).
     const RHI::Texture* depthTex = cl.GetContext().GetTexture(m_depth);
@@ -242,7 +239,7 @@ RHI::CommandList ParticleRenderPass::Execute(RHI::CommandList cl)
     cl.SetPrimitiveTopology(RHI::PrimitiveTopology::TRIANGLESTRIP);
 
     // Root CBV (b2 space0) = render CB.
-    gfx.BindConstantBuffer(m_renderCB, /*slot=*/1, cl);
+    gfx.BindConstantBuffer(m_renderCB.CurrentBuffer(gfx), /*slot=*/1, cl);
     // Descriptor table (t4 space0) = particle pool SRV.
     cl.BindDescriptorTableHandle(kGfxPoolSRVSlot, m_sys->GetPoolSRVHandle());
 

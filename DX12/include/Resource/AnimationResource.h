@@ -61,6 +61,12 @@ namespace Resource
         std::vector<AnimClipChannel>      channels;
         std::vector<ClipAsset::AnimEvent> events;
 
+        // AnimNotify tracks authored on this clip (Unreal AnimSequence-style).
+        // Carried verbatim into the bound ClipAsset (notifies are time-based,
+        // skeleton-independent). Serialized into the .ianim notify section.
+        std::vector<NotifyTrack> notifyTracks;
+        uint32_t                 nextNotifyId = 1; // editor id allocator
+
         // Produce a ClipAsset bound to the given skeleton.
         //
         // Each channel is matched to a skeleton bone by FNV-32 name hash.
@@ -154,11 +160,15 @@ namespace Resource
         };
 
         ClipAsset out;
-        out.boneCount  = skeleton.boneCount;
-        out.frameCount = frameCount;
-        out.duration   = duration;
-        out.frameRate  = frameRate;
-        out.events     = events;
+        out.boneCount    = skeleton.boneCount;
+        out.frameCount   = frameCount;
+        out.duration     = duration;
+        out.frameRate    = frameRate;
+        out.events       = events;
+        // Notifies are skeleton-independent (time-based) — copy verbatim so the
+        // runtime clip drives TimelineSystem for any entity that plays it.
+        out.notifyTracks = notifyTracks;
+        out.nextNotifyId = nextNotifyId;
 
         const size_t kf = static_cast<size_t>(out.boneCount) * out.frameCount;
         out.positions.resize(kf);

@@ -27,6 +27,7 @@
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include "Graphics/IndirectDrawCommand.h"
 
 #ifndef NOMINMAX
@@ -77,12 +78,18 @@ private:
 
     RHI::Texture m_atlas;  // Texture2DArray<D32_FLOAT>, kMaxCasters slices
 
-    // One small UPLOAD CB per caster, each holds a single transposed
-    // float4x4. Separate buffers are cleaner than one shared buffer with
-    // byte offsets because the engine's BindConstantBuffer API doesn't
-    // expose a per-dispatch CBV offset the way Compute's root CBV does.
-    RHI::GPUBuffer m_casterCBs[kMaxCasters];
-    void*          m_casterCBMapped[kMaxCasters]{};
+    // One small CB per caster, each holds a single transposed float4x4.
+    // 256-byte-aligned-per-CBV layout — bound via BindConstantBufferAtOffset
+    // with `i * kCasterCBStride`. Triple-buffered so frame N+1's CPU upload
+    // can't race frame N's GPU read.
+    static constexpr uint32_t kCasterCBStride = 256; // D3D12 CBV alignment
+    struct CasterCBPool
+    {
+        // 256-byte slot per caster — pad to the full stride so the FrameCB<>
+        // size math + the per-caster byteOffset bind line up cleanly.
+        uint8_t slots[kMaxCasters * kCasterCBStride];
+    };
+    FrameCB<CasterCBPool> m_casterCBs;
 
     DirectX::XMFLOAT4X4 m_pendingVP[kMaxCasters]{};
     uint32_t            m_activeCount = 0;
@@ -90,10 +97,13 @@ private:
     // Indirect draw arg buffer for batching opaque draws per slice (same
     // layout as ShadowPass / GBufferPass). 512 is too small for Bistro-
     // scale scenes where spot shadows need >20 k indirect draws; see
-    // ShadowPass.h for the full explanation.
+    // ShadowPass.h for the full explanation. Triple-buffered manual ring
+    // (UPLOAD heap, no CB bind flag → can't use FrameCB<>).
+    // 3 == GraphicsDX12::FrameCount.
     static constexpr uint32_t kMaxIndirectCommands = 32768;
-    RHI::GPUBuffer m_indirectArgBuffer;
-    void*          m_indirectArgMapped = nullptr;
+    static constexpr uint32_t kFrameCount          = 3;
+    RHI::GPUBuffer m_indirectArgBuffer[kFrameCount];
+    void*          m_indirectArgMapped[kFrameCount] = {};
 
     IGraphicsDevice* m_gfxPtr = nullptr;
 

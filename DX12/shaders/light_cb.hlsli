@@ -40,7 +40,6 @@ cbuffer LightCB : register(LIGHT_CB_REGISTER, space0)
     // ---- Direct directional light + camera + IBL params --------------------
     float3   lightDir;          float _p0;
     float3   lightColor;        float _p1;
-    float3   ambient;           float _p2;
     float3   cameraPos;         float _p3;
     float4x4 invViewProj;
     uint     iblRadianceMips;
@@ -97,7 +96,10 @@ cbuffer LightCB : register(LIGHT_CB_REGISTER, space0)
     //   1.0 = full AO on DDGI (legacy behaviour, double-occludes)
     //   ~0.4 = recommended balance (keeps near-field contact darkening)
     float    ddgiAONearFieldStrength;
-    float    _ddgiPad0;
+    // Global view-mode switch (Lit/Unlit/Wireframe). Repurposed from a DDGI
+    // pad — same 4-byte slot, no layout change. See view_mode_common.hlsli for
+    // the VIEW_MODE_* enum and Renderer::ViewMode for the C++ mirror.
+    uint     viewMode;
     float    _ddgiPad1;
     float    _ddgiPad2;
 };

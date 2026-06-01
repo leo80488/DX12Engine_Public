@@ -156,24 +156,37 @@ PSIn main(uint rawID : SV_VertexID, uint instID : SV_InstanceID)
     // TAA reads "static camera = full-pixel NDC motion every frame".
     o.curClip = mul(wPos, curViewProjNoJitter);
 
-    // For skinned meshes: SkinningCS wrote the previous-frame skinned position
-    // into the same position buffer at element index (prevPosInfo + vid).
-    // For static objects (prevPosInfo == 0xFFFFFFFF): same world pos, different VP.
+    // Prev-frame clip pos for velocity. Both skinned and static paths multiply
+    // by InstanceBuffer[].prevWorld so the entity's root motion between frames
+    // is accounted for — without this, TAA reprojection for moving entities
+    // (or skinned chars whose skinning output is in mesh-local space) lands
+    // at the wrong history pixel, leaving motion smear that's especially
+    // visible against sharp post-TAA overlays such as the outline pass.
+#if BILLBOARD
+    // Billboard wPos is already camera-oriented in world space; prev wPos
+    // would require prev camera axes which we don't track. Camera-motion
+    // velocity via current wPos × prevViewProj is the existing fallback.
+    o.prevClip = mul(wPos, prevViewProj);
+#else
+    float4x4 prevWorld = InstanceBuffer[instanceOffset + instID].prevWorld;
     if (prevPosInfo != 0xFFFFFFFFu)
     {
-        // Skinned: read previous world pos from the same position buffer.
+        // Skinned: prev-frame skinned position in MESH-LOCAL space.
         // prevPosInfo = outPrevPosByteOffset / 12 = base element index.
-        float3 prevWorldPos = FetchAsFloat3(
+        float3 prevLocalPos = FetchAsFloat3(
             md.position.bufferIndex,
             (prevPosInfo + vid) * 12u,
             md.position.format);
-        o.prevClip = mul(float4(prevWorldPos, 1.0f), prevViewProj);
+        float4 prevWPos = mul(float4(prevLocalPos, 1.0f), prevWorld);
+        o.prevClip = mul(prevWPos, prevViewProj);
     }
     else
     {
-        // Static: same world position, camera motion only
-        o.prevClip = mul(wPos, prevViewProj);
+        // Static: rest-pose local position × prev world × prev VP.
+        float4 prevWPos = mul(float4(localPos, 1.0f), prevWorld);
+        o.prevClip = mul(prevWPos, prevViewProj);
     }
+#endif
 
     return o;
 }

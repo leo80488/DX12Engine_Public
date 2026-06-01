@@ -266,8 +266,8 @@ void DDGIProbeDebugPass::Execute(IGraphicsDevice&             gfx,
         const uint32_t probeCount = mgr.GetProbeCount(slot);
         if (probeCount == 0) continue;
 
-        // Volume CB (b1).
-        const RHI::GPUBuffer* cb = mgr.GetVolumeCB(slot);
+        // Volume CB (b1) — per-frame ring slot.
+        const RHI::GPUBuffer* cb = mgr.GetVolumeCB(gfx, slot);
         if (!cb) continue;
         ID3D12Resource* cbRes = dx12.GetBufferResource(*cb);
         if (!cbRes) continue;

@@ -25,6 +25,10 @@ struct FollowEntityComponent
 {
     EntityHandle        target;
     DirectX::XMFLOAT4X4 localOffset;
+    // Editor authoring representation for rotation (same purpose as
+    // SocketComponent::Socket::rotationEulerDeg — avoids quat↔euler jitter
+    // when dragging the inspector). Runtime uses localOffset matrix only.
+    DirectX::XMFLOAT3   rotationEulerDeg = { 0.f, 0.f, 0.f };
 
     FollowEntityComponent() { DirectX::XMStoreFloat4x4(&localOffset, DirectX::XMMatrixIdentity()); }
 };
@@ -50,6 +54,7 @@ struct FollowSocketComponent
     EntityHandle        target;             // the character that owns SocketComponent
     uint32_t            socketIndex = 0;    // index into target SocketComponent::sockets
     DirectX::XMFLOAT4X4 localOffset;
+    DirectX::XMFLOAT3   rotationEulerDeg = { 0.f, 0.f, 0.f }; // authoring repr (see FollowEntityComponent)
 
     FollowSocketComponent() { DirectX::XMStoreFloat4x4(&localOffset, DirectX::XMMatrixIdentity()); }
 };

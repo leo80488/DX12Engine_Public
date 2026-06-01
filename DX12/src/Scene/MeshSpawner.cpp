@@ -13,13 +13,13 @@ Entity MeshSpawner::Spawn(int meshType, World& world)
     if (meshType < 0 || meshType >= static_cast<int>(PrimitiveMeshType::Count))
         return NullEntity;
 
-    static const char* names[] = { "Cube", "Sphere", "Cone" };
+    static const char* names[] = { "Cube", "Sphere", "Cone", "Plane", "Torus" };
 
     Entity e = world.CreateEntity();
     world.SetName(e, names[meshType]);
     world.AddComponent<LocalTransform>(e, LocalTransform{});
     world.AddComponent<GlobalTransform>(e, GlobalTransform{});
-    world.AddComponent<Visibility>(e, Visibility{});
+    world.AddComponent<VisibilityComponent>(e, VisibilityComponent{});
     world.AddComponent<RenderLayer>(e, RenderLayer{});
     world.AddComponent<Children>(e, Children{});
 
@@ -27,7 +27,8 @@ Entity MeshSpawner::Spawn(int meshType, World& world)
     mh.gpuMeshID = static_cast<uint32_t>(meshType);
     world.AddComponent<MeshHandle>(e, mh);
 
-    // Unit bounding box used for mouse picking (half-extents fit all three primitives).
+    // Unit bounding box used for mouse picking (half-extents fit every primitive;
+    // the Plane is flat and the Torus is sized to stay inside the unit box).
     world.AddComponent<BoundingVolume>(e, BoundingVolume{});
 
     // Load default material from .imat file.

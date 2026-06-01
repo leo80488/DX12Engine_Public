@@ -367,16 +367,27 @@ bool DrawObject(void* obj, const TypeDescriptor& desc)
         }
         if (f.kind == FieldKind::CollapseBegin)
         {
-            if (hideDepth > 0) { ++hideDepth; continue; }
+            if (hideDepth > 0)
+            {
+                ++hideDepth;
+                ImGui::PushID(f.label);
+                continue;
+            }
             const ImGuiTreeNodeFlags flags = (f.minVal > 0.f)
                 ? ImGuiTreeNodeFlags_DefaultOpen : 0;
             const bool open = ImGui::CollapsingHeader(f.label, flags);
+            // Scope subsequent widget IDs by section label so sibling
+            // collapses (e.g. "Spring Bones (Root)" / "(Child)") can reuse
+            // the same field labels ("Stiffness", "Damping") without
+            // colliding on ImGui's internal ID hash.
+            ImGui::PushID(f.label);
             if (!open) ++hideDepth;
             continue;
         }
         if (f.kind == FieldKind::CollapseEnd)
         {
             if (hideDepth > 0) --hideDepth;
+            ImGui::PopID();
             continue;
         }
 

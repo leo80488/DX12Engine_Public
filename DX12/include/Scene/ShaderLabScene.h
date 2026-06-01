@@ -1,6 +1,6 @@
 #pragma once
 
-// ShaderLabScene — minimal IScene for the ShaderLab.exe build target.
+// ShaderLabScene — minimal IGameMode for the ShaderLab.exe build target.
 //
 // Per the original ShaderLab design doc (section 6.1), the tool runs against
 // the same ECS / Renderer / RenderGraph the game uses — just with a tiny
@@ -17,19 +17,19 @@
 // Update is empty — ECS systems in App handle everything. Future work
 // (turntable spin, HDRI swap UI, ramp editor) hangs off this skeleton.
 
-#include "Scene/IScene.h"
+#include "Scene/IGameMode.h"
 #include "Scene/NPRRampEditor.h"
 
 #include <vector>
 
-class ShaderLabScene : public IScene
+class ShaderLabScene : public IGameMode
 {
 public:
     const char* GetName() const override { return "ShaderLabScene"; }
 
-    void Init      (SceneContext* ctx)  override;
+    void Init      (GameModeContext* ctx)  override;
     void Update    (float dt)           override;
-    void OnUIRender(SceneContext& ctx)  override;
+    void OnUIRender(GameModeContext& ctx)  override;
     void Shutdown  ()                   override;
 
 private:

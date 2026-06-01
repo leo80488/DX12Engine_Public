@@ -9,7 +9,7 @@ void MeshManager::Init(IGraphicsDevice& gfx)
     m_descHeap.Init(gfx);
 }
 
-bool MeshManager::UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out)
+bool MeshManager::UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out, bool persistent)
 {
     if (!m_gfx) return false;
 
@@ -41,14 +41,25 @@ bool MeshManager::UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out)
     if (hasTangents) out.tangentBuffer = makeRaw(data.tangents.data(), tanSz);
     if (hasUVs)      out.uvBuffer      = makeRaw(data.uvs.data(),      uvSz);
     out.indexCount   = static_cast<uint32_t>(data.indices.size());
+    out.vertexCount  = static_cast<uint32_t>(data.positions.size());
 
-    const uint32_t posIdx = m_descHeap.RegisterBuffer(out.posBuffer);
-    const uint32_t norIdx = m_descHeap.RegisterBuffer(out.normalBuffer);
-    const uint32_t colIdx = m_descHeap.RegisterBuffer(out.colorBuffer);
-    const uint32_t idxIdx = m_descHeap.RegisterBuffer(out.indexBuffer);
-    const uint32_t tanIdx = hasTangents ? m_descHeap.RegisterBuffer(out.tangentBuffer)
+    // Pick register variant by lifetime. Persistent path lands in the
+    // low reserved slot range so the cached slot indices stored on @p out
+    // survive every world reload (no manual re-register needed in
+    // MeshManager::OnWorldClear). World path is dedup'd and cleared with
+    // the rest of the per-world allocations.
+    auto regBuf = [&](const RHI::GPUBuffer& b) {
+        return persistent ? m_descHeap.RegisterPersistentBuffer(b)
+                          : m_descHeap.RegisterBuffer(b);
+    };
+
+    const uint32_t posIdx = regBuf(out.posBuffer);
+    const uint32_t norIdx = regBuf(out.normalBuffer);
+    const uint32_t colIdx = regBuf(out.colorBuffer);
+    const uint32_t idxIdx = regBuf(out.indexBuffer);
+    const uint32_t tanIdx = hasTangents ? regBuf(out.tangentBuffer)
                                         : RHI::kInvalidBufferIndex;
-    const uint32_t uvIdx  = hasUVs      ? m_descHeap.RegisterBuffer(out.uvBuffer)
+    const uint32_t uvIdx  = hasUVs      ? regBuf(out.uvBuffer)
                                         : RHI::kInvalidBufferIndex;
 
     if (posIdx == RHI::kInvalidBufferIndex ||
@@ -56,7 +67,7 @@ bool MeshManager::UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out)
         colIdx == RHI::kInvalidBufferIndex ||
         idxIdx == RHI::kInvalidBufferIndex)
     {
-        LOG_ERROR("MeshManager::UploadMesh: bindless table full");
+        LOG_ERROR("MeshManager::UploadMesh: bindless table full (persistent=%d)", persistent ? 1 : 0);
         return false;
     }
 
@@ -95,25 +106,31 @@ bool MeshManager::UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out)
     md.indexBufferIndex = idxIdx;
     md.indexByteOffset  = 0;
     md.indexFormat      = 0;
-    md.vertexCount      = static_cast<uint32_t>(data.positions.size());
+    md.vertexCount      = out.vertexCount;
 
-    out.meshDescSlot = m_descHeap.RegisterMesh(md);
+    out.meshDescSlot = persistent ? m_descHeap.RegisterPersistentMesh(md)
+                                  : m_descHeap.RegisterMesh(md);
     return out.meshDescSlot != RHI::kInvalidBufferIndex;
 }
 
 void MeshManager::InitPrimitives()
 {
-    const ProceduralMesh::MeshData meshes[3] =
+    constexpr int kCount = static_cast<int>(PrimitiveMeshType::Count);
+    const ProceduralMesh::MeshData meshes[kCount] =
     {
         ProceduralMesh::Cube(),
         ProceduralMesh::Sphere(),
         ProceduralMesh::Cone(),
+        ProceduralMesh::Plane(),
+        ProceduralMesh::Torus(),
     };
-    static const char* primNames[] = { "Cube", "Sphere", "Cone" };
+    static const char* primNames[] = { "Cube", "Sphere", "Cone", "Plane", "Torus" };
 
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < kCount; ++i)
     {
-        if (UploadMesh(meshes[i], m_primitives[i]))
+        // persistent=true: primitive slots stay valid across every world reload
+        // (entities created by MeshSpawner reference them by cached slot index).
+        if (UploadMesh(meshes[i], m_primitives[i], /*persistent=*/true))
             LOG_SUCCESS("MeshManager: uploaded %s (meshDescSlot=%u, %u indices)",
                         primNames[i], m_primitives[i].meshDescSlot,
                         m_primitives[i].indexCount);
@@ -147,7 +164,9 @@ void MeshManager::InitBillboardQuad()
     };
     quad.indices = { 0, 1, 2, 2, 1, 3 };
 
-    if (UploadMesh(quad, m_billboardQuad))
+    // persistent=true: billboard slot is referenced by every BillboardComponent
+    // across every world; must survive reloads.
+    if (UploadMesh(quad, m_billboardQuad, /*persistent=*/true))
     {
         m_billboardMeshDescSlot = m_billboardQuad.meshDescSlot;
         LOG_SUCCESS("MeshManager: billboard quad mesh registered (slot %u)",
@@ -254,4 +273,15 @@ void MeshManager::OnWorldClear()
     m_meshLibDescCache.clear();
     m_meshLibBindless.clear();
     ++m_meshLibDescGeneration;
+    // Reset the descriptor heap's world-scoped slot allocators only — slots
+    // in the persistent low range [0..kPermanent*Slots) keep their SRVs
+    // intact, so the primitives + billboard quad uploaded at Init time
+    // (via UploadMesh(..., persistent=true)) and the skinned vertex ring
+    // (via RegisterPersistentBuffer) keep their cached slot indices valid
+    // across the reload — no caller-side re-register needed any more.
+    //
+    // Caller must FlushAndWait before this so the GPU isn't still reading
+    // the world slots (Renderer::OnWorldClear runs mid-frame but the editor
+    // "Load World..." path flushes first).
+    m_descHeap.OnWorldClear();
 }

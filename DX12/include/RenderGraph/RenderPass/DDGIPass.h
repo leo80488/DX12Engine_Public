@@ -80,7 +80,8 @@ private:
     //                                    differs per dispatch)
     //   [4] DESC_TABLE 1 SRV  t2 space0  (ray data SRV — relight read path)
     //   [5] ROOT_SRV          t3 space0  (per-instance data — DDGISceneAS)
-    //   [6] DESC_TABLE 4096 SRV t0 space1 (bindless ByteAddressBuffer g_DDGIBuffers[]
+    //   [6] DESC_TABLE MeshDescriptorHeap::kMaxBuffers SRV t0 space1
+    //                                    (bindless ByteAddressBuffer g_DDGIBuffers[]
     //                                    — VB/IB lookup at hit time for face-normal)
     //   [7] DESC_TABLE 1 UAV  u1 space0  (variance buffer — irradiance relight only)
     //   [8] DESC_TABLE 1 SRV  t4 space0  (irradiance atlas SRV — multi-bounce trace read)

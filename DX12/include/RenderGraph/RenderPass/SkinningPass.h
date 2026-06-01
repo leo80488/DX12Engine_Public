@@ -83,20 +83,23 @@ private:
 
     // Max skinned meshes per frame. StructuredBuffer has no size limit.
     static constexpr uint32_t kMaxSkinJobs = 2048;
+    // Triple-buffered ring count == GraphicsDX12::FrameCount.
+    static constexpr uint32_t kFrameCount  = 3;
 
     IGraphicsDevice*   m_gfx     = nullptr;
     ShaderLibrary      m_shaderLib;
     RHI::PipelineState m_pso;
 
     // Job upload buffer: kMaxSkinJobs × 256 bytes (one 256B-aligned slot per job).
-    // Root CBV points at each slot for per-dispatch binding.
-    RHI::GPUBuffer m_jobBuffer;
-    void*          m_jobBufferMapped = nullptr;
+    // Root CBV points at each slot for per-dispatch binding. Triple-buffered
+    // so frame N+1 CPU writes don't race in-flight frame N GPU reads.
+    RHI::GPUBuffer m_jobBuffer[kFrameCount];
+    void*          m_jobBufferMapped[kFrameCount] = {};
 
     // Morph weight upload buffer: kMaxSkinJobs × 512 bytes (128 floats per slot).
-    RHI::GPUBuffer m_morphWeightBuf;
-    void*          m_morphWeightMapped = nullptr;
-    uint64_t       m_morphWeightSRV    = 0;
+    RHI::GPUBuffer m_morphWeightBuf[kFrameCount];
+    void*          m_morphWeightMapped[kFrameCount] = {};
+    uint64_t       m_morphWeightSRV[kFrameCount]    = {};
 
     PoseRingBuffer*   m_poseBuffer = nullptr;
     SkinnedVertexRing* m_vertRing  = nullptr;

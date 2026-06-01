@@ -17,6 +17,7 @@
 //     this is ~8000 spawns/sec before pops; raise the pool if you exceed.
 
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #include <vector>
 #include <cstdint>
@@ -97,9 +98,10 @@ public:
     const RHI::GPUBuffer& GetPool()        const { return m_pool; }
     uint64_t              GetPoolSRV()     const { return m_poolSrv; }
     uint64_t              GetPoolUAV()     const { return m_poolUav; }
-    const RHI::GPUBuffer& GetSpawnBuffer() const { return m_spawnBuffer; }
-    uint64_t              GetSpawnSRV()    const { return m_spawnSrv; }
-    const RHI::GPUBuffer& GetSystemCB()    const { return m_systemCB; }
+    // Triple-buffered — caller must supply device for current-frame slot.
+    const RHI::GPUBuffer& GetSpawnBuffer(IGraphicsDevice& gfx) const;
+    uint64_t              GetSpawnSRV    (IGraphicsDevice& gfx) const;
+    const RHI::GPUBuffer& GetSystemCB    (IGraphicsDevice& gfx) const { return m_systemCB.CurrentBuffer(gfx); }
 
     static constexpr uint32_t GetPoolCapacity() { return kMaxTracers; }
 
@@ -111,14 +113,14 @@ private:
     uint64_t       m_poolSrv = 0;
     uint64_t       m_poolUav = 0;
 
-    // Per-frame spawn upload buffer (UPLOAD heap, SRV).
-    RHI::GPUBuffer m_spawnBuffer;
-    uint64_t       m_spawnSrv = 0;
-    void*          m_spawnMapped = nullptr;
+    // Per-frame spawn upload buffer (UPLOAD heap, SRV) — triple-buffered.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_spawnBuffer[kFrameCount];
+    uint64_t       m_spawnSrv[kFrameCount]    = {};
+    void*          m_spawnMapped[kFrameCount] = {};
 
     // Per-frame system CB (UPLOAD heap, root CBV).
-    RHI::GPUBuffer m_systemCB;
-    void*          m_systemCBMapped = nullptr;
+    FrameCB<TracerSystemParams> m_systemCB;
 
     // CPU spawn queue, flushed at BeginFrame.
     std::vector<TracerSpawnGPU> m_pendingSpawns;

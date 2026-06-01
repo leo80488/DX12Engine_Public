@@ -98,6 +98,7 @@ void BeamSystem::Init(IGraphicsDevice& gfx, MeshDescriptorHeap& meshDescHeap)
     }
 
     // ---- Control-point upload buffer (UPLOAD, SR StructuredBuffer) --------
+    // Triple-buffered ring — written every frame by BeginFrame.
     {
         RHI::GPUBufferDesc d{};
         d.size = static_cast<uint64_t>(kMaxBeams) * kMaxControlPointsPerBeam
@@ -106,25 +107,32 @@ void BeamSystem::Init(IGraphicsDevice& gfx, MeshDescriptorHeap& meshDescHeap)
         d.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         d.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
         d.stride     = sizeof(BeamControlPointGPU);
-        if (gfx.CreateBuffer(d, m_controlPointsBuffer))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_controlPointsMapped = gfx.MapBuffer(m_controlPointsBuffer);
-            m_controlPointsSrv    = gfx.GetBufferSRVGpuHandle(m_controlPointsBuffer);
+            if (gfx.CreateBuffer(d, m_controlPointsBuffer[i]))
+            {
+                m_controlPointsMapped[i] = gfx.MapBuffer(m_controlPointsBuffer[i]);
+                m_controlPointsSrv[i]    = gfx.GetBufferSRVGpuHandle(m_controlPointsBuffer[i]);
+            }
+            if (!m_controlPointsMapped[i])
+                LOG_ERROR("BeamSystem: control-points buffer map failed (slot %u)", i);
         }
-        if (!m_controlPointsMapped)
-            LOG_ERROR("BeamSystem: control-points buffer map failed");
     }
 
     // ---- Per-beam params CBV (UPLOAD, root CBV per dispatch) --------------
+    // Triple-buffered ring — written every frame by BeginFrame.
     {
         RHI::GPUBufferDesc d{};
         d.size       = static_cast<uint64_t>(kMaxBeams) * kBeamParamSlotStride;
         d.usage      = RHI::Usage::UPLOAD;
         d.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(d, m_paramsBuffer))
-            m_paramsMapped = gfx.MapBuffer(m_paramsBuffer);
-        if (!m_paramsMapped)
-            LOG_ERROR("BeamSystem: params buffer map failed");
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(d, m_paramsBuffer[i]))
+                m_paramsMapped[i] = gfx.MapBuffer(m_paramsBuffer[i]);
+            if (!m_paramsMapped[i])
+                LOG_ERROR("BeamSystem: params buffer map failed (slot %u)", i);
+        }
     }
 
     // ---- Pre-allocate kMaxBeams MeshDescriptor slots ----------------------
@@ -178,10 +186,14 @@ void BeamSystem::Init(IGraphicsDevice& gfx, MeshDescriptorHeap& meshDescHeap)
 
 void BeamSystem::Shutdown(IGraphicsDevice& gfx)
 {
-    if (m_paramsMapped)         { gfx.UnmapBuffer(m_paramsBuffer);        m_paramsMapped = nullptr; }
-    if (m_controlPointsMapped)  { gfx.UnmapBuffer(m_controlPointsBuffer); m_controlPointsMapped = nullptr; }
-    if (m_paramsBuffer.IsValid())        gfx.DestroyBuffer(m_paramsBuffer);
-    if (m_controlPointsBuffer.IsValid()) gfx.DestroyBuffer(m_controlPointsBuffer);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (m_paramsMapped[i])        { gfx.UnmapBuffer(m_paramsBuffer[i]);        m_paramsMapped[i] = nullptr; }
+        if (m_controlPointsMapped[i]) { gfx.UnmapBuffer(m_controlPointsBuffer[i]); m_controlPointsMapped[i] = nullptr; }
+        if (m_paramsBuffer[i].IsValid())        gfx.DestroyBuffer(m_paramsBuffer[i]);
+        if (m_controlPointsBuffer[i].IsValid()) gfx.DestroyBuffer(m_controlPointsBuffer[i]);
+        m_controlPointsSrv[i] = 0;
+    }
     if (m_indexBuffer.IsValid())         gfx.DestroyBuffer(m_indexBuffer);
     if (m_uvBuffer.IsValid())            gfx.DestroyBuffer(m_uvBuffer);
     if (m_tangentBuffer.IsValid())       gfx.DestroyBuffer(m_tangentBuffer);
@@ -231,10 +243,13 @@ void BeamSystem::BeginFrame(float globalTimeSec)
 {
     m_activeBeams.clear();
 
-    if (!m_controlPointsMapped || !m_paramsMapped) return;
+    if (!m_gfx) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot >= kFrameCount) return;
+    if (!m_controlPointsMapped[frameSlot] || !m_paramsMapped[frameSlot]) return;
 
-    auto* cpDst     = static_cast<BeamControlPointGPU*>(m_controlPointsMapped);
-    auto* paramsDst = static_cast<uint8_t*>(m_paramsMapped);
+    auto* cpDst     = static_cast<BeamControlPointGPU*>(m_controlPointsMapped[frameSlot]);
+    auto* paramsDst = static_cast<uint8_t*>(m_paramsMapped[frameSlot]);
 
     for (uint32_t i = 0; i < kMaxBeams; ++i)
     {
@@ -256,4 +271,25 @@ void BeamSystem::BeginFrame(float globalTimeSec)
 
         m_activeBeams.push_back({ i, static_cast<uint32_t>(i * kBeamParamSlotStride) });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame accessors — return the slot matching gfx.GetFrameIndex().
+const RHI::GPUBuffer& BeamSystem::GetParamsBuffer() const
+{
+    const uint32_t s = m_gfx ? m_gfx->GetFrameIndex() : 0;
+    return m_paramsBuffer[s < kFrameCount ? s : 0];
+}
+
+const RHI::GPUBuffer& BeamSystem::GetControlPointsBuf() const
+{
+    const uint32_t s = m_gfx ? m_gfx->GetFrameIndex() : 0;
+    return m_controlPointsBuffer[s < kFrameCount ? s : 0];
+}
+
+uint64_t BeamSystem::GetControlPointsSrv() const
+{
+    if (!m_gfx) return 0;
+    const uint32_t s = m_gfx->GetFrameIndex();
+    return s < kFrameCount ? m_controlPointsSrv[s] : 0;
 }

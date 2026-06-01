@@ -28,15 +28,24 @@ class IGraphicsDevice;
 class ReflectionProbeManager
 {
 public:
+    // Matches GraphicsDX12::FrameCount — probe StructuredBuffer is ring-allocated
+    // because BuildScene_UploadProbes rewrites every visible slot each frame
+    // (no dirty gate). A single UPLOAD buffer would race the GPU which is still
+    // sampling frame N's data from LightingPass / ClusterPass / TransparentPass.
+    static constexpr uint32_t kFrameCount = 3;
+
     // Create the cubemap-array + StructuredBuffer and initialise the capture
     // pass. Returns false if any step fails (capture pass init failure is
     // logged but non-fatal — the caller can still proceed without probes).
     bool Init(IGraphicsDevice& gfx);
 
-    // Raw UPLOAD-buffer pointer for per-frame packing. Writes to dst[slice]
-    // are visible to the GPU next frame. Returns nullptr if Init() didn't
-    // manage to create the StructuredBuffer.
-    Reflection::GPUReflectionProbe* GetUploadPointer() const { return m_bufferMapped; }
+    // Tear down GPU resources (unmap + destroy each ring slot). Idempotent.
+    void Shutdown(IGraphicsDevice& gfx);
+
+    // Raw UPLOAD-buffer pointer for per-frame packing — current frame's slot.
+    // Writes to dst[slice] are visible to the GPU this frame. Returns nullptr
+    // if Init() didn't manage to create the StructuredBuffer.
+    Reflection::GPUReflectionProbe* GetUploadPointer(IGraphicsDevice& gfx) const;
 
     // Set / get the number of slots the shaders will read. BuildScene sets
     // this after packing; the cluster pass + lighting shader honour it.
@@ -61,7 +70,10 @@ public:
     RHI::Texture&       GetArrayTexture()         { return m_array; }
     const RHI::Texture& GetArrayTexture()   const { return m_array; }
     uint64_t            GetArraySrv()       const { return m_arraySrv;  }
-    uint64_t            GetBufferSrv()      const { return m_bufferSrv; }
+    // Per-frame SRV of the probe StructuredBuffer — selects the ring slot
+    // matching gfx.GetFrameIndex(). Renderer must rewire LightingPass /
+    // TransparentPass / ClusterPass each frame.
+    uint64_t            GetBufferSrv(IGraphicsDevice& gfx) const;
 
     // Capture pass instance — exposed so ProcessProbeBakeQueue can call
     // BakeProbe() on it with a context it builds from the scene state.
@@ -70,9 +82,13 @@ public:
 private:
     RHI::Texture                m_array;
     uint64_t                    m_arraySrv    = 0;
-    RHI::GPUBuffer                  m_buffer;
-    Reflection::GPUReflectionProbe* m_bufferMapped = nullptr;
-    uint64_t                    m_bufferSrv   = 0;
+
+    // Triple-buffered UPLOAD StructuredBuffer ring — one physical buffer +
+    // mapped pointer + SRV per frame slot.
+    RHI::GPUBuffer                  m_buffer[kFrameCount];
+    Reflection::GPUReflectionProbe* m_bufferMapped[kFrameCount] = {};
+    uint64_t                        m_bufferSrv[kFrameCount]    = {};
+
     uint32_t                    m_activeCount = 0;
     std::vector<uint32_t>       m_bakeQueue;
     ReflectionProbeCapturePass  m_capturePass;

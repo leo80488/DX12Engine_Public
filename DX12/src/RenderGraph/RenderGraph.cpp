@@ -88,6 +88,12 @@ namespace RG
         m_drawList = packets;
     }
 
+    void RenderGraph::SetExternalWait(const char* passName, RHI::CommandList depCL)
+    {
+        if (!passName) return;
+        m_externalWaits[passName] = depCL;
+    }
+
     // ---- Setup-phase API ---------------------------------------------------
 
     RGTextureHandle RenderGraph::DeclareTexture(const char* name, const RGTextureDesc& desc)
@@ -212,10 +218,16 @@ namespace RG
                 if (h.IsValid() && h.id < m_textures.size())
                     m_textures[h.id].hasSRV = true;
         }
-        // Also honour isUAV declared at CreateTexture time (decal-friendly
-        // graph-scope textures that may not have any pass UAV write yet).
+        // Also honour isUAV / isSRV declared at CreateTexture time. isSRV is for
+        // textures read as an SRV from OUTSIDE the graph (e.g. GBuffer velocity
+        // read by TAA/XeGTAO/SSR via direct SRV handles) — no in-graph pass
+        // declares the read, so without this the physical resource would be
+        // created without SHADER_RESOURCE and GetTextureSRVGpuHandle returns 0.
         for (auto& vt : m_textures)
+        {
             if (vt.desc.isUAV) vt.hasUAV = true;
+            if (vt.desc.isSRV) vt.hasSRV = true;
+        }
 
         CreatePhysicalTextures(gfx);
 
@@ -343,6 +355,18 @@ namespace RG
             if (prevCL.IsValid())
                 gfx.AddCommandListDependency(r.cl, prevCL);
 
+            // External cross-queue wait (e.g. LightingPass ← DDGI compute CL).
+            // Registered by the caller via SetExternalWait before Execute;
+            // landing the wait here means GBuffer / Terrain / SkyIBL keep
+            // running in parallel with the async producer while only the
+            // dependent pass stalls.
+            if (!m_externalWaits.empty())
+            {
+                auto it = m_externalWaits.find(m_passes[i].pass->GetName());
+                if (it != m_externalWaits.end() && it->second.IsValid())
+                    gfx.AddCommandListDependency(r.cl, it->second);
+            }
+
             if (node.colorTarget == BuiltinTexture::HdrSceneColor)
                 gfx.SetRenderTargetToHdr(clearColor, r.cl);
             else if (node.colorTarget == BuiltinTexture::HdrSceneColorPreserve)
@@ -382,6 +406,10 @@ namespace RG
             for (size_t i = 0; i < passCount; ++i)
                 gfx.EndGPUTimestamp(recs[i].cl, recs[i].profilerRegion);
         }
+
+        // External waits are per-frame; clear so a stale dep from a previous
+        // frame doesn't leak into the next graph run.
+        m_externalWaits.clear();
 
         return recs[passCount - 1].cl;
     }

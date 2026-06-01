@@ -56,14 +56,54 @@ namespace AI
         if (v.is<int>())                 return v.as<int>();
         if (v.is<float>())               return v.as<float>();
         if (v.is<std::string>())         return v.as<std::string>();
-        // Table assumed to be {x, y, z} — XMFLOAT3.
         if (v.is<sol::table>())
         {
             sol::table t = v.as<sol::table>();
+            // Disambiguate scalar XMFLOAT3 from list-of-XMFLOAT3 / list-of-
+            // string. The decision is by the first positional element's type:
+            //   table  → list of XMFLOAT3 (waypoints, formation slots, …)
+            //   string → list of strings  (SetRandomState's candidates, …)
+            //   number / nil → scalar XMFLOAT3 path
+            sol::object first = t[1];
+            if (first.is<sol::table>())
+            {
+                std::vector<DirectX::XMFLOAT3> arr;
+                for (size_t i = 1; ; ++i)
+                {
+                    sol::object slot = t[i];
+                    if (!slot.is<sol::table>()) break;
+                    sol::table st = slot.as<sol::table>();
+                    DirectX::XMFLOAT3 f{};
+                    // Accept both {x=,y=,z=} and positional {x,y,z}.
+                    if (st["x"].valid()) f.x = st.get_or("x", 0.0f);
+                    else                 f.x = st.get_or(1,   0.0f);
+                    if (st["y"].valid()) f.y = st.get_or("y", 0.0f);
+                    else                 f.y = st.get_or(2,   0.0f);
+                    if (st["z"].valid()) f.z = st.get_or("z", 0.0f);
+                    else                 f.z = st.get_or(3,   0.0f);
+                    arr.push_back(f);
+                }
+                return arr;
+            }
+            if (first.is<std::string>())
+            {
+                std::vector<std::string> arr;
+                for (size_t i = 1; ; ++i)
+                {
+                    sol::object slot = t[i];
+                    if (!slot.is<std::string>()) break;
+                    arr.push_back(slot.as<std::string>());
+                }
+                return arr;
+            }
+            // Scalar XMFLOAT3 path — also accept named {x=,y=,z=}.
             DirectX::XMFLOAT3 f3{};
-            f3.x = t.get_or(1, 0.0f);
-            f3.y = t.get_or(2, 0.0f);
-            f3.z = t.get_or(3, 0.0f);
+            if (t["x"].valid()) f3.x = t.get_or("x", 0.0f);
+            else                f3.x = t.get_or(1,   0.0f);
+            if (t["y"].valid()) f3.y = t.get_or("y", 0.0f);
+            else                f3.y = t.get_or(2,   0.0f);
+            if (t["z"].valid()) f3.z = t.get_or("z", 0.0f);
+            else                f3.z = t.get_or(3,   0.0f);
             return f3;
         }
         return std::string{};
@@ -226,6 +266,14 @@ namespace AI
         return asset;
     }
 
+    std::shared_ptr<BTAsset> AISystem::ReloadTree(const std::string& path)
+    {
+        auto fresh = ParseFromFile(path);
+        if (!fresh) return nullptr;
+        m_loaded[path] = fresh;
+        return fresh;
+    }
+
     void AISystem::Update(World& world, float dt)
     {
         m_elapsed += dt;
@@ -241,7 +289,19 @@ namespace AI
     void AISystem::TickEntity(World& world, Entity e, float dt)
     {
         AIComponent* ai = world.GetComponent<AIComponent>(e);
-        if (!ai || !ai->enabled || !ai->tree || !ai->tree->root) return;
+        if (!ai || !ai->enabled) return;
+
+        // Deserialised AIComponents arrive with treePath set but tree/instance
+        // null — the path is the persistable handle, the parsed BTAsset isn't.
+        // Resolve here on first tick so the user doesn't have to re-drop the
+        // .bt.lua in the Inspector after every world load.
+        if (!ai->tree && !ai->treePath.empty())
+        {
+            ai->tree = AcquireTree(ai->treePath);
+            if (ai->tree && !ai->instance)
+                ai->instance = std::make_unique<BTInstance>();
+        }
+        if (!ai->tree || !ai->tree->root) return;
 
         ai->timeSinceLastTick += dt;
         if (ai->timeSinceLastTick < ai->tickInterval) return;

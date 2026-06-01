@@ -97,13 +97,46 @@ void main(uint3 tid : SV_GroupID, uint3 lid : SV_GroupThreadID)
 #endif
             if (w < 1e-3) continue;
 
-            sumWeight += w;
 #if DDGI_RELIGHT_TARGET_IRRADIANCE
+            sumWeight += w;
             sumColor += sample.rgb * w;
 #else
-            float d = sample.w >= 0.0 ? sample.w : 100.0;
-            sumDist  += d  * w;
-            sumDist2 += d  * d * w;
+            // Hit-distance decode — encoding contract is set in DDGIRayTrace.cs:
+            //   sample.w > 0       : frontface hit, this distance
+            //   sample.w == -1.0   : miss
+            //   sample.w < -1.5    : backface hit, real t = -(sample.w + 2.0)
+            //
+            // Miss handling: misses are EXCLUDED from the depth integral. The
+            // pre-fix "miss → d = 100" was the indoor↔outdoor leak vector: a
+            // texel where some rays hit the wall close (d ≈ 0.5) and some
+            // misses-as-100 averaged to d ≈ 50, inflating mean far past the
+            // shading point's distToProbe so Chebyshev's `if (distToProbe >
+            // mean)` gate never fired and the probe passed straight through
+            // as visible. Skipping misses lets the close-hit signal dominate
+            // mean → Chebyshev gates correctly. All-miss texels fall through
+            // sumWeight ≈ 0; the existing branch below either keeps stale
+            // data or writes 0, and the sampler's `if (mean > 1e-3)` guard
+            // short-circuits Chebyshev to "no occlusion info → don't gate" —
+            // which is what we want for open directions.
+            //
+            // Backface handling: record the actual wall distance (-(sample.w+2.0)).
+            // The probe is INSIDE solid material in this direction, so any
+            // shading point on the OTHER side of the wall must be Chebyshev-
+            // gated — and the wall distance is the right occluder depth.
+            if (sample.w >= 0.0)
+            {
+                sumWeight += w;
+                sumDist  += sample.w * w;
+                sumDist2 += sample.w * sample.w * w;
+            }
+            else if (sample.w < -1.5)
+            {
+                float d = -sample.w - 2.0;
+                sumWeight += w;
+                sumDist  += d * w;
+                sumDist2 += d * d * w;
+            }
+            // else: miss — skip
 #endif
         }
 

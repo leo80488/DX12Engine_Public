@@ -40,17 +40,24 @@ float3 SampleHistoryCatmullRom9Tap(Texture2D<float4> tex,
     float2 tc12 = (tc + w2 / w12)    * invTex;
     float2 tc3  = (tc + 2.0)         * invTex;
 
+    // Per-tap max(0, ...) clamp. CR's negative lobe weights (w0, w3 can go
+    // negative around f=0.5) can amplify any negative-component sample (hist
+    // exposed to a previous negative blend on edges + high contrast) into a
+    // negative weighted-sum contribution that survives the OUTER clamp at
+    // the call site. Particularly bad for thin high-contrast features over
+    // textured backgrounds where contamination chains across frames. Falcor's
+    // reference does the same.
     // clang-format off
     float3 r =
-        tex.SampleLevel(samp, float2(tc0.x,  tc0.y),  0).rgb * (w0.x  * w0.y)  +
-        tex.SampleLevel(samp, float2(tc12.x, tc0.y),  0).rgb * (w12.x * w0.y)  +
-        tex.SampleLevel(samp, float2(tc3.x,  tc0.y),  0).rgb * (w3.x  * w0.y)  +
-        tex.SampleLevel(samp, float2(tc0.x,  tc12.y), 0).rgb * (w0.x  * w12.y) +
-        tex.SampleLevel(samp, float2(tc12.x, tc12.y), 0).rgb * (w12.x * w12.y) +
-        tex.SampleLevel(samp, float2(tc3.x,  tc12.y), 0).rgb * (w3.x  * w12.y) +
-        tex.SampleLevel(samp, float2(tc0.x,  tc3.y),  0).rgb * (w0.x  * w3.y)  +
-        tex.SampleLevel(samp, float2(tc12.x, tc3.y),  0).rgb * (w12.x * w3.y)  +
-        tex.SampleLevel(samp, float2(tc3.x,  tc3.y),  0).rgb * (w3.x  * w3.y);
+        max(tex.SampleLevel(samp, float2(tc0.x,  tc0.y),  0).rgb, 0.0) * (w0.x  * w0.y)  +
+        max(tex.SampleLevel(samp, float2(tc12.x, tc0.y),  0).rgb, 0.0) * (w12.x * w0.y)  +
+        max(tex.SampleLevel(samp, float2(tc3.x,  tc0.y),  0).rgb, 0.0) * (w3.x  * w0.y)  +
+        max(tex.SampleLevel(samp, float2(tc0.x,  tc12.y), 0).rgb, 0.0) * (w0.x  * w12.y) +
+        max(tex.SampleLevel(samp, float2(tc12.x, tc12.y), 0).rgb, 0.0) * (w12.x * w12.y) +
+        max(tex.SampleLevel(samp, float2(tc3.x,  tc12.y), 0).rgb, 0.0) * (w3.x  * w12.y) +
+        max(tex.SampleLevel(samp, float2(tc0.x,  tc3.y),  0).rgb, 0.0) * (w0.x  * w3.y)  +
+        max(tex.SampleLevel(samp, float2(tc12.x, tc3.y),  0).rgb, 0.0) * (w12.x * w3.y)  +
+        max(tex.SampleLevel(samp, float2(tc3.x,  tc3.y),  0).rgb, 0.0) * (w3.x  * w3.y);
     // clang-format on
     return r;
 }

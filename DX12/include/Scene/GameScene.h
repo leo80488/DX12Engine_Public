@@ -4,7 +4,7 @@
 //
 // Init responsibilities:
 //   - Reset the World (Clear) so we don't inherit Title's leftovers
-//   - If game.json specifies "startup_world", LoadWorld it
+//   - If game.json specifies "startup_scene", LoadScene it
 //   - Otherwise spawn a minimal default scene (camera + light + skybox + cube)
 //
 // Update responsibilities:
@@ -14,16 +14,16 @@
 // Engine systems (script/physics/animation) tick in App on the same World;
 // no per-frame work here unless the game needs scripted level events.
 
-#include "Scene/IScene.h"
+#include "Scene/IGameMode.h"
 
 #include <vector>
 
-class GameScene : public IScene
+class GameScene : public IGameMode
 {
 public:
     const char* GetName() const override { return "GameScene"; }
 
-    void Init    (SceneContext* ctx) override;
+    void Init    (GameModeContext* ctx) override;
     void Update  (float dt) override;
     void Shutdown() override;
 

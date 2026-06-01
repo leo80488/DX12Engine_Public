@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 class IGraphicsDevice;
@@ -56,13 +57,17 @@ namespace Resource
         // Returns an opaque library handle (ResourceType::MeshLibrary).
         // Returns kInvalidHandle if the file is missing or malformed.
         //
-        // Same-path re-load is NOT deduplicated — that's the responsibility of
-        // a higher-level cache (SceneInstanceLoader typically loads each
-        // library exactly once per scene). Keeps this class single-purpose.
+        // Path-deduplicated: same path → existing slot, refcount bumped, no
+        // re-upload. Critical for same-world reload — without it every
+        // SceneInstanceLoader run allocates a fresh VB+IB and the DDGI BLAS
+        // cache misses (memory: project_loadworld_phase12 § Renderer fix
+        // applied the equivalent pattern to TextureSystem).
         Handle Load(const std::string& path, IGraphicsDevice& gfx);
 
-        // Free GPU buffers and mark the slot dead. Bumps generation so stale
-        // handles fail IsValid(). Safe to call with kInvalidHandle (no-op).
+        // Decrement refcount. When refcount reaches 0, free GPU buffers and
+        // bump the slot generation so stale handles fail IsValid(). Safe to
+        // call with kInvalidHandle (no-op). Each Load call must be paired
+        // with exactly one Release call to balance refcount.
         void Release(Handle libHandle, IGraphicsDevice& gfx);
 
         bool IsValid(Handle libHandle) const;
@@ -132,6 +137,13 @@ namespace Resource
             // libraries leave this false and rely on GBuffer.vs's synthesised
             // basis fallback.
             bool               hasTangent       = false;
+            // Path-dedup refcount: bumped by Load() on cache hit, decremented
+            // by Release(); slot only freed when this reaches 0. Mirrors
+            // TextureSystem's TextureEntry::refCount.
+            uint32_t           refCount         = 0;
+            // FNV-1a hash of sourcePath, kept on the slot for O(1) erase from
+            // m_pathHashToSlot during FreeSlot (avoids re-hashing).
+            uint64_t           pathHash         = 0;
         };
 
         // Slot pool helpers — caller must hold m_mutex.
@@ -143,8 +155,12 @@ namespace Resource
         // handle. Caller must hold m_mutex.
         const Slot* GetSlot(Handle h) const;
 
+        // FNV-1a 64-bit path hash (matches TextureSystem / ResourceManager).
+        static uint64_t HashPath(const std::string& path);
+
         mutable std::mutex m_mutex;
         std::vector<Slot>   m_slots;
         std::vector<uint32_t> m_freeList;
+        std::unordered_map<uint64_t, uint32_t> m_pathHashToSlot; // path hash → slot index
     };
 }

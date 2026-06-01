@@ -13,6 +13,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #include <DirectXMath.h>
 
@@ -69,8 +70,31 @@ private:
     uint32_t           m_texW    = 0;
     uint32_t           m_texH    = 0;
 
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
+    struct alignas(16) LensFlareCB
+    {
+        uint32_t dstWidth;
+        uint32_t dstHeight;
+        uint32_t srcDepthWidth;
+        uint32_t srcDepthHeight;
+
+        uint32_t enabled;
+        float    intensity;
+        float    sunBehind;
+        float    chromaticOffset;
+
+        float    sunUV[2];
+        float    haloWidth;
+        float    streakLength;
+
+        float    sunColor[3];
+        float    ghostDispersal;
+
+        uint32_t ghostCount;
+        float    streakWidth;
+        float    occlusionRadius;
+        float    _pad0;
+    };
+    FrameCB<LensFlareCB> m_cb;
 
     // Per-frame inputs
     bool                m_enabled    = true;

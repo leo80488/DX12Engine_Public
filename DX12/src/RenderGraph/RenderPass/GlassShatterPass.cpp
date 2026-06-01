@@ -109,14 +109,8 @@ void GlassShatterPass::Init(IGraphicsDevice& gfx)
     GenerateVoronoiMesh();
 
     // Per-frame CB.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(ShatterCB) + 255u) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_paramsCB))
-            m_paramsCBMapped = gfx.MapBuffer(m_paramsCB);
-    }
+    if (!m_paramsCB.Create(gfx, "GlassShatterPass.ParamsCB"))
+        LOG_ERROR("GlassShatterPass: params CB create failed");
 
     LOG_SUCCESS("GlassShatterPass: initialized (%u shards)", m_shardCount);
 }
@@ -304,7 +298,9 @@ void GlassShatterPass::EnsureSourceTexture(uint32_t w, uint32_t h)
 // ============================================================================
 void GlassShatterPass::UploadCB(uint32_t w, uint32_t h)
 {
-    if (!m_paramsCBMapped) return;
+    if (!m_gfx) return;
+    auto* slot = m_paramsCB.Current(*m_gfx);
+    if (!slot) return;
     ShatterCB c{};
     c.TimeSinceTrigger     = m_timeSinceTrigger;
     c.DeltaTime            = 0.0f;  // overwritten per-Execute
@@ -320,7 +316,7 @@ void GlassShatterPass::UploadCB(uint32_t w, uint32_t h)
     c.CrackColor           = m_crackColor;
     c.Width                = w;
     c.Height               = h;
-    std::memcpy(m_paramsCBMapped, &c, sizeof(c));
+    *slot = c;
 }
 
 // ============================================================================
@@ -385,17 +381,16 @@ void GlassShatterPass::Execute(RHI::CommandList cl,
 
     UploadCB(vpW, vpH);
     // DeltaTime needs separate write — patch directly.
-    if (m_paramsCBMapped)
-    {
-        ShatterCB* p = reinterpret_cast<ShatterCB*>(m_paramsCBMapped);
-        p->DeltaTime = deltaTime;
-    }
+    if (auto* slot = m_paramsCB.Current(gfx))
+        slot->DeltaTime = deltaTime;
+
+    const RHI::GPUBuffer& paramsCBBuf = m_paramsCB.CurrentBuffer(gfx);
 
     // ---- Init dispatch (trigger frame only) -----------------------------
     if (m_pendingInit)
     {
         gfx.BindComputePipelineState(m_initPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_paramsCB, cl);
+        gfx.SetComputeRootCBV(kCBSlot, paramsCBBuf, cl);
         gfx.SetComputeDescriptorTable(kSRV0, gfx.GetBufferSRVGpuHandle(m_metaBuffer), cl);
         gfx.SetComputeDescriptorTable(kUAV0, gfx.GetBufferUAVGpuHandle(m_shardBuffer), cl);
         gfx.DispatchCompute((m_shardCount + 63) / 64, 1, 1, cl);
@@ -405,7 +400,7 @@ void GlassShatterPass::Execute(RHI::CommandList cl,
 
     // ---- Simulate dispatch ----------------------------------------------
     gfx.BindComputePipelineState(m_simulatePSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramsCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, paramsCBBuf, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetBufferUAVGpuHandle(m_shardBuffer), cl);
     gfx.DispatchCompute((m_shardCount + 63) / 64, 1, 1, cl);
     gfx.PushBarrier(RHI::GPUBarrier::Memory(&m_shardBuffer), cl);
@@ -413,7 +408,7 @@ void GlassShatterPass::Execute(RHI::CommandList cl,
     // ---- Composite dispatch — reads Edges (SRV from UPLOAD heap, GENERIC_READ),
     // ShatterSource (SR_COMPUTE), Shards (UAV — read-only RW), writes Tonemap UAV.
     gfx.BindComputePipelineState(m_compositePSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramsCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, paramsCBBuf, cl);
     gfx.SetComputeDescriptorTable(kSRV0, gfx.GetBufferSRVGpuHandle(m_edgeBuffer),  cl);
     gfx.SetComputeDescriptorTable(kSRV1, gfx.GetTextureSRVGpuHandle(m_shatterSource), cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(*tonemapOutput), cl);

@@ -71,6 +71,19 @@ struct BLAS
     uint64_t                                sizeBytes = 0;
     D3D12_GPU_VIRTUAL_ADDRESS               GPUAddress() const
     { return resource ? resource->GetGPUVirtualAddress() : 0; }
+
+    // ---- Optional compaction state machine (used by the DDGI BLAS cache) ----
+    // A BLAS built with ALLOW_COMPACTION can be shrunk to its exact size a few
+    // frames later (typically 30-55% smaller than the conservative build size).
+    // EmitBLASCompactedSize records a COMPACTED_SIZE postbuild query into
+    // compactSizeUav -> compactSizeReadback; once the GPU has produced it
+    // (the caller's frame-counter delay has elapsed), CompactBLAS copies into a
+    // right-sized resource and the cache swaps it in. None/Done = nothing to do.
+    enum class CompactState : uint8_t { None, AwaitingSize, Done };
+    CompactState                            compactState = CompactState::None;
+    Microsoft::WRL::ComPtr<ID3D12Resource>  compactSizeUav;      // DEFAULT UAV, 8B (postbuild emit dest)
+    Microsoft::WRL::ComPtr<ID3D12Resource>  compactSizeReadback; // READBACK,   8B (CPU read of compacted size)
+    uint64_t                                compactReadyCounter = 0; // caller counter value at/after which the readback is GPU-ready
 };
 
 // One TLAS instance (one entity in the static-only DDGI scene). Maps to
@@ -121,7 +134,8 @@ struct ScratchBuffer
 // the device is not DXR-capable. Populates outResultSize / outScratchSize.
 bool QueryBLASBuildSize(GraphicsDX12& gfx,
                         const GeometryDesc* geoms, uint32_t geomCount,
-                        uint64_t& outResultSize, uint64_t& outScratchSize);
+                        uint64_t& outResultSize, uint64_t& outScratchSize,
+                        bool allowCompaction = false);
 
 // Allocate the BLAS result buffer (DEFAULT heap, UAV, RAYTRACING_ACCELERATION_STRUCTURE
 // initial state). Does NOT record any GPU work. Caller passes the same scratch
@@ -138,7 +152,26 @@ void BuildBLAS(GraphicsDX12& gfx,
                ID3D12GraphicsCommandList4* cmdList,
                const GeometryDesc* geoms, uint32_t geomCount,
                BLAS& blas,
-               const ScratchBuffer& scratch);
+               const ScratchBuffer& scratch,
+               bool allowCompaction = false);
+
+// Record a COMPACTED_SIZE postbuild-info query for a BLAS that was built with
+// allowCompaction=true. Allocates the tiny emit (DEFAULT UAV) + readback
+// buffers onto `blas` and sets blas.compactState = AwaitingSize. MUST be called
+// right after BuildBLAS on the same command list — the result-UAV barrier
+// BuildBLAS emits is the required read-barrier before the postbuild query.
+void EmitBLASCompactedSize(GraphicsDX12& gfx,
+                           ID3D12GraphicsCommandList4* cmdList,
+                           BLAS& blas);
+
+// Allocate a right-sized result buffer and record a COMPACT copy of `src` into
+// `outCompacted` (UAV-barriered). Returns false if allocation failed. The
+// caller keeps `src` alive until this command list completes on the GPU, then
+// defer-releases it.
+bool CompactBLAS(GraphicsDX12& gfx,
+                 ID3D12GraphicsCommandList4* cmdList,
+                 const BLAS& src, uint64_t compactedSize,
+                 BLAS& outCompacted);
 
 // Compute / allocate TLAS sized for @p maxInstances. Caller fills the
 // instance buffer each frame and calls BuildTLAS(). Reusing the same TLAS

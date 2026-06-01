@@ -63,11 +63,7 @@ bool ShadowFrustumCompute::Compute(World& world,
     m_valid = false;
     if (vpW == 0 || vpH == 0) return false;
 
-    const float cp = std::cos(cam.pitch);
-    const float sp = std::sin(cam.pitch);
-    const float cy = std::cos(cam.yaw);
-    const float sy = std::sin(cam.yaw);
-    const XMVECTOR forward = XMVectorSet(sy * cp, -sp, cy * cp, 0.f);
+    const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&cam.forward));
     const XMVECTOR camPos  = XMLoadFloat3(&cam.position);
     const XMVECTOR up      = XMVectorSet(0.f, 1.f, 0.f, 0.f);
     XMMATRIX view = XMMatrixLookToLH(camPos, forward, up);

@@ -32,10 +32,22 @@ namespace Resource
     void MeshLibrary::FreeSlot(uint32_t index)
     {
         Slot& s = m_slots[index];
+        if (s.pathHash != 0)
+            m_pathHashToSlot.erase(s.pathHash);
         s.generation = (s.generation % Handle::MAX_GEN) + 1;  // never wraps to 0
         s.alive      = false;
+        s.refCount   = 0;
+        s.pathHash   = 0;
+        s.sourcePath.clear();
         s.entries.clear();
         m_freeList.push_back(index);
+    }
+
+    uint64_t MeshLibrary::HashPath(const std::string& path)
+    {
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char c : path) { h ^= c; h *= 1099511628211ULL; }
+        return h;
     }
 
     bool MeshLibrary::IsValidHandle(Handle h) const
@@ -65,6 +77,26 @@ namespace Resource
     // -------------------------------------------------------------------------
     Handle MeshLibrary::Load(const std::string& path, IGraphicsDevice& gfx)
     {
+        // Path-dedup fast path: same path already loaded → bump refcount and
+        // return the existing handle. Eliminates GPU re-upload on same-world
+        // reload (Bistro: ~10 .meshlib files, each 100 MB+ of VB+IB).
+        const uint64_t pathHash = HashPath(path);
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_pathHashToSlot.find(pathHash);
+            if (it != m_pathHashToSlot.end() && it->second < m_slots.size())
+            {
+                Slot& s = m_slots[it->second];
+                if (s.alive)
+                {
+                    ++s.refCount;
+                    return Handle::Make(it->second,
+                                        ResourceType::MeshLibrary,
+                                        static_cast<uint16_t>(s.generation));
+                }
+            }
+        }
+
         std::vector<uint8_t> blob;
         if (!::Resource::AssetFS::Get().ReadFile(path, blob))
         {
@@ -197,6 +229,25 @@ namespace Resource
 
         // ---- Commit slot ------------------------------------------------------
         std::lock_guard<std::mutex> lock(m_mutex);
+
+        // Race recheck: another thread may have loaded the same path while we
+        // were doing file I/O outside the lock. If so, drop our buffers and
+        // return the winner's handle (refcount++).
+        if (auto it = m_pathHashToSlot.find(pathHash);
+            it != m_pathHashToSlot.end() && it->second < m_slots.size())
+        {
+            Slot& winner = m_slots[it->second];
+            if (winner.alive)
+            {
+                ++winner.refCount;
+                gfx.DestroyBuffer(vb);
+                gfx.DestroyBuffer(ib);
+                return Handle::Make(it->second,
+                                    ResourceType::MeshLibrary,
+                                    static_cast<uint16_t>(winner.generation));
+            }
+        }
+
         const uint32_t idx = AllocSlot();
         Slot& slot = m_slots[idx];
         if (slot.generation == 0) slot.generation = 1;
@@ -209,6 +260,9 @@ namespace Resource
         slot.vertexStride     = vStride;
         slot.hasTangent       = flagHasTangent;
         slot.alive            = true;
+        slot.refCount         = 1;
+        slot.pathHash         = pathHash;
+        m_pathHashToSlot[pathHash] = idx;
 
         LOG_SUCCESS("MeshLibrary: loaded '%s' (%u meshes, %u verts, %u idx, %.1f MB)",
                     path.c_str(), meshCount, vertexCount, indexCount,
@@ -228,6 +282,9 @@ namespace Resource
         if (!IsValidHandle(libHandle)) return;
 
         Slot& slot = m_slots[libHandle.Index()];
+        if (slot.refCount == 0) return;            // defensive: imbalanced Release
+        if (--slot.refCount > 0) return;            // still referenced elsewhere
+
         if (slot.vb.IsValid()) gfx.DestroyBuffer(slot.vb);
         if (slot.ib.IsValid()) gfx.DestroyBuffer(slot.ib);
         FreeSlot(libHandle.Index());

@@ -114,6 +114,9 @@ PSODesc TransparentPass::BuildPSODesc(PermutationKey perm, uint32_t customPSID) 
     desc.rs.cull_mode         = perm.Has(PermutationKey::DOUBLE_SIDED)
                                 ? RHI::CullMode::NONE
                                 : RHI::CullMode::BACK;
+    // Global view-mode wireframe (PSOCache hashes rs.fill_mode → distinct PSO).
+    desc.rs.fill_mode         = m_wireframeMode ? RHI::FillMode::WIREFRAME
+                                                : RHI::FillMode::SOLID;
     desc.rs.depth_clip_enable = true;
 
     // Depth test ON, depth write OFF — transparent objects don't update depth.

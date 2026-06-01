@@ -33,18 +33,33 @@ cbuffer TAACB : register(b0, space2)
     float4x4 prevViewProj;           // previous frame unjittered VP
     uint     width;
     uint     height;
-    float    tauHistory;             // diffuse history time constant (seconds)
+    float    historyWeight;          // [0, 0.99] direct history blend weight.
+                                     //   α_diffuse  = 1 - historyWeight
+                                     //   α_specular = α_diffuse * 0.125 (preserves the old
+                                     //                τ*8 ratio so spec tracking stays stable).
+                                     // NOTE: replaced the prior tauHistory(seconds) model on
+                                     // 2026-05-24. The exp(-Δt/τ) form gave a frame-rate-
+                                     // independent integration but a non-linear slider where
+                                     // 70% of the range was visually identical (0.3..1.0 all
+                                     // looked the same). Direct weight is intuitive (literally
+                                     // "how much history") at the cost of FR-independence —
+                                     // 144fps with w=0.9 integrates 2.4× faster (in absolute
+                                     // time) than 60fps. For this engine's typical 60–144 fps
+                                     // band the perceptual difference is mild and the UX win
+                                     // dominates.
     float    hasHistory;             // 0 = first frame / after resize, 1 = valid
-    float    deltaTime;              // seconds elapsed this frame
+    float    deltaTime;              // seconds elapsed this frame (kept for non-alpha uses)
     float    jitterX;                // current frame jitter X in pixels [-0.5, +0.5)
     float    jitterY;                // current frame jitter Y in pixels [-0.5, +0.5)
     float    colorBoxSigma;          // base AABB gamma (default 1.5)
     float    colorBoxSigmaSpecular;  // AABB gamma for specular pixels (default 2.0)
     float    specularRoughnessMax;   // roughness threshold for "specular" (default 0.5)
     uint     antiFlicker;            // 0/1 — Falcor distance-to-clamp anti-flicker
-    float    velocityWiden;          // motion-proportional AABB widening factor (Fix L)
+    float    velocityWiden;          // motion-proportional AABB widening factor
     float    sharpenStrength;        // Karis 5-tap unsharp blend factor (default 0.1; 0 disables)
-    float    _pad0;                  // CB 16-byte alignment
+    float    outlineMinAlpha;        // history-weight floor when outlineStencilBit is set in stencil
+    uint     outlineStencilBit;      // bit mask AND'd against stencil; 0 disables the lookup
+    // cbuffer ends at 188 bytes; implicit 4-byte tail pad brings it to 192.
 };
 
 // ---- Luma / tonemap ---------------------------------------------------------

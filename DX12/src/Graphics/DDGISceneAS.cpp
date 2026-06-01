@@ -78,7 +78,21 @@ void DDGISceneAS::EnsureScratch(GraphicsDX12& gfx, uint64_t needed)
     const uint64_t grown = needed + (needed >> 2);
     RT::ScratchBuffer fresh;
     if (RT::AllocateScratch(gfx, grown, fresh))
+    {
+        // Pipelined frame pacing — the OLD scratch may still be referenced
+        // by an AS-build CL submitted in a previous frame. Defer-release
+        // tied to the last signaled COMPUTE fence: scratch is compute-only,
+        // so once that fence completes no GPU work references it. More
+        // precise than the slot-based kFrameCount defer (we're not bound
+        // to the backbuffer rotation cycle).
+        if (m_scratch.resource)
+        {
+            constexpr uint32_t kComputeQueue = 1; // RHI::QUEUE_TYPE::COMPUTE
+            const uint64_t fv = gfx.GetLastSignaledFenceValue(kComputeQueue);
+            gfx.DeferReleaseResource(std::move(m_scratch.resource), kComputeQueue, fv);
+        }
         m_scratch = std::move(fresh);
+    }
 }
 
 void DDGISceneAS::EnsureTLAS(GraphicsDX12& gfx, uint32_t maxInstances)
@@ -91,6 +105,15 @@ void DDGISceneAS::EnsureTLAS(GraphicsDX12& gfx, uint32_t maxInstances)
     RT::TLAS fresh;
     if (RT::AllocateTLAS(gfx, cap, fresh))
     {
+        // Same hazard as EnsureScratch — defer-release the old TLAS + its
+        // instance upload buffer instead of letting operator= drop them.
+        // The TLAS resource is also referenced by Lighting/SSR via the
+        // shader-side TLAS SRV (g_DDGITLAS), so any in-flight read of the
+        // old SRV needs the resource alive until that frame's fence clears.
+        if (m_tlas.resource)
+            gfx.DeferReleaseResource(std::move(m_tlas.resource));
+        if (m_tlas.instanceUploadBuffer)
+            gfx.DeferReleaseResource(std::move(m_tlas.instanceUploadBuffer));
         m_tlas         = std::move(fresh);
         m_tlasCapacity = cap;
         m_tlasFresh    = false; // freshly allocated → first build cannot be an update
@@ -100,12 +123,24 @@ void DDGISceneAS::EnsureTLAS(GraphicsDX12& gfx, uint32_t maxInstances)
 void DDGISceneAS::EnsureMaterialBuffer(GraphicsDX12& gfx, uint32_t maxInstances)
 {
     if (maxInstances == 0) return;
-    if (m_matBuffer.IsValid() && m_matCapacity >= maxInstances) return;
-    if (m_matBuffer.IsValid())
+    if (m_matBuffer[0].IsValid() && m_matCapacity >= maxInstances) return;
+
+    // Free the existing ring (slot-by-slot) before re-allocating at the larger
+    // capacity. EnsureMaterialBuffer is called every BuildOrRefit; the
+    // already-large-enough fast path above guarantees this only runs on growth.
+    // OnWorldClear runs mid-frame so any in-flight CL referencing the OLD
+    // buffer slots could still be unsubmitted — but EnsureMaterialBuffer is
+    // only ever called from BuildOrRefit, which runs BEFORE its own CL is
+    // recorded each frame, so we can synchronously destroy here (no other CL
+    // references this resource yet this frame).
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
-        if (m_matMapped) { gfx.UnmapBuffer(m_matBuffer); m_matMapped = nullptr; }
-        gfx.DestroyBuffer(m_matBuffer);
-        m_matSrv = 0;
+        if (m_matBuffer[i].IsValid())
+        {
+            if (m_matMapped[i]) { gfx.UnmapBuffer(m_matBuffer[i]); m_matMapped[i] = nullptr; }
+            gfx.DestroyBuffer(m_matBuffer[i]);
+            m_matSrv[i] = 0;
+        }
     }
 
     uint32_t cap = 1;
@@ -117,27 +152,85 @@ void DDGISceneAS::EnsureMaterialBuffer(GraphicsDX12& gfx, uint32_t maxInstances)
     bd.usage      = RHI::Usage::UPLOAD;
     bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
     bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-    if (gfx.CreateBuffer(bd, m_matBuffer))
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
-        m_matMapped   = gfx.MapBuffer(m_matBuffer);
-        m_matSrv      = gfx.GetBufferSRVGpuHandle(m_matBuffer);
-        m_matCapacity = cap;
-        if (m_matMapped) std::memset(m_matMapped, 0, bd.size);
+        if (gfx.CreateBuffer(bd, m_matBuffer[i]))
+        {
+            m_matMapped[i] = gfx.MapBuffer(m_matBuffer[i]);
+            m_matSrv  [i]  = gfx.GetBufferSRVGpuHandle(m_matBuffer[i]);
+            if (m_matMapped[i]) std::memset(m_matMapped[i], 0, bd.size);
+        }
     }
+    m_matCapacity = cap;
 }
 
 // =============================================================================
 // World clear
 // =============================================================================
 
-void DDGISceneAS::OnWorldClear()
+void DDGISceneAS::OnWorldClear(GraphicsDX12& gfx)
 {
-    // BLAS resources are ComPtr-owned — clearing the map releases them.
-    m_blasCache.clear();
+    // BLAS cache survives world reload. MeshLibrary path-dedupes + refcounts
+    // its slots (project_loadworld_phase12), so same-world reload preserves
+    // every (libGen<<32 | libSlot, meshId) cache key and the cached BLAS
+    // resource stays valid. Clearing here previously forced 600+ BLAS
+    // rebuilds on every reload even though the meshes hadn't changed.
+    //
+    // Stale entries from world cycles (A→B→A) are reclaimed by PruneStaleBLAS
+    // — Renderer calls it from OnWorldClear right after the meshlib
+    // two-stage release that actually transitions slots to refCount==0.
+    //
     // TLAS resource stays allocated (the buffer is reused across worlds);
     // mark the next build as a non-update rebuild.
+    (void)gfx;
     m_tlasFresh         = false;
     m_lastInstanceCount = 0;
+}
+
+void DDGISceneAS::PruneStaleBLAS(Resource::MeshLibrary* meshLib, GraphicsDX12& gfx)
+{
+    if (!meshLib || m_blasCache.empty()) return;
+
+    size_t pruned = 0;
+    for (auto it = m_blasCache.begin(); it != m_blasCache.end(); )
+    {
+        if (it->first.sourceKind != 0)
+        {
+            // MeshHandle (procedural) — no generation to compare. Skipped:
+            // see header comment. Cube/sphere BLAS are tiny.
+            ++it;
+            continue;
+        }
+
+        // Reconstruct the meshlib Handle from CacheKey.libOrSlot.
+        const uint32_t slotIdx = static_cast<uint32_t>(it->first.libOrSlot & 0xFFFFFFFFu);
+        const uint16_t slotGen = static_cast<uint16_t>(it->first.libOrSlot >> 32);
+        const Resource::Handle libHandle = Resource::Handle::Make(
+            slotIdx, Resource::ResourceType::MeshLibrary, slotGen);
+
+        if (meshLib->IsValid(libHandle))
+        {
+            ++it;
+            continue;
+        }
+
+        // Slot freed or generation bumped — entry is stale. The BLAS resource
+        // is a separate ID3D12Resource from the source VB+IB, so it's still
+        // GPU-valid and safe to defer-release here.
+        if (it->second.resource)
+            gfx.DeferReleaseResource(std::move(it->second.resource));
+        // An entry pruned mid-compaction still holds the transient size buffers;
+        // defer-release them too so they don't leak or free while still in-flight.
+        if (it->second.compactSizeUav)
+            gfx.DeferReleaseResource(std::move(it->second.compactSizeUav));
+        if (it->second.compactSizeReadback)
+            gfx.DeferReleaseResource(std::move(it->second.compactSizeReadback));
+        it = m_blasCache.erase(it);
+        ++pruned;
+    }
+
+    if (pruned > 0)
+        LOG_INFO("DDGISceneAS: pruned %zu stale BLAS entries", pruned);
 }
 
 // =============================================================================
@@ -153,6 +246,10 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
                           MeshManager*                meshMgr)
 {
     if (!gfx.SupportsDXR() || !cmd) return 0;
+
+    // Advances once per real build/refit; drives the BLAS-compaction readback
+    // timing (see m_buildCounter / kCompactReadyDelay below).
+    ++m_buildCounter;
 
     // ---- Phase A: collect candidate static-mesh entities --------------------
     // Static-mesh inclusion rule (Phase 1):
@@ -291,9 +388,9 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
         }
     }
 
-    // ---- MeshHandle path (procedural primitives — Cube/Sphere/Cone) --------
-    // ECS MeshHandle stores a slot in MeshManager's primitive pool (currently
-    // bounded by PrimitiveMeshType::Count = 3). The actual GPU buffers are
+    // ---- MeshHandle path (procedural primitives — Cube/Sphere/Cone/Plane/Torus) --
+    // ECS MeshHandle stores a slot in MeshManager's primitive pool (bounded by
+    // PrimitiveMeshType::Count). The actual GPU buffers are
     // pre-uploaded by MeshManager::InitPrimitives at startup; we read them
     // directly via GetPrimitive(). Procedural primitives use uint16 indices
     // (ProceduralMesh::MeshData::indices) — the index format must be threaded
@@ -439,7 +536,8 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
         {
             if (sizedSoFar++ >= toBuild) break;
             uint64_t resSz = 0, scratchSz = 0;
-            if (!RT::QueryBLASBuildSize(gfx, &g, 1, resSz, scratchSz)) continue;
+            // allowCompaction=true: prebuild size MUST match the BuildBLAS flags.
+            if (!RT::QueryBLASBuildSize(gfx, &g, 1, resSz, scratchSz, /*allowCompaction*/true)) continue;
             blasScratchMax = std::max<uint64_t>(blasScratchMax, scratchSz);
         }
         // Also account for TLAS scratch — query it before any AS-record work.
@@ -447,17 +545,82 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
         const uint64_t totalScratchNeeded = std::max<uint64_t>(blasScratchMax, m_tlas.scratchSize);
         if (totalScratchNeeded > 0) EnsureScratch(gfx, totalScratchNeeded);
 
+        // A BLAS built this call has its COMPACTED_SIZE readback GPU-ready after
+        // kFrameCount more BuildOrRefit calls (the slot fence in BeginFrame
+        // guarantees this frame's compute work has completed by then). +1 for
+        // margin. State 2 (below) reads it and swaps in a shrunk BLAS.
+        constexpr uint64_t kCompactReadyDelay = kFrameCount + 1;
+
         uint32_t builtThisFrame = 0;
         for (const auto& [k, g] : needBuild)
         {
             if (builtThisFrame >= toBuild) break;
             uint64_t resSz = 0, scratchSz = 0;
-            if (!RT::QueryBLASBuildSize(gfx, &g, 1, resSz, scratchSz)) continue;
+            if (!RT::QueryBLASBuildSize(gfx, &g, 1, resSz, scratchSz, /*allowCompaction*/true)) continue;
             RT::BLAS blas;
             if (!RT::AllocateBLAS(gfx, resSz, blas)) continue;
-            RT::BuildBLAS(gfx, cmd, &g, 1, blas, m_scratch);
+            RT::BuildBLAS(gfx, cmd, &g, 1, blas, m_scratch, /*allowCompaction*/true);
+            // Queue the compacted-size readback; State 2 shrinks it a few frames
+            // later. Failure inside leaves compactState=None → stays full size.
+            RT::EmitBLASCompactedSize(gfx, cmd, blas);
+            blas.compactReadyCounter = m_buildCounter + kCompactReadyDelay;
             m_blasCache.emplace(k, std::move(blas));
             builtThisFrame++;
+        }
+    }
+
+    // ---- State 2: compact BLAS whose COMPACTED_SIZE readback is now GPU-ready.
+    // Runs BEFORE the TLAS build so any swapped (shrunk) BLAS VA flows into this
+    // frame's TLAS instances. CopyRaytracingAccelerationStructure(COMPACT) needs
+    // NO scratch, so this does not touch the delicate one-shot m_scratch sizing
+    // above. Budgeted like the build loop to bound per-frame GPU work (TDR).
+    bool blasSwapped = false;
+    {
+        constexpr uint32_t kMaxBLASCompactionsPerFrame = 16;
+        uint32_t compactedThisFrame = 0;
+        for (auto& [k, blas] : m_blasCache)
+        {
+            if (compactedThisFrame >= kMaxBLASCompactionsPerFrame) break;
+            if (blas.compactState != RT::BLAS::CompactState::AwaitingSize) continue;
+            if (m_buildCounter < blas.compactReadyCounter) continue; // readback not GPU-ready yet
+
+            uint64_t compactedSize = 0;
+            if (blas.compactSizeReadback)
+            {
+                D3D12_RANGE rr{ 0, sizeof(uint64_t) };
+                void* mapped = nullptr;
+                if (SUCCEEDED(blas.compactSizeReadback->Map(0, &rr, &mapped)) && mapped)
+                {
+                    compactedSize = *static_cast<const uint64_t*>(mapped);
+                    D3D12_RANGE wr{ 0, 0 };
+                    blas.compactSizeReadback->Unmap(0, &wr);
+                }
+            }
+
+            // Release the transient size buffers regardless of the outcome
+            // (slot-based defer: still referenced by the recent emit/copy CL).
+            if (blas.compactSizeUav)      gfx.DeferReleaseResource(std::move(blas.compactSizeUav));
+            if (blas.compactSizeReadback) gfx.DeferReleaseResource(std::move(blas.compactSizeReadback));
+
+            if (compactedSize > 0 && compactedSize < blas.sizeBytes)
+            {
+                RT::BLAS compacted;
+                if (RT::CompactBLAS(gfx, cmd, blas, compactedSize, compacted))
+                {
+                    // Original is still referenced by in-flight TLASes (<= kFrameCount
+                    // frames) and by this frame's compaction copy — slot-based defer
+                    // outlives both (same lifetime class as the TLAS resource).
+                    gfx.DeferReleaseResource(std::move(blas.resource));
+                    blas.resource     = std::move(compacted.resource);
+                    blas.sizeBytes    = compacted.sizeBytes;
+                    blas.compactState = RT::BLAS::CompactState::Done;
+                    blasSwapped       = true;
+                    compactedThisFrame++;
+                    continue;
+                }
+            }
+            // No savings (or compaction unavailable) → keep the original, stop retrying.
+            blas.compactState = RT::BLAS::CompactState::Done;
         }
     }
 
@@ -470,7 +633,10 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
 
     std::vector<RT::TLASInstance> instances;
     instances.reserve(pending.size());
-    auto* matDst = static_cast<DDGIInstanceData*>(m_matMapped);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    auto* matDst = (frameSlot < kFrameCount)
+        ? static_cast<DDGIInstanceData*>(m_matMapped[frameSlot])
+        : nullptr;
 
     for (const Pending& p : pending)
     {
@@ -507,16 +673,16 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
             matDst[instIdx]   = d;
         }
     }
-    // Periodic diagnostic — log instance + cache stats so user can verify
-    // DDGISceneAS actually sees their static geometry. Throttled to ~1 Hz.
-    {
-        static uint32_t s_logCounter = 0;
-        if ((++s_logCounter % 60u) == 0)
-        {
-            LOG_INFO("DDGISceneAS: pending=%zu instances=%zu blasCache=%zu",
-                     pending.size(), instances.size(), m_blasCache.size());
-        }
-    }
+    //// Periodic diagnostic — log instance + cache stats so user can verify
+    //// DDGISceneAS actually sees their static geometry. Throttled to ~1 Hz.
+    //{
+    //    static uint32_t s_logCounter = 0;
+    //    if ((++s_logCounter % 60u) == 0)
+    //    {
+    //        LOG_INFO("DDGISceneAS: pending=%zu instances=%zu blasCache=%zu",
+    //                 pending.size(), instances.size(), m_blasCache.size());
+    //    }
+    //}
 
     if (instances.empty()) return 0;
 
@@ -524,7 +690,10 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
     // PERFORM_UPDATE requires the same instance count and same BLAS pointers.
     // Any change in either means we MUST do a full rebuild, otherwise DXR
     // reads garbage on the unchanged-instance assumption and crashes the GPU.
-    const bool canUpdate = m_tlasFresh && (newCount == m_lastInstanceCount);
+    // A compaction swap this frame changed a BLAS VA; a PERFORM_UPDATE refit
+    // (which assumes identical BLAS pointers) would feed a stale/freed VA into
+    // the refit → GPU hang. Force a full rebuild on any swap frame.
+    const bool canUpdate = m_tlasFresh && (newCount == m_lastInstanceCount) && !blasSwapped;
 
     RT::WriteTLASInstances(m_tlas, instances.data(), newCount);
     RT::BuildTLAS(gfx, cmd, m_tlas, m_scratch, canUpdate);
@@ -532,4 +701,21 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
     m_lastInstanceCount = newCount;
 
     return m_tlas.GPUAddress();
+}
+
+// =============================================================================
+// Per-frame accessors
+// =============================================================================
+
+const RHI::GPUBuffer* DDGISceneAS::GetInstanceBuffer(GraphicsDX12& gfx) const
+{
+    const uint32_t s = gfx.GetFrameIndex();
+    if (s >= kFrameCount) return nullptr;
+    return m_matBuffer[s].IsValid() ? &m_matBuffer[s] : nullptr;
+}
+
+uint64_t DDGISceneAS::GetInstanceSrv(GraphicsDX12& gfx) const
+{
+    const uint32_t s = gfx.GetFrameIndex();
+    return (s < kFrameCount) ? m_matSrv[s] : 0;
 }

@@ -25,11 +25,15 @@ struct LocalTransform
     DirectX::XMFLOAT3 scale       = { 1.f, 1.f, 1.f };
 
     // Returns the local SRT matrix in DirectXMath (row-vector) convention.
+    // Quat is normalized defensively — XMMatrixRotationQuaternion is undefined
+    // on non-unit input. Worlds saved with negative-zero/sign-flipped qw can
+    // sit ε off unit length, leaking a tiny shear-scale into the matrix.
     DirectX::XMMATRIX ToMatrix() const
     {
         using namespace DirectX;
         const XMMATRIX S = XMMatrixScalingFromVector(XMLoadFloat3(&scale));
-        const XMMATRIX R = XMMatrixRotationQuaternion(XMLoadFloat4(&rotation));
+        const XMMATRIX R = XMMatrixRotationQuaternion(
+            XMQuaternionNormalize(XMLoadFloat4(&rotation)));
         const XMMATRIX T = XMMatrixTranslationFromVector(XMLoadFloat3(&translation));
         return S * R * T;
     }
@@ -63,17 +67,80 @@ struct Children
 };
 
 // ---------------------------------------------------------------------------
-// Visibility — per-entity rendering flag.
-// is_visible       : user-settable toggle (culling system may also clear it)
-// inherited_hidden : set by TransformSystem when any ancestor is invisible
+// ViewBit — per-view identifier used by VisibilityComponent::viewMask.
+// Each rendering view (main camera, every shadow cascade, every probe, etc.)
+// owns one bit. Culling AND's the entity's mask against the view's bit to
+// decide early-out before any frustum / occlusion work runs.
 // ---------------------------------------------------------------------------
-struct Visibility
+namespace ViewBit
 {
-    bool is_visible       = true;
-    bool inherited_hidden = false;
+    constexpr uint32_t MainCamera       = 1u << 0;
+    constexpr uint32_t ShadowCascade0   = 1u << 1;
+    constexpr uint32_t ShadowCascade1   = 1u << 2;
+    constexpr uint32_t ShadowCascade2   = 1u << 3;
+    constexpr uint32_t ShadowCascade3   = 1u << 4;
+    constexpr uint32_t ReflectionProbe  = 1u << 5;
+    constexpr uint32_t PlanarReflection = 1u << 6;
+    constexpr uint32_t RayTracing       = 1u << 7;
+    constexpr uint32_t CustomDepth      = 1u << 8;
 
-    bool IsEffectivelyVisible() const { return is_visible && !inherited_hidden; }
+    constexpr uint32_t ShadowAny =
+        ShadowCascade0 | ShadowCascade1 | ShadowCascade2 | ShadowCascade3;
+    constexpr uint32_t All = ~0u;
+}
+
+// ---------------------------------------------------------------------------
+// VisibilityComponent — author-intent visibility for a render entity.
+//
+// `flags`            — user-toggleable bits (Visible / CastShadow / RenderInMainPass).
+// `viewMask`         — which views this entity participates in (see ViewBit).
+// `renderLayer`      — reserved for camera-layer filtering (1 byte, future use).
+// `inheritedHidden`  — runtime-only: written by TransformSystem when any
+//                      ancestor is invisible. Not persisted.
+//
+// Pipeline order (see DesignMd/ecs_visibility_design.md):
+//   VisibilityComponent filter  →  BVH frustum cull  →  HZB occlusion  →  draw
+// Hidden entities must be dropped before they enter BVH gather.
+// ---------------------------------------------------------------------------
+struct VisibilityComponent
+{
+    enum Flags : uint8_t
+    {
+        Visible          = 1 << 0,   // user toggle — entity is shown at all
+        CastShadow       = 1 << 1,   // contribute to shadow passes
+        RenderInMainPass = 1 << 2,   // emit a draw in the main / GBuffer pass
+    };
+
+    uint32_t viewMask        = ViewBit::All;
+    uint8_t  flags           = Visible | CastShadow | RenderInMainPass;
+    uint8_t  renderLayer     = 0;
+    bool     inheritedHidden = false;   // recomputed every frame by TransformSystem
+
+    bool IsVisible() const            { return (flags & Visible) != 0; }
+    bool CastsShadow() const          { return (flags & CastShadow) != 0; }
+    bool RendersInMainPass() const    { return (flags & RenderInMainPass) != 0; }
+    bool IsInView(uint32_t viewBit) const { return (viewMask & viewBit) != 0; }
+
+    // Author-visible AND hierarchy-propagated: the predicate culling reads.
+    bool IsEffectivelyVisible() const { return IsVisible() && !inheritedHidden; }
+
+    void SetVisible(bool v)          { v ? flags |= Visible          : flags &= ~Visible; }
+    void SetCastShadow(bool v)       { v ? flags |= CastShadow       : flags &= ~CastShadow; }
+    void SetRenderInMainPass(bool v) { v ? flags |= RenderInMainPass : flags &= ~RenderInMainPass; }
 };
+
+// ---------------------------------------------------------------------------
+// Phase-2 structural-hide tags. Presence on an entity excludes it from culling
+// without touching its VisibilityComponent — query the pool, branch out.
+//   EditorOnlyTag    — gizmos, debug volumes, never visible in the Game build.
+//   HiddenInGameTag  — editor-time props that vanish at play.
+//   DisabledTag      — entity logically paused: culled in all builds.
+// Tags stay attached across saves/loads, so toggling is intended to be rare.
+// For high-frequency hide/show, prefer VisibilityComponent::SetVisible.
+// ---------------------------------------------------------------------------
+struct EditorOnlyTag {};
+struct HiddenInGameTag {};
+struct DisabledTag {};
 
 // ---------------------------------------------------------------------------
 // RenderLayer — bitmask for camera layer filtering.

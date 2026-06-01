@@ -1,7 +1,6 @@
 #include "AI/AILODSystem.h"
 #include "AI/AIComponents.h"
-#include "ECS/Components.h"            // CameraComponent
-#include "ECS/HierarchyComponents.h"   // GlobalTransform
+#include "ECS/HierarchyComponents.h"   // GlobalTransform (camera pose)
 
 #include <DirectXMath.h>
 
@@ -19,15 +18,15 @@ namespace AI
     void AILODSystem::Update(World& world)
     {
         // Camera position — fall back to (0,0,0) if no camera or no
-        // CameraComponent. Tier selection still works because every AI
+        // GlobalTransform. Tier selection still works because every AI
         // gets compared against the same origin.
         DirectX::XMFLOAT3 camPos{ 0.f, 0.f, 0.f };
         bool haveCamera = false;
         if (m_camera != NullEntity)
         {
-            if (auto* cam = world.GetComponent<CameraComponent>(m_camera))
+            if (auto* gt = world.GetComponent<GlobalTransform>(m_camera))
             {
-                camPos     = cam->position;
+                camPos     = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
                 haveCamera = true;
             }
         }

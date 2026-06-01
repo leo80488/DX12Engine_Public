@@ -35,15 +35,41 @@ static const float LUT_SIZE   = 32.0;
 static const float LUT_SCALE  = (LUT_SIZE - 1.0) / LUT_SIZE;
 static const float LUT_OFFSET = 0.5 / LUT_SIZE;
 
-// ACES fitted tone mapping (Narkowicz 2015)
-float3 ACESFilm(float3 x)
+// ACES Fitted (Stephen Hill / "s2014") — full hue-preserving RRT+ODT fit
+// in ACEScg (AP1) space. This is the tonemap UE's "ACES" output transform uses.
+// Highlights desaturate naturally (saturated blues from Rayleigh scattering
+// roll off toward white instead of staying pure blue).
+//
+// Pipeline:
+//   sRGB linear → ACEScg (AP1)  via ACESInputMat
+//   tonemap S-curve in AP1      via RRTAndODTFit
+//   ACEScg → sRGB linear        via ACESOutputMat
+//
+// Matrices fold (sRGB→AP0→AP1) and (AP1→sRGB) into single 3×3s.
+static const float3x3 ACESInputMat = {
+    { 0.59719f, 0.35458f, 0.04823f },
+    { 0.07600f, 0.90834f, 0.01566f },
+    { 0.02840f, 0.13383f, 0.83777f }
+};
+static const float3x3 ACESOutputMat = {
+    {  1.60475f, -0.53108f, -0.07367f },
+    { -0.10208f,  1.10813f, -0.00605f },
+    { -0.00327f, -0.07276f,  1.07602f }
+};
+
+float3 RRTAndODTFit(float3 v)
 {
-    const float a = 2.51f;
-    const float b = 0.03f;
-    const float c = 2.43f;
-    const float d = 0.59f;
-    const float e = 0.14f;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+    float3 a = v * (v + 0.0245786f) - 0.000090537f;
+    float3 b = v * (0.983729f * v + 0.4329510f) + 0.238081f;
+    return a / b;
+}
+
+float3 ACESFitted(float3 color)
+{
+    color = mul(ACESInputMat, color);
+    color = RRTAndODTFit(color);
+    color = mul(ACESOutputMat, color);
+    return saturate(color);
 }
 
 [numthreads(8, 8, 1)]
@@ -65,8 +91,8 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     // Apply exposure
     color *= exposure;
 
-    // ACES tone mapping
-    color = ACESFilm(color);
+    // ACES tone mapping (Stephen Hill fitted RRT+ODT, hue-preserving)
+    color = ACESFitted(color);
 
     // Linear → sRGB gamma (approximate: pow(c, 1/2.2))
     color = pow(max(color, 0.0f), 1.0f / 2.2f);

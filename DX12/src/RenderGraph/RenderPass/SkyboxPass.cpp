@@ -5,17 +5,7 @@
 
 #include <cstring>
 
-struct alignas(16) SkyCBData
-{
-    float    sunDir[3];    float sunDiskSize;       // cos(half-angle of sun core)
-    float    sunColor[3];  float sunDiskIntensity;
-    float    moonDir[3];   float moonDiskCos;       // cos(half-angle of moon disk)
-    float    moonColor[3]; float moonVisible;       // 1 = draw moon, 0 = skip
-    float    starIntensity;                          // [0,1] day/night blend
-    float    starTime;                               // seconds, twinkle phase
-    float    starDensity;                            // grid resolution
-    float    starBrightness;                         // overall multiplier
-};
+// SkyCBData now lives in SkyboxPass.h so FrameCB<SkyCBData> can be a member.
 
 // Root parameter slot for cube vertex ByteAddressBuffer (t2 space0, slot 0 of BindResource).
 static constexpr uint32_t kCubeVBSlot     =  0;   // maps to root param 10 → t2
@@ -151,17 +141,9 @@ void SkyboxPass::Init(IGraphicsDevice& gfx)
         gfx.CreateSampler(cs2, m_starsCubeSampler);
     }
 
-    // SkyCB — persistent UPLOAD CB for sun disk parameters (bound at b2).
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(SkyCBData) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_skyCB))
-            m_skyCBMapped = gfx.MapBuffer(m_skyCB);
-        else
-            LOG_ERROR("SkyboxPass: SkyCB creation failed");
-    }
+    // SkyCB — triple-buffered UPLOAD CB for sun disk parameters (bound at b2).
+    if (!m_skyCB.Create(gfx, "SkyboxPass.SkyCB"))
+        LOG_ERROR("SkyboxPass: SkyCB creation failed");
 
     if (!m_psoCache.GetOrCreate(BuildPSODesc()))
         LOG_ERROR("SkyboxPass: PSO creation failed");
@@ -195,6 +177,7 @@ PSODesc SkyboxPass::BuildPSODesc() const
 
 RHI::CommandList SkyboxPass::Execute(RHI::CommandList cl)
 {
+    if (m_viewModeHidden) return cl;   // Wireframe view — keep the background black
     if (!m_envMapGpuHandle) return cl; // no cubemap assigned yet
     if (!m_cubeVB.IsValid()) return cl;
 
@@ -244,7 +227,7 @@ RHI::CommandList SkyboxPass::Execute(RHI::CommandList cl)
     cl.GetDevice().SetRenderTargetToHdrWithDepth(depthTex, cl);
 
     // Upload the latest sun / moon parameters into SkyCB (b2).
-    if (m_skyCBMapped)
+    if (auto* slot = m_skyCB.Current(gfx))
     {
         SkyCBData d{};
         d.sunDir[0] = m_sunDir.x;     d.sunDir[1] = m_sunDir.y;     d.sunDir[2] = m_sunDir.z;
@@ -259,7 +242,7 @@ RHI::CommandList SkyboxPass::Execute(RHI::CommandList cl)
         d.starTime      = m_starTime;
         d.starDensity   = m_starDensity;
         d.starBrightness= m_starBrightness;
-        std::memcpy(m_skyCBMapped, &d, sizeof(d));
+        *slot = d;
     }
 
     cl.BindDescriptorHeaps();

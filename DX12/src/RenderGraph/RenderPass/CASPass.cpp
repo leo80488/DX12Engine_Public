@@ -33,12 +33,7 @@ void CASPass::Init(IGraphicsDevice& gfx)
         return;
     }
 
-    RHI::GPUBufferDesc bd{};
-    bd.size       = (sizeof(CASCB) + 255u) & ~255u;
-    bd.usage      = RHI::Usage::UPLOAD;
-    bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(bd, m_cb))
-        m_cbMapped = gfx.MapBuffer(m_cb);
+    m_cb.Create(gfx, "CAS.CB");
 
     LOG_SUCCESS("CASPass: initialized");
 }
@@ -94,13 +89,13 @@ void CASPass::Execute(RHI::CommandList cl)
     auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
 
     // ---- Upload CB --------------------------------------------------------
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
         CASCB c{};
         c.width     = m_vpW;
         c.height    = m_vpH;
         c.sharpness = sharpness;
-        std::memcpy(m_cbMapped, &c, sizeof(c));
+        *slot = c;
     }
 
     // ---- Transition output to UAV ------------------------------------------
@@ -113,7 +108,7 @@ void CASPass::Execute(RHI::CommandList cl)
 
     // ---- Dispatch ----------------------------------------------------------
     gfx.BindComputePipelineState(m_pso, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRV0, m_inputSrv, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_output), cl);
     gfx.DispatchCompute((m_vpW + 7) / 8, (m_vpH + 7) / 8, 1, cl);

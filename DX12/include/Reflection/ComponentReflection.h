@@ -32,19 +32,30 @@
 
 #include "ECS/Components.h"
 #include "ECS/HierarchyComponents.h"
+#include "ECS/CameraStackComponents.h"
 #include "ECS/BillboardComponent.h"
 #include "ECS/SkyboxComponent.h"
+#include "ECS/AtmosphereComponent.h"
+#include "ECS/CloudComponent.h"
+#include "ECS/TODComponents.h"
 #include "ECS/ReflectionProbeComponent.h"
 #include "ECS/DDGIComponents.h"
 #include "ECS/TrailComponent.h"
 #include "ECS/BeamComponent.h"
 #include "ECS/PhysicsComponents.h"
+#include "ECS/CharacterControllerComponent.h"
+#include "ECS/PlayerComponent.h"
+#include "ECS/AIIntentComponent.h"
+#include "ECS/PerceptionComponent.h"
+#include "Nav/NavComponents.h"
 #include "ECS/AnimationComponents.h"
+#include "ECS/FootIKComponent.h"
 #include "ECS/ParticleComponent.h"
 #include "ECS/TerrainComponent.h"
 #include "ECS/SocketSystem.h"
 #include "ECS/FollowComponents.h"
 #include "ECS/VolumeComponent.h"
+#include "ECS/VideoComponent.h"
 #include "AI/AIComponents.h"
 #include "Physics/ChainPhysicsSystem.h"
 #include "Scripting/ScriptComponent.h"
@@ -58,9 +69,81 @@
 // HierarchyComponents — pure data
 // ===========================================================================
 
-REFLECT_BEGIN(Visibility)
-    REFLECT_BOOL(is_visible,        "Visible")
-    REFLECT_BOOL(inherited_hidden,  "Inherited Hidden")
+// VisibilityComponent — author-intent flags + per-view selection mask.
+//
+// `flags` (uint8) packs Visible / CastShadow / RenderInMainPass; expanded as
+// three checkboxes. `viewMask` (uint32) is one bit per ViewBit (main camera,
+// each shadow cascade, RT, etc.). Both go through custom widgets — a 4-billion
+// drag-int wouldn't let you set individual bits, and the wider one-checkbox-
+// per-ViewBit list also doubles as documentation for what bits exist.
+namespace Reflect_CustomWidgets
+{
+    inline bool DrawVisibilityFlags(void* fp, const Reflect::FieldDescriptor& f)
+    {
+        auto* bits = static_cast<uint8_t*>(fp);
+        bool changed = false;
+        ImGui::PushID(f.label);
+        auto toggle = [&](const char* lbl, uint8_t mask) {
+            bool v = (*bits & mask) != 0;
+            if (ImGui::Checkbox(lbl, &v)) {
+                if (v) *bits |= mask; else *bits &= ~mask;
+                changed = true;
+            }
+        };
+        toggle("Visible",            VisibilityComponent::Visible);
+        toggle("Cast Shadow",        VisibilityComponent::CastShadow);
+        toggle("Render In Main Pass",VisibilityComponent::RenderInMainPass);
+        ImGui::PopID();
+        return changed;
+    }
+
+    inline bool DrawViewMaskBits(void* fp, const Reflect::FieldDescriptor& f)
+    {
+        auto* mask = static_cast<uint32_t*>(fp);
+        bool changed = false;
+        ImGui::PushID(f.label);
+        ImGui::TextDisabled("View Mask (per-view participation)");
+
+        auto toggle = [&](const char* lbl, uint32_t bit) {
+            bool v = (*mask & bit) != 0;
+            if (ImGui::Checkbox(lbl, &v)) {
+                if (v) *mask |= bit; else *mask &= ~bit;
+                changed = true;
+            }
+        };
+        toggle("Main Camera",       ViewBit::MainCamera);
+        toggle("Shadow Cascade 0",  ViewBit::ShadowCascade0);
+        toggle("Shadow Cascade 1",  ViewBit::ShadowCascade1);
+        toggle("Shadow Cascade 2",  ViewBit::ShadowCascade2);
+        toggle("Shadow Cascade 3",  ViewBit::ShadowCascade3);
+        toggle("Reflection Probe",  ViewBit::ReflectionProbe);
+        toggle("Planar Reflection", ViewBit::PlanarReflection);
+        toggle("Ray Tracing",       ViewBit::RayTracing);
+        toggle("Custom Depth",      ViewBit::CustomDepth);
+
+        // Quick presets cover the common authoring cases.
+        if (ImGui::SmallButton("All"))      { *mask = ViewBit::All;        changed = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("None"))     { *mask = 0u;                  changed = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Main+Shadow")) {
+            *mask = ViewBit::MainCamera | ViewBit::ShadowAny;             changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Shadow Only")) {
+            *mask = ViewBit::ShadowAny;                                   changed = true;
+        }
+        // Hex readout so users editing serialized files can sanity-check.
+        ImGui::Text("Raw: 0x%08X", *mask);
+        ImGui::PopID();
+        return changed;
+    }
+}
+
+REFLECT_BEGIN(VisibilityComponent)
+    REFLECT_CUSTOM(flags,           "Flags",     &Reflect_CustomWidgets::DrawVisibilityFlags)
+    REFLECT_CUSTOM(viewMask,        "View Mask", &Reflect_CustomWidgets::DrawViewMaskBits)
+    REFLECT_BOOL  (inheritedHidden, "Inherited Hidden (read-only)")
 REFLECT_END()
 
 REFLECT_BEGIN(RenderLayer)
@@ -73,18 +156,45 @@ REFLECT_BEGIN(LocalAabb)
 REFLECT_END()
 
 // ===========================================================================
-// CameraComponent — game-layer FPS camera
+// CameraComponent — lens / view-projection parameters
 // ===========================================================================
 
 REFLECT_BEGIN(CameraComponent)
-    REFLECT_FLOAT3(position,         "Position",          -1e6f, 1e6f)
-    REFLECT_SLIDER(yaw,              "Yaw (rad)",         -3.14159f, 3.14159f)
-    REFLECT_SLIDER(pitch,            "Pitch (rad)",       -1.5f,     1.5f)
-    REFLECT_ANGLE (fov,              "FOV",               10.f, 170.f)
-    REFLECT_FLOAT_FMT(nearZ,         "Near Z",            0.001f,    10.f,   "%.3f", 0.001f)
-    REFLECT_FLOAT_FMT(farZ,          "Far Z",             1.f,       5000.f, "%.0f", 1.f)
-    REFLECT_FLOAT_FMT(mouseSensitivity, "Mouse Sensitivity", 0.0001f, 0.05f, "%.4f", 0.0001f)
-    REFLECT_FLOAT_FMT(moveSpeed,     "Move Speed",        0.1f,      1000.f, "%.1f", 0.1f)
+    REFLECT_ANGLE (fov,      "FOV",     10.f,   170.f)
+    REFLECT_FLOAT_FMT(nearZ, "Near Z",  0.001f, 10.f,   "%.3f", 0.001f)
+    REFLECT_FLOAT_FMT(farZ,  "Far Z",   1.f,    5000.f, "%.0f", 1.f)
+REFLECT_END()
+
+// ===========================================================================
+// CameraControllerComponent — FPS controller state (yaw/pitch + tuning).
+// The camera pose itself is edited via the Local Transform component.
+// ===========================================================================
+
+constexpr Reflect::EnumOption kCameraModeOptions[] = {
+    { (int)CameraControllerComponent::Mode::Free,        "Free (fly-cam)"  },
+    { (int)CameraControllerComponent::Mode::ThirdPerson, "Third-Person"    },
+    { (int)CameraControllerComponent::Mode::FirstPerson, "First-Person"    },
+};
+
+REFLECT_BEGIN(CameraControllerComponent)
+    REFLECT_SLIDER(yaw,                 "Yaw (rad)",         -3.14159f, 3.14159f)
+    REFLECT_SLIDER(pitch,               "Pitch (rad)",       -1.5f,     1.5f)
+    REFLECT_FLOAT_FMT(mouseSensitivity, "Mouse Sensitivity",  0.0001f,  0.05f,  "%.4f", 0.0001f)
+    REFLECT_FLOAT_FMT(moveSpeed,        "Move Speed",         0.1f,     1000.f, "%.1f", 0.1f)
+    REFLECT_ENUM(mode,                  "Mode",              kCameraModeOptions)
+    // Follow-mode fields only relevant when mode != Free.
+    REFLECT_IF([](const void* o) {
+        return static_cast<const CameraControllerComponent*>(o)->mode
+            != CameraControllerComponent::Mode::Free;
+    })
+        // followTarget is an AttachmentRef — picker UI lives in EditorLayer
+        // postDraw (see RegisterDefaultEditors), not in reflection.
+        REFLECT_FLOAT(thirdPersonDistance, "Third-Person Distance",   0.1f, 50.f)
+        REFLECT_FLOAT3(headOffset,        "FP Head Offset",          -10.f, 10.f)
+        REFLECT_FLOAT3(shoulderOffset,    "TP Shoulder Offset",      -10.f, 10.f)
+        REFLECT_BOOL  (cameraCollisionEnabled, "TP Wall-Collision Probe")
+        REFLECT_FLOAT (cameraProbeRadius, "TP Probe Radius",          0.01f, 1.0f)
+    REFLECT_ENDIF()
 REFLECT_END()
 
 // ===========================================================================
@@ -96,6 +206,95 @@ REFLECT_BEGIN(CameraData)
     REFLECT_FLOAT(nearZ,                "Near Z",               0.001f, 10.f)
     REFLECT_FLOAT(farZ,                 "Far Z",                1.f,    10000.f)
     REFLECT_FLOAT(aspectRatioOverride,  "Aspect Override (0=auto)", 0.f, 8.f)
+REFLECT_END()
+
+// ===========================================================================
+// Camera stack — virtual camera + pose + priority + blend + live
+// ===========================================================================
+
+REFLECT_BEGIN(VirtualCameraComponent)
+    REFLECT_ANGLE    (fov,            "FOV",             10.f, 170.f)
+    REFLECT_FLOAT_FMT(nearZ,          "Near Z",         0.001f, 10.f,   "%.3f", 0.001f)
+    REFLECT_FLOAT_FMT(farZ,           "Far Z",          1.f,    5000.f, "%.0f", 1.f)
+    REFLECT_FLOAT    (aspectOverride, "Aspect Override (0=auto)", 0.f, 8.f)
+    REFLECT_UINT     (channelId,      "Channel Id (hashed)",      0u, 0xFFFFFFFFu)
+REFLECT_END()
+
+REFLECT_BEGIN(CameraPoseComponent)
+    REFLECT_FLOAT3(position, "Position", -1e5f, 1e5f)
+    REFLECT_FLOAT4(rotation, "Rotation (xyzw)", -1.f, 1.f)
+REFLECT_END()
+
+REFLECT_BEGIN(VCamPriorityComponent)
+    REFLECT_INT  (priority, "Priority",   -1000, 10000)
+    REFLECT_FLOAT(weight,   "Weight",     0.f,   1.f)
+    REFLECT_BOOL (enabled,  "Enabled")
+REFLECT_END()
+
+constexpr Reflect::EnumOption kBlendCurveOptions[] = {
+    { (int)BlendCurve::Linear,    "Linear"    },
+    { (int)BlendCurve::EaseIn,    "Ease In"   },
+    { (int)BlendCurve::EaseOut,   "Ease Out"  },
+    { (int)BlendCurve::EaseInOut, "Ease In/Out" },
+    { (int)BlendCurve::Custom,    "Custom"    },
+};
+
+constexpr Reflect::EnumOption kBlendStateOptions[] = {
+    { (int)BlendState::Inactive,    "Inactive"    },
+    { (int)BlendState::BlendingIn,  "Blending In" },
+    { (int)BlendState::Active,      "Active"      },
+    { (int)BlendState::BlendingOut, "Blending Out" },
+};
+
+REFLECT_BEGIN(VCamBlendComponent)
+    REFLECT_FLOAT(blendInDuration,  "Blend-In Duration (s)",  0.f, 5.f)
+    REFLECT_FLOAT(blendOutDuration, "Blend-Out Duration (s)", 0.f, 5.f)
+    REFLECT_ENUM (curveIn,          "Curve In",  kBlendCurveOptions)
+    REFLECT_ENUM (curveOut,         "Curve Out", kBlendCurveOptions)
+    REFLECT_SLIDER(currentBlend,    "Current Blend",  0.f, 1.f)
+    REFLECT_ENUM (state,            "State", kBlendStateOptions)
+REFLECT_END()
+
+REFLECT_BEGIN(FollowCameraComponent)
+    // target is an AttachmentRef — picker UI is provided via the component
+    // editor's postDraw closure in EditorLayer::RegisterDefaultEditors.
+    REFLECT_FLOAT3(offset,          "Offset (target-local)",  -50.f, 50.f)
+    REFLECT_FLOAT3(lookAtOffset,    "LookAt Offset",          -50.f, 50.f)
+    REFLECT_FLOAT (damping,         "Position Damping",       0.f, 100.f)
+    REFLECT_FLOAT (rotationDamping, "Rotation Damping",       0.f, 100.f)
+    REFLECT_BOOL  (useLookAt,       "Use LookAt")
+REFLECT_END()
+
+REFLECT_BEGIN(AimCameraComponent)
+    // target is an AttachmentRef — picker UI is provided via the component
+    // editor's postDraw closure in EditorLayer::RegisterDefaultEditors.
+    REFLECT_FLOAT3(pivotOffset,    "Pivot Offset",    -50.f, 50.f)
+    REFLECT_SLIDER(yaw,            "Yaw (rad)",       -3.14159f, 3.14159f)
+    REFLECT_SLIDER(pitch,          "Pitch (rad)",     -1.5f, 1.5f)
+    REFLECT_FLOAT (distance,       "Distance",        0.f, 50.f)
+    REFLECT_FLOAT (pitchMin,       "Pitch Min",       -1.5f, 1.5f)
+    REFLECT_FLOAT (pitchMax,       "Pitch Max",       -1.5f, 1.5f)
+    REFLECT_BOOL  (collisionAvoid, "Wall-Collision Probe")
+    REFLECT_FLOAT (probeRadius,    "Probe Radius",    0.01f, 1.f)
+REFLECT_END()
+
+REFLECT_BEGIN(CameraShakeComponent)
+    REFLECT_SLIDER(trauma,        "Trauma",                  0.f, 1.f)
+    REFLECT_FLOAT (falloffPerSec, "Falloff /sec",            0.f, 10.f)
+    REFLECT_FLOAT3(posAmplitude,  "Position Amplitude",      0.f, 1.f)
+    REFLECT_FLOAT3(rotAmplitude,  "Rotation Amplitude (rad)", 0.f, 0.5f)
+    REFLECT_FLOAT (frequency,     "Frequency (Hz-ish)",      0.f, 60.f)
+REFLECT_END()
+
+REFLECT_BEGIN(LiveCameraComponent)
+    REFLECT_FLOAT3(position,     "Position",         -1e5f, 1e5f)
+    REFLECT_FLOAT4(rotation,     "Rotation (xyzw)",  -1.f, 1.f)
+    REFLECT_FLOAT3(forward,      "Forward",          -1.f, 1.f)
+    REFLECT_ANGLE (fov,          "FOV",              10.f, 170.f)
+    REFLECT_FLOAT (nearZ,        "Near Z",           0.001f, 10.f)
+    REFLECT_FLOAT (farZ,         "Far Z",            1.f, 10000.f)
+    REFLECT_UINT  (channelId,    "Channel Id",       0u, 0xFFFFFFFFu)
+    REFLECT_BOOL  (historyValid, "History Valid")
 REFLECT_END()
 
 // ===========================================================================
@@ -127,6 +326,135 @@ REFLECT_BEGIN(SkyboxComponent)
     REFLECT_STRING(skyboxPath,        "Skybox Path")
     REFLECT_UINT  (radianceMipLevels, "Radiance Mips", 1u, 16u)
     REFLECT_FLOAT (iblStrength,       "IBL Strength", 0.f, 8.f)
+REFLECT_END()
+
+// ===========================================================================
+// AtmosphereComponent — procedural sky / time-of-day / aerial / stars.
+// Source of truth; Renderer pushes these into SkyIBLPass each frame.
+// ===========================================================================
+
+constexpr Reflect::EnumOption kSkyboxSourceOptions[] = {
+    { (int)AtmosphereComponent::SkyboxSource::Atmosphere, "Atmosphere (procedural)" },
+    { (int)AtmosphereComponent::SkyboxSource::Static,     "Static Cubemap"          },
+};
+
+REFLECT_BEGIN(AtmosphereComponent)
+    REFLECT_BOOL  (atmosphereEnabled,      "Procedural Atmosphere")
+    REFLECT_ENUM  (skyboxSource,           "Skybox Source", kSkyboxSourceOptions)
+    REFLECT_HEADER("IBL")
+    REFLECT_SLIDER(iblStrength,            "IBL Intensity", 0.f, 3.f)
+    REFLECT_INFO  ("Master scale on indirect lighting (diffuse + specular). 0 = no IBL.")
+    REFLECT_HEADER("Aerial Perspective")
+    REFLECT_BOOL  (aerialCompositeEnabled, "Composite Aerial Perspective")
+    REFLECT_INFO  ("Distance fog. Depends on world-unit-to-km scale.")
+    REFLECT_HEADER("Stars")
+    REFLECT_SLIDER(starDensity,            "Star Density",     1.f,   2048.f)
+    REFLECT_SLIDER(starBrightness,         "Star Brightness",  0.f,   2.f)
+REFLECT_END()
+
+// ===========================================================================
+// TODConfigComponent — author-set Time-of-Day parameters (singleton).
+// ===========================================================================
+REFLECT_BEGIN(TODConfigComponent)
+    REFLECT_BOOL  (enabled,            "Enable Time-of-Day")
+    REFLECT_SLIDER(timeOfDay,          "Time (0=midnight, 0.5=noon)", 0.f, 1.f)
+    REFLECT_SLIDER(timeSpeed,          "Speed (day/sec)",             0.f, 0.5f)
+    REFLECT_SLIDER(latitudeRad,        "Latitude (rad)",             -1.55f, 1.55f)
+    REFLECT_SLIDER(sunBrightnessScale, "Sun Brightness",  0.f, 5.f)
+    REFLECT_SLIDER(moonIntensityScale, "Moon Intensity",  0.f, 1.f)
+REFLECT_END()
+
+// ===========================================================================
+// TODOutputComponent — computed each frame; shown read-only as diagnostics.
+// ===========================================================================
+REFLECT_BEGIN(TODOutputComponent)
+    REFLECT_INFO  ("Computed by TODEvaluationSystem. Read-only diagnostics.")
+    REFLECT_FLOAT3(activeDirection, "Active Light Dir", -1.f, 1.f)
+    REFLECT_COLOR3(activeColor,     "Active Light Color")
+    REFLECT_FLOAT3(sunDirection,    "Sun Dir (geom)",   -1.f, 1.f)
+    REFLECT_COLOR3(sunColor,        "Sun Color (geom)")
+    REFLECT_FLOAT3(moonDirection,   "Moon Dir",         -1.f, 1.f)
+    REFLECT_COLOR3(moonColor,       "Moon Disk Color")
+    REFLECT_BOOL  (isMoonActive,    "Moon Drives Lighting")
+    REFLECT_BOOL  (moonDiskVisible, "Moon Disk Visible")
+REFLECT_END()
+
+// ===========================================================================
+// SunLightTag / MoonLightTag — empty marker components. Attach to a
+// DirectionalLight entity to bring it under TOD control.
+// ===========================================================================
+REFLECT_BEGIN(SunLightTag)
+    REFLECT_INFO("TOD will drive this directional light as the SUN.")
+REFLECT_END()
+
+REFLECT_BEGIN(MoonLightTag)
+    REFLECT_INFO("TOD will drive this directional light as the MOON.")
+REFLECT_END()
+
+// ===========================================================================
+// CloudComponent — volumetric cloud authoring knobs (singleton).
+// Sun direction + colour come from TODOutputComponent at runtime.
+// ===========================================================================
+REFLECT_BEGIN(CloudComponent)
+    REFLECT_BOOL  (enabled,         "Enabled")
+    REFLECT_HEADER("Layer Altitude")
+    REFLECT_FLOAT (bottomAltitude,  "Bottom (m)", 0.f,   20000.f)
+    REFLECT_FLOAT (topAltitude,     "Top (m)",    0.f,   20000.f)
+    REFLECT_HEADER("Shape")
+    REFLECT_SLIDER(coverage,        "Coverage",   0.f,   1.f)
+    REFLECT_SLIDER(density,         "Density",    0.f,   4.f)
+    REFLECT_FLOAT_FMT(noiseScale,   "Noise Scale", 0.0001f, 0.01f, "%.5f", 0.0001f)
+    REFLECT_HEADER("Wind")
+    REFLECT_FLOAT3(windDirection,   "Wind Direction", -1.f, 1.f)
+    REFLECT_SLIDER(windSpeed,       "Wind Speed (m/s)", 0.f, 100.f)
+    REFLECT_HEADER("Lighting")
+    REFLECT_SLIDER(anisotropy,      "Anisotropy (HG g)", -0.99f, 0.99f)
+    REFLECT_SLIDER(extinction,      "Extinction",     0.f, 0.5f)
+    REFLECT_SLIDER(ambientStrength, "Ambient Fill",   0.f, 2.f)
+    REFLECT_COLOR3(cloudColor,      "Cloud Albedo")
+REFLECT_END()
+
+// ===========================================================================
+// VideoComponent — playback + surface params. Play / Pause / Stop / Restart
+// buttons + seek slider live in EditorLayer's postDraw because they need to
+// call Video::* helpers (decoupled from the descriptor).
+// ===========================================================================
+
+constexpr Reflect::EnumOption kVideoStateOptions[] = {
+    { (int)VideoPlaybackState::Stopped, "Stopped" },
+    { (int)VideoPlaybackState::Playing, "Playing" },
+    { (int)VideoPlaybackState::Paused,  "Paused"  },
+};
+
+constexpr Reflect::EnumOption kVideoCodecOptions[] = {
+    { (int)RHI::VideoCodec::H264, "H.264" },
+    { (int)RHI::VideoCodec::H265, "H.265" },
+};
+
+constexpr Reflect::EnumOption kVideoColorSpaceOptions[] = {
+    { 0, "BT.709 (HD)" },
+    { 1, "BT.601 (SD)" },
+};
+
+REFLECT_BEGIN(VideoComponent)
+    REFLECT_HEADER("Playback")
+    REFLECT_ENUM  (state,        "State",           kVideoStateOptions)
+    REFLECT_SLIDER(playRate,     "Speed",            0.0f, 4.0f)
+    REFLECT_BOOL  (loop,         "Loop")
+    REFLECT_HEADER("Surface")
+    REFLECT_BOOL  (worldSpace,   "World-Space Quad")
+    REFLECT_FLOAT (worldWidth,   "World Width (m)",  0.01f, 100.f)
+    REFLECT_FLOAT (worldHeight,  "World Height (m)", 0.01f, 100.f)
+    REFLECT_SLIDER(rectUMin,     "Screen U Min",     0.f, 1.f)
+    REFLECT_SLIDER(rectVMin,     "Screen V Min",     0.f, 1.f)
+    REFLECT_SLIDER(rectUMax,     "Screen U Max",     0.f, 1.f)
+    REFLECT_SLIDER(rectVMax,     "Screen V Max",     0.f, 1.f)
+    REFLECT_SLIDER(renderAlpha,  "Alpha",            0.f, 1.f)
+    REFLECT_ENUM  (colorSpace,   "Color Space",      kVideoColorSpaceOptions)
+    REFLECT_HEADER("Stream Config (only used by hand-rolled D3D12 decoder path)")
+    REFLECT_ENUM  (codec,        "Codec",            kVideoCodecOptions)
+    REFLECT_SLIDER_INT(width,    "Max Width",        16, 7680)
+    REFLECT_SLIDER_INT(height,   "Max Height",       16, 4320)
 REFLECT_END()
 
 // ===========================================================================
@@ -194,7 +522,7 @@ REFLECT_END()
 
 REFLECT_BEGIN(IndirectLightingSettingsComponent)
     REFLECT_BOOL  (ddgiEnabled,           "DDGI Enabled")
-    REFLECT_FLOAT (ddgiDiffuseScale,      "DDGI Diffuse Scale",   0.f, 4.f)
+    REFLECT_FLOAT (ddgiDiffuseScale,      "DDGI Diffuse Scale",   0.f, 8.f)
     REFLECT_FLOAT (skyIBLDiffuseScale,    "Sky IBL Diffuse Scale", 0.f, 4.f)
     // 0 = no AO on DDGI (trust probe visibility), 1 = full AO (legacy double-occlude),
     // ~0.4 = recommended. Sky-fallback path always gets full AO.
@@ -394,6 +722,47 @@ constexpr Reflect::EnumOption kRigidBodyMotionOptions[] = {
     { (int)RigidBodyComponent::Motion::Dynamic,   "Dynamic"   },
 };
 
+namespace Reflect_CustomWidgets
+{
+    inline bool DrawRigidBodyAxisLocks(void* fp, const Reflect::FieldDescriptor& f)
+    {
+        auto* bits = static_cast<uint8_t*>(fp);
+        bool changed = false;
+        ImGui::PushID(f.label);
+        ImGui::TextDisabled("Axis Lock (freezes velocity on the locked axis)");
+
+        auto toggle = [&](const char* lbl, uint8_t mask) {
+            bool v = (*bits & mask) != 0;
+            if (ImGui::Checkbox(lbl, &v)) {
+                if (v) *bits |= mask; else *bits &= ~mask;
+                changed = true;
+            }
+        };
+
+        ImGui::Text("Freeze Position:");
+        ImGui::SameLine();
+        toggle("X##pos",   RigidBodyComponent::LockTranslationX); ImGui::SameLine();
+        toggle("Y##pos",   RigidBodyComponent::LockTranslationY); ImGui::SameLine();
+        toggle("Z##pos",   RigidBodyComponent::LockTranslationZ);
+
+        ImGui::Text("Freeze Rotation:");
+        ImGui::SameLine();
+        toggle("X##rot",   RigidBodyComponent::LockRotationX); ImGui::SameLine();
+        toggle("Y##rot",   RigidBodyComponent::LockRotationY); ImGui::SameLine();
+        toggle("Z##rot",   RigidBodyComponent::LockRotationZ);
+
+        if (ImGui::SmallButton("None"))         { *bits = 0;                                                   changed = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Lock Rot"))     { *bits |= RigidBodyComponent::LockRotationAll;                changed = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Plane 2D (XY)")){ *bits  = RigidBodyComponent::LockTranslationZ
+                                                          | RigidBodyComponent::LockRotationX
+                                                          | RigidBodyComponent::LockRotationY;                 changed = true; }
+        ImGui::PopID();
+        return changed;
+    }
+}
+
 REFLECT_BEGIN(RigidBodyComponent)
     REFLECT_ENUM (motion,         "Motion",          kRigidBodyMotionOptions)
     REFLECT_IF([](const void* o) {
@@ -407,13 +776,158 @@ REFLECT_BEGIN(RigidBodyComponent)
     REFLECT_FLOAT_FMT(friction,       "Friction",        0.f,  2.f, "%.2f", 0.01f)
     REFLECT_FLOAT_FMT(restitution,    "Restitution",     0.f,  1.f, "%.2f", 0.01f)
     REFLECT_FLOAT_FMT(gravityFactor,  "Gravity Factor", -2.f,  5.f, "%.2f", 0.05f)
+    // Axis locks only have effect on Dynamic — hide on Static/Kinematic so
+    // users don't toggle inert checkboxes wondering why nothing happened.
+    REFLECT_IF([](const void* o) {
+        return static_cast<const RigidBodyComponent*>(o)->motion
+            == RigidBodyComponent::Motion::Dynamic;
+    })
+        REFLECT_CUSTOM(lockedAxes, "Constraints",
+                       &Reflect_CustomWidgets::DrawRigidBodyAxisLocks)
+    REFLECT_ENDIF()
 REFLECT_END()
 
 constexpr Reflect::EnumOption kColliderShapeOptions[] = {
     { (int)ColliderComponent::Shape::Box,     "Box"     },
     { (int)ColliderComponent::Shape::Sphere,  "Sphere"  },
     { (int)ColliderComponent::Shape::Capsule, "Capsule" },
+    { (int)ColliderComponent::Shape::Mesh,    "Mesh"    },
 };
+
+// CharacterControllerComponent — KCC tuning. Runtime state (velocity,
+// isGrounded, groundEntity, timeInAir, bodyId, generation) is intentionally
+// not exposed: it's overwritten every physics step, so editing it from the
+// Inspector would just flicker.
+REFLECT_BEGIN(CharacterControllerComponent)
+    REFLECT_FLOAT_FMT(capsuleRadius,     "Capsule Radius",      0.05f, 5.0f, "%.3f", 0.01f)
+    REFLECT_FLOAT_FMT(capsuleHalfHeight, "Capsule Half-Height", 0.05f, 5.0f, "%.3f", 0.01f)
+    REFLECT_FLOAT_FMT(stepHeight,        "Step Height",         0.0f,  2.0f, "%.3f", 0.01f)
+    REFLECT_ANGLE    (maxSlopeRad,       "Max Walkable Slope",  0.f,   80.f)
+    REFLECT_FLOAT_FMT(skinWidth,         "Skin Width",          0.0f,  0.1f, "%.4f", 0.001f)
+    REFLECT_FLOAT_FMT(mass,              "Mass (kg)",           1.0f,  500.f,"%.1f", 0.5f)
+    REFLECT_FLOAT_FMT(pushStrength,      "Push Strength",       0.0f,  4.0f, "%.2f", 0.05f)
+    REFLECT_FLOAT_FMT(gravity,           "Gameplay Gravity",    -80.f, 0.f,  "%.2f", 0.5f)
+    REFLECT_FLOAT_FMT(maxFallSpeed,      "Max Fall Speed",      1.0f,  200.f,"%.1f", 1.0f)
+    REFLECT_FLOAT_FMT(jumpSpeed,         "Jump Speed",          0.0f,  30.f, "%.2f", 0.1f)
+REFLECT_END()
+
+// PlayerComponent — high-level avatar tuning. cameraEntity is an
+// AttachmentRef — picker UI is in EditorLayer postDraw, not reflection.
+// jumpBufferTimer is runtime-only.
+REFLECT_BEGIN(PlayerComponent)
+    REFLECT_FLOAT_FMT(walkSpeed,      "Walk Speed",       0.0f, 50.f, "%.2f", 0.1f)
+    REFLECT_FLOAT_FMT(runSpeed,       "Run Speed",        0.0f, 50.f, "%.2f", 0.1f)
+    REFLECT_SLIDER   (airControl,     "Air Control",      0.0f,  1.0f)
+    REFLECT_FLOAT_FMT(turnRate,       "Turn Rate (rad/s)",0.0f, 40.f, "%.2f", 0.25f)
+    REFLECT_FLOAT_FMT(facingMinSpeed, "Facing Min Speed", 0.0f,  5.0f,"%.2f", 0.05f)
+    REFLECT_FLOAT_FMT(coyoteTime,     "Coyote Time (s)",  0.0f,  0.5f, "%.3f", 0.005f)
+    REFLECT_FLOAT_FMT(jumpBufferTime, "Jump Buffer (s)",  0.0f,  0.5f, "%.3f", 0.005f)
+REFLECT_END()
+
+REFLECT_BEGIN(FootIKComponent)
+    REFLECT_BOOL  (enabled,        "Enabled")
+    REFLECT_SLIDER(enableWeight,   "Weight",        0.0f, 1.0f)
+    REFLECT_FLOAT (rayUp,          "Ray Up",        0.0f, 5.0f)
+    REFLECT_FLOAT (rayDown,        "Ray Down",      0.0f, 5.0f)
+    REFLECT_FLOAT (footOffset,     "Foot Offset",  -1.0f, 1.0f)
+    REFLECT_BOOL  (alignToNormal,  "Align To Normal (Phase 2)")
+    REFLECT_BOOL  (pelvisDrop,     "Pelvis Drop (Phase 3)")
+    // Chain indices are runtime-resolved; show as int so authors can override
+    // when auto-detect picks the wrong pair on a non-standard rig. -1 = auto.
+    REFLECT_INT   (leftChainIdx,   "Left Chain Idx",  -1, 128)
+    REFLECT_INT   (rightChainIdx,  "Right Chain Idx", -1, 128)
+REFLECT_END()
+
+REFLECT_BEGIN(AIIntentComponent)
+    // Strategic-layer intent. BehaviorTreeSystem writes; AITacticalSystem
+    // translates into NavAgent.destination + facingMode. See
+    // DesignMd §2.3 for the full goal taxonomy.
+    REFLECT_INT   (currentGoal,   "Current Goal", 0, 7)   // enum AIGoal (Idle…UseObject)
+    REFLECT_FLOAT3(goalPosition,  "Goal Position", -1.0e6f, 1.0e6f)
+    REFLECT_FLOAT (goalPriority,  "Goal Priority", 0.0f, 100.0f)
+    REFLECT_FLOAT (goalStartTime, "Goal Start (debug)", 0.0f, 1.0e6f)
+REFLECT_END()
+
+REFLECT_BEGIN(NavAgentComponent)
+    // Tactical-layer intent + steering tunables. AITacticalSystem writes
+    // destination + facingMode, NavAgentSystem reads them and pushes
+    // desired velocity onto CharacterControllerComponent.
+    REFLECT_BOOL  (hasDestination, "Has Destination")
+    REFLECT_FLOAT3(destination,    "Destination", -1.0e6f, 1.0e6f)
+    REFLECT_BOOL  (useLookAt,      "Use Look-At")
+    REFLECT_FLOAT3(lookTarget,     "Look Target", -1.0e6f, 1.0e6f)
+    REFLECT_INT   (facingMode,     "Facing Mode (0=Move,1=Target,2=Manual)", 0, 2)
+    // Steering tunables.
+    REFLECT_FLOAT (speed,          "Speed",              0.0f,  100.0f)
+    REFLECT_FLOAT (arriveRadius,   "Arrive Radius",      0.01f,  10.0f)
+    REFLECT_FLOAT (slowdownRadius, "Slowdown Radius",    0.0f,   20.0f)
+    REFLECT_FLOAT (repathDistance, "Repath Distance",    0.0f,  100.0f)
+    REFLECT_BOOL  (rotateToFacing, "Rotate To Facing")
+    REFLECT_FLOAT (turnRate,       "Turn Rate (rad/s)",  0.0f,   50.0f)
+REFLECT_END()
+
+REFLECT_BEGIN(PerceptionComponent)
+    // Sensing tunables. PerceptionSystem (not yet implemented) will read
+    // these to drive visibility raycasts and sound aggregation.
+    REFLECT_FLOAT (sightRange,   "Sight Range",      0.0f, 200.0f)
+    REFLECT_FLOAT (sightConeDeg, "Sight Cone (deg)", 0.0f, 180.0f)
+    REFLECT_FLOAT (hearingRange, "Hearing Range",    0.0f, 100.0f)
+    REFLECT_FLOAT (audibleFor,   "Sound Memory (s)", 0.0f, 60.0f)
+REFLECT_END()
+
+namespace Reflect_CustomWidgets
+{
+    // Offset editor with a "Snap to Bottom" preset that pushes the shape so
+    // its lowest point touches the entity pivot (= floor for foot-pivoted
+    // characters). Per-shape Y formula:
+    //   Capsule: halfHeight + radius
+    //   Sphere : radius
+    //   Box    : halfExtents.y
+    //   Mesh   : 0 (mesh authoring decides its own pivot)
+    inline bool DrawColliderOffset(void* fp, const Reflect::FieldDescriptor& /*f*/)
+    {
+        auto* offset = static_cast<DirectX::XMFLOAT3*>(fp);
+        // Recover the owning ColliderComponent so the preset reads sibling
+        // fields and so we can render both Offset + Rotation in this single
+        // custom widget block (one widget per REFLECT_CUSTOM site).
+        auto* owner  = reinterpret_cast<ColliderComponent*>(
+            reinterpret_cast<std::uint8_t*>(offset) - offsetof(ColliderComponent, offset));
+        bool changed = false;
+        ImGui::PushID("ColliderOffset");
+        changed |= ImGui::DragFloat3("Offset", &offset->x, 0.01f, -1000.f, 1000.f, "%.3f");
+        if (ImGui::SmallButton("Snap to Bottom"))
+        {
+            float y = 0.f;
+            switch (owner->shape)
+            {
+                case ColliderComponent::Shape::Capsule: y = owner->halfHeight + owner->radius; break;
+                case ColliderComponent::Shape::Sphere:  y = owner->radius;                     break;
+                case ColliderComponent::Shape::Box:     y = owner->halfExtents.y;              break;
+                case ColliderComponent::Shape::Mesh:    y = 0.f;                               break;
+            }
+            offset->x = 0.f;
+            offset->y = y;
+            offset->z = 0.f;
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Offset")) { *offset = {0.f, 0.f, 0.f}; changed = true; }
+
+        changed |= ImGui::DragFloat3("Rotation (deg)", &owner->rotationEulerDeg.x,
+                                     0.5f, -360.f, 360.f, "%.2f");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Clear Rot")) { owner->rotationEulerDeg = {0.f, 0.f, 0.f}; changed = true; }
+        // Capsule-on-its-side preset — capsules are Y-axis primitives in
+        // Jolt, so 90° about Z lays it along X. Most-asked workflow.
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Lay X")) { owner->rotationEulerDeg = {0.f, 0.f, 90.f};  changed = true; }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Lay Z")) { owner->rotationEulerDeg = {90.f, 0.f, 0.f};  changed = true; }
+
+        ImGui::PopID();
+        return changed;
+    }
+}
 
 REFLECT_BEGIN(ColliderComponent)
     REFLECT_ENUM (shape, "Shape", kColliderShapeOptions)
@@ -436,6 +950,14 @@ REFLECT_BEGIN(ColliderComponent)
     })
         REFLECT_FLOAT(halfHeight, "Half-Height (excl. caps)", 0.001f, 1000.f)
     REFLECT_ENDIF()
+    REFLECT_IF([](const void* o) {
+        return static_cast<const ColliderComponent*>(o)->shape
+            == ColliderComponent::Shape::Mesh;
+    })
+        REFLECT_STRING(meshLibPath,   "Mesh Lib")
+        REFLECT_UINT  (meshLibMeshId, "Mesh ID", 0u, 65535u)
+    REFLECT_ENDIF()
+    REFLECT_CUSTOM(offset, "Offset", &Reflect_CustomWidgets::DrawColliderOffset)
 REFLECT_END()
 
 // ===========================================================================

@@ -9,6 +9,7 @@ cbuffer PushConstants : register(b0, space0)
     uint meshDescIdx;
     uint instanceOffset;
     uint materialIndex;
+    uint pickingFlag;   // non-zero → OR bit-31 into output so sub-pass 3 picks selection color
 };
 
 // Input comes from GBuffer.vs.hlsl (world position / uv not used here).
@@ -25,5 +26,7 @@ struct PSIn
 
 uint main(PSIn i) : SV_TARGET
 {
-    return meshDescIdx + 1u;
+    uint id = meshDescIdx + 1u;
+    if (pickingFlag != 0u) id |= 0x80000000u;
+    return id;
 }

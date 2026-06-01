@@ -152,8 +152,9 @@ public:
               uint32_t lightCount);
 
     // SRV GPU handle of the packed StructuredBuffer<VolumeGPUDesc> — bound by
-    // Lighting.ps + DDGI passes. Returns 0 before the first Tick().
-    uint64_t  GetVolumeBufferSrv() const { return m_volumeBufferSrv; }
+    // Lighting.ps + DDGI passes. Triple-buffered; returns the current frame's
+    // slot. Returns 0 before the first Tick().
+    uint64_t  GetVolumeBufferSrv(IGraphicsDevice& gfx) const;
 
     // Multi-volume descriptor-table base GPU handles. Each table holds
     // kMaxVolumes contiguous SRVs in slot-index order — Lighting.ps binds these
@@ -195,16 +196,16 @@ public:
     // (relocation CS write) within the same frame.
     const RHI::GPUBuffer* GetProbeDataBuffer(uint32_t slot) const;
 
-    // Per-volume CB GPU virtual address. The DDGI passes bind this directly via
-    // SetComputeRootCBV on the per-volume dispatch.
-    uint64_t  GetVolumeCBVGpuAddress(uint32_t slot) const;
+    // Per-volume CB GPU virtual address — current frame's ring slot. The DDGI
+    // passes bind this directly via SetComputeRootCBV on the per-volume dispatch.
+    uint64_t  GetVolumeCBVGpuAddress(IGraphicsDevice& gfx, uint32_t slot) const;
 
-    // Per-volume CB underlying GPUBuffer — used by DDGIPass to query the
-    // backend for the resource's GPU VA at bind time (the manager doesn't
-    // store the VA because the backend doesn't expose it on IGraphicsDevice;
-    // GraphicsDX12::GetBufferResource() resolves it for callers in the DX12
-    // layer).
-    const RHI::GPUBuffer* GetVolumeCB(uint32_t slot) const;
+    // Per-volume CB underlying GPUBuffer — current frame's ring slot. Used by
+    // DDGIPass to query the backend for the resource's GPU VA at bind time
+    // (the manager doesn't store the VA because the backend doesn't expose it
+    // on IGraphicsDevice; GraphicsDX12::GetBufferResource() resolves it for
+    // callers in the DX12 layer).
+    const RHI::GPUBuffer* GetVolumeCB(IGraphicsDevice& gfx, uint32_t slot) const;
 
     // Resource state — passes use this to push the right barrier when toggling
     // between UAV (relight / trace writes) and SRV (sampling read in Lighting).
@@ -232,6 +233,21 @@ public:
     void      PromoteAtlasesForGraphicsQueue(IGraphicsDevice& gfx,
                                              RHI::CommandList graphicsCmd);
 
+    // Symmetric inverse of PromoteAtlasesForGraphicsQueue. Demotes depth atlas
+    // (when in SRV state) + SH probe buffer + probeData buffer from the full
+    // PIXEL | NON_PIXEL shader-resource state back to NON_PIXEL_SHADER_RESOURCE
+    // only, so the next compute-queue DDGI Execute can transition them validly.
+    //
+    // Why this exists: a barrier on the COMPUTE queue with StateBefore = SR
+    // (PIXEL | NON_PIXEL = 0xC0) is rejected by the D3D12 debug layer because
+    // PIXEL_SHADER_RESOURCE (0x80) is invalid on compute. The demote must run
+    // on a GRAPHICS command list. Idempotent per-frame: gated by
+    // buffersInComputeOnlyState / atlasInComputeOnlyState flags.
+    //
+    // Called once per frame BEFORE the compute-queue DDGI CL.
+    void      DemoteForComputeQueue(IGraphicsDevice& gfx,
+                                    RHI::CommandList graphicsCmd);
+
     // Probe count helpers for sizing dispatches.
     uint32_t  GetProbeCount(uint32_t slot) const;
     uint32_t  GetRaysPerProbe(uint32_t slot) const;
@@ -242,6 +258,11 @@ public:
     uint32_t  GetActiveVolumeCount() const { return m_activeCount; }
 
 private:
+    // Frame-pipelining depth — matches GraphicsDX12::FrameCount. Used to ring
+    // all per-volume + engine-wide UPLOAD buffers so CPU writes for frame N+1
+    // don't trample the GPU's still-pending frame N read.
+    static constexpr uint32_t kFrameCount = 3;
+
     struct VolumeResources
     {
         bool          allocated = false;
@@ -253,6 +274,12 @@ private:
         // this frame). PromoteAtlasesForGraphicsQueue lifts it back to the
         // full PIXEL | NON_PIXEL state on the graphics queue.
         bool          atlasInComputeOnlyState = false;
+        // Mirrors atlasInComputeOnlyState for the SH probe buffer + probeData
+        // buffer. Separate flag because these buffers' state cycle is decoupled
+        // from the depth atlas's (TransitionVolumeAtlases only touches the
+        // atlas). Initialised to false because CreateBuffer leaves SR-bound
+        // DEFAULT buffers in the full SHADER_RESOURCE (NPSR|PSR) mask.
+        bool          buffersInComputeOnlyState = false;
 
         RHI::GPUBuffer probeSHBuffer;     // RWStructuredBuffer<DDGIProbeSH> — L1 SH per probe.
                                           // Replaces the old irradiance atlas.
@@ -267,7 +294,15 @@ private:
                                           // [1..] = packed (probeIdx | rayIdx<<20).
         RHI::GPUBuffer dispatchArgsBuffer;// 16 B — [0..2] = D3D12_DISPATCH_ARGUMENTS for the
                                           // trace's ExecuteIndirect. Toggles UAV↔INDIRECT_ARGUMENT.
-        RHI::GPUBuffer volumeCB;          // CB upload-mapped, mirrors VolumeGPUDesc subset
+
+        // Per-volume CB upload-mapped, mirrors VolumeGPUDesc subset.
+        // Triple-buffered ring: Tick() writes randomRotation + frameIndex every
+        // frame, and DDGIPass / DDGIProbeDebugPass read it from the GPU on the
+        // very same frame. A single UPLOAD CB would let frame N+1's CPU write
+        // race frame N's GPU read while the engine is pipelined 2 frames deep.
+        RHI::GPUBuffer volumeCB    [kFrameCount];
+        void*          cbvMapped   [kFrameCount] = {};
+        uint64_t       cbvGpuAddress[kFrameCount] = {};
 
         // Cached SRV/UAV handles for hot-path lookups.
         uint64_t       probeSHSrv         = 0;
@@ -282,10 +317,6 @@ private:
         uint64_t       rayCountUav        = 0;
         uint64_t       rayAllocUav        = 0;
         uint64_t       dispatchArgsUav    = 0;
-
-        // Persistently-mapped CBV pointer (UPLOAD heap).
-        void*          cbvMapped          = nullptr;
-        uint64_t       cbvGpuAddress      = 0;
     };
 
     void DestroyVolume(IGraphicsDevice& gfx, VolumeResources& res);
@@ -298,9 +329,11 @@ private:
 
     // Engine-wide volume descriptor buffer (kMaxVolumes entries). Updated each
     // frame in Tick(). UPLOAD-heap StructuredBuffer<VolumeGPUDesc>.
-    RHI::GPUBuffer  m_volumeBuffer;
-    void*           m_volumeBufferMapped = nullptr;
-    uint64_t        m_volumeBufferSrv    = 0;
+    // Triple-buffered so the CPU's frame N+1 write doesn't overlap the GPU's
+    // frame N read of the same physical buffer.
+    RHI::GPUBuffer  m_volumeBuffer[kFrameCount];
+    void*           m_volumeBufferMapped[kFrameCount] = {};
+    uint64_t        m_volumeBufferSrv   [kFrameCount] = {};
 
     // Per-resource-type contiguous descriptor blocks (kMaxVolumes slots each).
     // Allocated once at Init from the static GPU-visible region; the GPU

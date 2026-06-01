@@ -716,6 +716,12 @@ namespace RG
         // and a UAV descriptor to be allocated.
         bool           isUAV     = false;
         const wchar_t* debugName = nullptr;
+        // Set true when this texture is read as an SRV from OUTSIDE the graph
+        // (e.g. TAA / XeGTAO / SSR read GBuffer velocity via a direct
+        // GetTextureSRVGpuHandle, not a graph-declared read). Forces the
+        // physical resource to carry BindFlag::SHADER_RESOURCE + an SRV
+        // descriptor even though no in-graph pass declares the read.
+        bool           isSRV     = false;
     };
 } // namespace RG
 

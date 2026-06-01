@@ -26,7 +26,10 @@ cbuffer SSRCB : register(b0, space2)
     float4x4 viewProj;            // jittered — must match depth rasterization
     float4x4 invViewProj;         // jittered inverse
     float3   cameraPos;           float  nearZ;
-    uint     screenW;             uint   screenH;
+    // Phase 3: trace runs at HALF-RES. renderW/H is the full-res GBuffer dim
+    // (used for all GBuffer / pyramid math); traceW/H is the dispatch dim
+    // (used to bound DTid + index UAV writes).
+    uint     renderW;             uint   renderH;
     uint     hizMipCount;         float  maxRayLength;
     float    farZ;                float  roughnessCutoff;
     uint     frameIndex;          uint   _pad1;
@@ -49,9 +52,27 @@ cbuffer SSRCB : register(b0, space2)
     //                        which samples the reflecting plane's own color
     //                        and makes anything touching the plane invisible
     //                        in the reflection. UE-ish values: 0.002–0.01.
+    //   finishLinearSteps  — Phase 2 (Lumen-style): after the Hi-Z walker
+    //                        converges to mip 0 it stops at a CELL corner,
+    //                        not the actual hit pixel. Without a finish trace
+    //                        the converged xy lands on whichever neighbour
+    //                        pixel the cell happens to cover — often sky for
+    //                        mesh-vs-sky silhouettes, causing the historical
+    //                        "reflection shows sky next to objects" bug.
+    //                        This many pixel-steps of linear refinement walk
+    //                        the ray back along its direction one pixel at a
+    //                        time until ray.z crosses surface.z, landing on
+    //                        the real hit pixel. 16 is generous; UE uses ~8.
     float    traceThickness;      uint   hizMostDetailedLvl;
     float    coneMipMax;          float  depthBiasFactor;
+    uint     finishLinearSteps;   uint   traceW;
+    uint     traceH;              uint   _pad2;
 };
+
+// Phase 7: sub-pixel jitter table removed. Trace runs at full render res; the
+// dispatch grid IS the GBuffer pixel grid, no jittering needed. The traceW/H
+// CB fields stay equal to renderW/H so future re-introduction of half-res
+// doesn't require another shader edit.
 
 Texture2D<float4>   gNormal    : register(t0, space2);
 Texture2D<float4>   gSurface   : register(t1, space2);
@@ -128,7 +149,7 @@ float2 SampleHammersley(uint2 pixel, uint frame, uint regen)
     uint  sampleIdx = (frame * 15u + regen) & 63u;
     float2 Xi = Hammersley2D(sampleIdx, 64u);
 
-    uint h = WangHash((pixel.x + pixel.y * screenW) ^ (regen * 0x9E3779B9u));
+    uint h = WangHash((pixel.x + pixel.y * renderW) ^ (regen * 0x9E3779B9u));
     float2 offset = float2(h & 0xFFFFu, (h >> 16) & 0xFFFFu) * (1.0 / 65536.0);
     return frac(Xi + offset);
 }
@@ -272,6 +293,150 @@ float3 HierarchicalRaymarch(
 }
 
 // ----------------------------------------------------------------------------
+// Perspective-correct NDC z of the world ray at a given screen UV.
+//
+// The world ray P(s) = worldPos + s·L maps to clip(s) = startClip + s·dirClip
+// (linear in s). The screen UV at parameter s is:
+//   ndc(s).xy = clip(s).xy / clip(s).w
+//   uv(s)     = ndc(s).xy * (0.5, -0.5) + 0.5
+// Given a target uv, back-solve for s along whichever axis has the bigger
+// denominator (numerically stable), then evaluate ndc(s).z = clip(s).z /
+// clip(s).w. The linear `cur.z = startSS.z + t·rayDirSS.z` the Hi-Z + finish
+// walker uses underestimates this real z for reverse-Z perspective (NDC z is
+// convex in t under reverse-Z), so a linear cur.z crosses surface depth
+// EARLIER than the real ray would — the walker stops short and reports a
+// hit pixel closer to the start than truth. The further from the camera the
+// reflecting surface is, the larger this error grows, which is the visible
+// "reflection slides as camera pulls away" symptom.
+float EvalRayNdcZ(float2 uv, float4 sClip, float4 dClip)
+{
+    float ndcX = uv.x * 2.0 - 1.0;
+    float ndcY = 1.0 - uv.y * 2.0;
+    float denX = ndcX * dClip.w - dClip.x;
+    float denY = ndcY * dClip.w - dClip.y;
+    float s = (abs(denX) > abs(denY))
+              ? (sClip.x - ndcX * sClip.w) / denX
+              : (sClip.y - ndcY * sClip.w) / denY;
+
+    // The world ray P(s)=worldPos+s·L projects to a straight line on screen,
+    // but only the s>=0, clipW>0 portion corresponds to points IN FRONT of
+    // the camera. Past the vanishing point (asymptote on screen — happens
+    // when L has a strong forward component), back-solving uv to s gives
+    // s<0 / negative clipW which describes a phantom point BEHIND the
+    // camera. Plugging that into clipZ/clipW yields a negative or
+    // nonsensical depth that the walker would always accept as
+    // realZ<=sZ — producing a fake hit at the first past-asymptote pixel
+    // and clustering every floor reflection onto a single screen region.
+    // Sentinel >>1 so the walker treats these pixels as "ray doesn't
+    // reach here", continues, and eventually exits off-screen → falls back
+    // to the IBL probe via the trace's miss path.
+    float clipW = sClip.w + s * dClip.w;
+    if (s < 0.0 || clipW < 1e-3) return 1e9;
+
+    float clipZ = sClip.z + s * dClip.z;
+    return clipZ / clipW;
+}
+
+// ----------------------------------------------------------------------------
+// Hi-Z + perspective-correct linear finish trace.
+//
+// Hi-Z (HierarchicalRaymarch) skips empty tiles fast and converges near the
+// true crossing pixel. The depth pyramid it samples MUST be correct (mips
+// 1..N-1 have real max-depth values) — the per-mip CB race condition in
+// SSRDepthHierarchyPass was causing every reduce dispatch to read the LAST
+// iteration's dims and early-out, leaving every middle mip at 0. That made
+// `aboveSurface = 0 < cur.z` always true, so Hi-Z walked off-screen for many
+// rays. With that fixed, Hi-Z lands within ~1 cell of the true intersection
+// and this finish trace just refines via pixel-precise backward + forward
+// walks using perspective-correct realZ.
+bool LinearFinishTrace(float3 hzPosition, float3 origin, float3 direction,
+                       float4 sClip, float4 dClip,
+                       float2 screenDim, uint maxSteps,
+                       out float3 outHit, out float outSurfZ)
+{
+    float2 dirPxLen = abs(direction.xy) * screenDim;
+    float  pxLen    = max(max(dirPxLen.x, dirPxLen.y), 1e-6);
+    float  dt       = 1.0 / pxLen;       // 1 t-unit = 1 dominant-axis pixel
+    float3 step     = direction * dt;
+
+    float3 cur = hzPosition;
+    int2   ssize = int2(screenDim);
+
+    // 1. Back up while we're below the surface (real z ≤ surface z) or
+    //    hitting sky. Goal: cur lands strictly ABOVE a real surface so the
+    //    forward walk has a clean above→below crossing to find.
+    [loop]
+    for (uint b = 0; b < maxSteps / 2u; ++b)
+    {
+        int2  px    = clamp(int2(cur.xy * screenDim), int2(0, 0), ssize - 1);
+        float sZ    = gDepth.Load(int3(px, 0));
+        float realZ = EvalRayNdcZ(cur.xy, sClip, dClip);
+        if (sZ > 0.0 && realZ > sZ) { cur.z = realZ; break; }
+        cur -= step;
+        if (any(cur.xy < 0.0) || any(cur.xy > 1.0)) { cur += step; break; }
+    }
+
+    // 2. Walk forward 1 pixel at a time until the real (perspective-correct)
+    //    ray z crosses the surface. On crossing, LINEARLY INTERPOLATE between
+    //    the previous (above) and current (below) sample to recover the
+    //    sub-pixel hit UV — without this, adjacent reflective pixels whose
+    //    rays differ by < 1 pixel of step.xy snap to the same OR adjacent
+    //    integer hit pixels, producing visible staircase / pixel-jump
+    //    artifacts on slanted reflected surfaces (worst at high-contrast
+    //    edges like column silhouettes on the right side of the floor).
+    float3 prev    = cur;
+    float  prevRZ  = EvalRayNdcZ(cur.xy, sClip, dClip);
+    [loop]
+    for (uint f = 0; f < maxSteps; ++f)
+    {
+        if (any(cur.xy < 0.0) || any(cur.xy > 1.0)) break;
+        int2  px    = clamp(int2(cur.xy * screenDim), int2(0, 0), ssize - 1);
+        float sZ    = gDepth.Load(int3(px, 0));
+        float realZ = EvalRayNdcZ(cur.xy, sClip, dClip);
+        if (sZ > 0.0 && realZ <= sZ)
+        {
+            // Sub-pixel crossing: solve realZ(t) = sZ between prev and cur
+            // assuming sZ ≈ constant across the 1-pixel span and realZ is
+            // ≈ linear between adjacent walker steps.
+            //
+            // Range-check t (do NOT saturate). When the surface depth jumps
+            // discontinuously between prev and cur (typical at the silhouette
+            // of a foreground object floating above the receiving surface:
+            // prev's sZ = far-background, cur's sZ = near-foreground sphere),
+            // both prev.realZ and cur.realZ stay nearly equal across the one
+            // pixel step, so the algebraic "crossing point" with the assumed
+            // constant sZ lies OUTSIDE [prev, cur]. Saturating to [0,1] would
+            // pin the lerp to one endpoint and report a "hit" that's actually
+            // a fake intersection — the world ray missed the foreground in 3D
+            // and the screen-space "crossing" is purely the surface-depth
+            // discontinuity. Skip those and keep marching; the real ray
+            // either crosses the foreground further along OR exits screen.
+            float denom = prevRZ - realZ;
+            float t_raw = (abs(denom) > 1e-6) ? (prevRZ - sZ) / denom : 1.0;
+            if (t_raw >= -0.01 && t_raw <= 1.01)
+            {
+                float t   = saturate(t_raw);
+                outSurfZ  = sZ;
+                outHit.xy = lerp(prev.xy, cur.xy, t);
+                outHit.z  = lerp(prevRZ,  realZ,  t);
+                return true;
+            }
+            // Discontinuity false crossing: fall through to keep marching.
+        }
+        prev   = cur;
+        prevRZ = realZ;
+        cur   += step;
+    }
+
+    // Budget exhausted — fall back to the Hi-Z position with its own surface
+    // depth so the caller's ValidateHit can decide via thickness check.
+    int2 px = clamp(int2(hzPosition.xy * screenDim), int2(0, 0), ssize - 1);
+    outSurfZ = gDepth.Load(int3(px, 0));
+    outHit   = hzPosition;
+    return false;
+}
+
+// ----------------------------------------------------------------------------
 // Hit validation (Wicked's pattern: edge vignette × depth-thickness)
 // ----------------------------------------------------------------------------
 float CalculateEdgeVignette(float2 hitUV)
@@ -311,7 +476,7 @@ float ValidateHit(float3 hit, float surfaceDepthAtHit, float2 prevHitUV)
 float PickConeMip(float roughness, float rayLen, float hitLinZ)
 {
     float coneRadius  = roughness * roughness * rayLen;
-    float pixelRadius = coneRadius * float(screenH) * 0.5 / max(hitLinZ, 0.1);
+    float pixelRadius = coneRadius * float(renderH) * 0.5 / max(hitLinZ, 0.1);
     return clamp(log2(max(pixelRadius, 1.0)), 0.0, coneMipMax);
 }
 
@@ -321,9 +486,11 @@ float PickConeMip(float roughness, float rayLen, float hitLinZ)
 [numthreads(8, 8, 1)]
 void CSMain(uint3 DTid : SV_DispatchThreadID)
 {
-    if (DTid.x >= screenW || DTid.y >= screenH) return;
+    // Phase 7: full-res dispatch — one thread per GBuffer pixel.
+    if (DTid.x >= traceW || DTid.y >= traceH) return;
+
     const uint2  pixel = DTid.xy;
-    const float2 uv    = (float2(pixel) + 0.5) / float2(screenW, screenH);
+    const float2 uv    = (float2(pixel) + 0.5) / float2(renderW, renderH);
 
     // Write miss by default; early-returns below leave these values.
     OutHit[pixel]       = 0;
@@ -341,14 +508,31 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     float3 worldPos = ReconstructWorldPos(uv, depth);
     float3 V = normalize(cameraPos - worldPos);
 
-    // --- Ray regeneration loop (Wicked-style) -------------------------------
-    // Some GGX samples produce H vectors whose reflected L is below the
-    // surface (RdotN <= 0). Re-draw another low-discrepancy sample — cheap
-    // compared to tracing a wasted ray.
+    // --- Ray selection ------------------------------------------------------
+    // For near-mirror surfaces (roughness < kMirrorThreshold), use the
+    // DETERMINISTIC reflect(-V, N) direction. This eliminates the per-pixel
+    // stochastic noise of GGX importance sampling — critical when running
+    // without TAA, where the 0.85 EMA temporal accumulation that normally
+    // averages out the per-pixel sample variance isn't available. The GGX
+    // lobe at this roughness is so tight that a single mirror sample is
+    // visually indistinguishable from the converged stochastic result.
+    //
+    // For glossier-than-mirror but still smooth surfaces (kMirrorThreshold
+    // <= roughness <= roughnessCutoff), draw a stochastic GGX sample and
+    // re-roll if the reflected L lies below the surface (RdotN <= 0).
     float3 L;
     float  pdf;
     float  RdotN = 0.0;
-    const uint kMaxRegen = 15;
+    const float kMirrorThreshold = 0.05;
+    const uint  kMaxRegen        = 15;
+    if (roughness <= kMirrorThreshold)
+    {
+        L     = reflect(-V, N);
+        pdf   = 1.0;                                  // delta-function lobe
+        RdotN = dot(N, L);
+        if (RdotN <= 0.01) return;
+    }
+    else
     {
         float3x3 TBN = GetTangentBasis(N);
         [loop]
@@ -365,26 +549,39 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     }
 
     // --- Project ray into screen space --------------------------------------
-    // Ray origin uses the pixel's own (uv, depth) DIRECTLY — no round-trip
-    // through invViewProj × viewProj. Matrix-inverse rounding offsets the
-    // startSS by ~1 texel; that offset makes Hi-Z's first surfaceZ fetch
-    // disagree with position.z, `aboveSurface` flips, and the ray either
-    // self-stops or tunnels the floor.
+    // BOTH endpoints come out of the SAME viewProj * perspective-divide
+    // pipeline so `rayDirSS = endSS - startSS` is purely the projected
+    // displacement of (worldPos+L) − worldPos in NDC, with no leftover
+    // invVP→VP round-trip residue. The previous version used
+    // `startSS = (pixel_uv, gbuffer_depth)` directly, paired with an endSS
+    // built from `mul(worldPos+L, viewProj)`. For close-to-camera surfaces
+    // the ~FP-precision difference between (pixel_uv, depth) and
+    // (startClip.xy/w, startClip.z/w) is sub-texel and harmless; for far
+    // surfaces it becomes a measurable screen-space offset that biases the
+    // Hi-Z walker into stopping at the wrong pixel (manifested as the
+    // reflection sliding toward the camera-side of the screen as the
+    // viewer pulled away from a reflective plane).
     //
-    // Depth bias: push the start depth toward the camera in LINEAR space by
-    // a small fraction of the pixel's linear depth. Without this the ray
-    // origin sits exactly on the surface — the first Hi-Z cell's max-depth
-    // (nearest of the 4 neighbours at mip 1) is >= origin.z, `aboveSurface`
-    // never flips true, the walker descends mips and immediately reports
-    // "hit at origin". The reflection then samples this plane's own colour,
-    // so objects sitting on the plane vanish in the reflection and the
-    // plane's diffuse tint leaks into every hit colour.
-    //
-    // UE biases by a fraction of the GBuffer depth (scale-independent); 0.5%
-    // is a reasonable middle ground between "still self-hits" and "reflection
-    // visibly floats above caster". Tune via SSRPass::SetTraceParams.
-    float3 startSS = float3(uv, depth);
+    // Endpoint: project (worldPos + L) with unit-length L to recover the
+    // ray's natural screen-space direction. When the endpoint falls BEHIND
+    // the near plane (endClip.w <= 0, typical at tilted / top-down views
+    // where the reflected L points up-and-back toward the camera), clip
+    // the ray IN CLIP SPACE so the endpoint lands just in front of the
+    // near plane. Clip-space lerp is legitimate because mul(worldPos+t*L,
+    // viewProj) is linear in t, so we can solve for t such that w = small
+    // epsilon directly on the already-computed clip-space points.
+    float4 startClip = mul(float4(worldPos,     1.0), viewProj);
+    float4 endClip   = mul(float4(worldPos + L, 1.0), viewProj);
+    if (startClip.w <= 1e-3) return;          // origin behind near plane: bail
+
+    // Build startSS from the SAME projection that produced endSS — keeps
+    // the two endpoints in a single consistent NDC→UV space.
+    float3 startSS;
     {
+        float3 startNDC = startClip.xyz / startClip.w;
+        startSS.xy      = startNDC.xy * float2(0.5, -0.5) + 0.5;
+        startSS.z       = startNDC.z;
+
         // Depth bias: push the start toward the camera in linear space by
         // max(fractional, absolute) units. The absolute floor matters for
         // close-to-camera surfaces where a pure percentage bias (0.5% of
@@ -392,40 +589,17 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
         // depth spread — the walker's first aboveSurface test stays false
         // and the ray self-hits at iter 0 before moving. 2 cm absolute
         // floor is safe at typical scene scales.
-        float linZ         = LinearizeReverseZ(depth);
-        float biasAbs      = max(linZ * depthBiasFactor, 0.02);
-        float linZBiased   = max(linZ - biasAbs, nearZ);
-        startSS.z          = saturate(InverseLinearDepth(linZBiased));
+        float linZ       = LinearizeReverseZ(startSS.z);
+        float biasAbs    = max(linZ * depthBiasFactor, 0.02);
+        float linZBiased = max(linZ - biasAbs, nearZ);
+        startSS.z        = saturate(InverseLinearDepth(linZBiased));
     }
-
-    // Endpoint: project (worldPos + L) with unit-length L to recover the
-    // ray's natural screen-space direction. When the endpoint falls BEHIND
-    // the near plane (endClip.w <= 0, typical at tilted / top-down views
-    // where the reflected L points up-and-back toward the camera), clip
-    // the ray IN CLIP SPACE so the endpoint lands just in front of the
-    // near plane.
-    //
-    // The previous fallback ("force endSS.z = 0 = reverse-Z far plane")
-    // produced a rayDirSS.z FAR longer than the true ray slope — Hi-Z
-    // walked through every depth layer in one iteration and reported
-    // phantom hits deep in sky. That was the visible "only works at
-    // horizontal views" symptom: tilt the camera down to look at a
-    // reflective platform, endClip.w went negative, the fallback fired,
-    // and reflections broke for every pixel whose L reached behind-camera
-    // space.
-    //
-    // Clip-space lerp is legitimate because mul(worldPos + t*L, viewProj)
-    // is linear in t, so we can solve for t such that w = small epsilon
-    // directly on the already-computed clip-space points.
-    float4 startClip = mul(float4(worldPos,     1.0), viewProj);
-    float4 endClip   = mul(float4(worldPos + L, 1.0), viewProj);
 
     const float kClipW = 1e-3;
     if (endClip.w <= kClipW)
     {
-        // Visible-surface start point must sit in front of the near plane;
-        // if it doesn't, GBuffer depth is bogus — bail.
-        if (startClip.w <= kClipW) return;
+        // Endpoint behind near plane — clip in clip space so endClip lands
+        // just in front. startClip.w > kClipW already guaranteed above.
         float denom = endClip.w - startClip.w;              // < 0 here
         float t     = saturate((kClipW - startClip.w) / denom);
         endClip     = lerp(startClip, endClip, t);
@@ -461,64 +635,69 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     // --- Hi-Z traversal -----------------------------------------------------
     bool  validHit = false;
     float3 hit = HierarchicalRaymarch(startSS, rayDirSS,
-                                      float2(screenW, screenH), validHit);
+                                      float2(renderW, renderH), validHit);
     if (!validHit) return;
 
-    // --- Hi-Z silhouette recovery + minimal validation ---------------------
-    // Hi-Z walks per-CELL. At a mesh-vs-sky silhouette the coarser-mip
-    // cell's max-depth equals the MESH's depth, so position.z stops near
-    // mesh depth. But when it descends to mip 0 the xy can land on any
-    // pixel within the cell — frequently a SKY pixel adjacent to the
-    // actual mesh pixel. Reading depth at the sky pixel gives 0, the
-    // gap with hit.z explodes to (farZ-nearZ), and ValidateHit rejected
-    // every mesh hit no matter how high traceThickness was set.
-    //
-    // 3×3 snap: search neighbours, pick the one whose linear depth best
-    // matches the ray's stopping depth. The actual mesh pixel will be
-    // there (Hi-Z's xy error is < 1 cell at mip 0). hit.xy is updated
-    // so downstream colour sampling reads the correct (mesh, not sky)
-    // pixel.
-    int2 hitPxInt = clamp(int2(hit.xy * float2(screenW, screenH)),
-                          int2(0, 0), int2((int)screenW - 1, (int)screenH - 1));
-    float  surfaceDepthAtHit = gDepth.Load(int3(hitPxInt, 0));
-    float  linRayDepth       = LinearizeReverseZ(hit.z);
-    float  linHit0           = (surfaceDepthAtHit > 0.0)
-                               ? LinearizeReverseZ(surfaceDepthAtHit)
-                               : farZ;
-    float  bestDepthDiff     = abs(linRayDepth - linHit0);
-    int2   bestPxInt         = hitPxInt;
+    // --- Phase 2: pixel-precision finish trace -----------------------------
+    // Hi-Z stops at a cell boundary, not the actual hit pixel. Walk along the
+    // ray one pixel at a time until ray.z crosses the GBuffer depth at that
+    // pixel. After this, `hit.xy` is the real hit pixel center and
+    // `surfaceDepthAtHit` is the GBuffer depth at that pixel — both correct
+    // even at mesh-vs-sky silhouettes (the old 3x3 snap heuristic that lived
+    // here was a wrong fix for a missing finish-trace).
+    // Finish trace returns true when it lands on a real (non-sky) mesh
+    // pixel. In that case we accept with full confidence (modulo edge
+    // vignette) because the snap is sub-pixel-precise. On budget exhaust
+    // (false) we fall back to ValidateHit's thickness check as a safety net.
+    // Clip-space ray direction for perspective-correct depth evaluation in
+    // LinearFinishTrace. dirClip is the clip-space displacement for ONE world
+    // unit of L (matches the unscaled endClip - startClip relationship). The
+    // walker's screen-space step is still linear in cur.xy, but cur.z is
+    // re-evaluated per-pixel via EvalRayNdcZ to avoid the reverse-Z
+    // perspective non-linearity that biased the old linear cur.z toward
+    // premature crossing on long rays.
+    float4 dirClip = mul(float4(L, 0.0), viewProj);
+    float  surfaceDepthAtHit;
+    bool   finishOk = LinearFinishTrace(hit, startSS, rayDirSS,
+                                        startClip, dirClip,
+                                        float2(renderW, renderH),
+                                        max(finishLinearSteps, 1u),
+                                        hit, surfaceDepthAtHit);
 
-    [loop] for (int dy = -1; dy <= 1; ++dy)
+    // Sky pixel at the refined hit = legitimate miss. Reject so we don't
+    // emit sky-cubemap colour as a "reflection" — probe fallback handles
+    // off-screen-sky reflections via the IBL chain anyway.
+    if (surfaceDepthAtHit <= 0.0) return;
+
+    // Always apply ValidateHit. The lerp inside LinearFinishTrace makes
+    // hit.z = surfaceDepthAtHit ALGEBRAICALLY when the crossing is a clean
+    // within-pixel intersection (t naturally in [0,1]) — thickness check
+    // trivially passes (≈ 0 difference). When the "crossing" is a depth
+    // discontinuity (silhouette of a floating object: prev's sZ is the
+    // far-background, cur's sZ is the near-foreground), the lerp t saturates
+    // and hit.z falls back to the raw ray Z at the trigger pixel, which
+    // differs from surfaceDepthAtHit by the geometric ray-vs-surface gap in
+    // eye-space — exactly what thickness should reject. Without this, every
+    // floor pixel that walks past a floating object's screen-space silhouette
+    // accepts that silhouette as a hit, producing the "tube smear under
+    // floating sphere" artifact.
+    float confidence = ValidateHit(hit, surfaceDepthAtHit, startSS.xy);
+
+    // Silhouette / backface guard. ValidateHit catches discontinuities only
+    // when the eye-space gap exceeds traceThickness. For objects floating
+    // just barely above the receiving surface, that gap can shrink below the
+    // threshold while still being a fake hit. Normal at the hit pixel pins
+    // it down: real reflections land on a face whose outward normal opposes
+    // L (i.e. N·(-L) > 0); at a silhouette the visible normal is ~⊥ to V
+    // and typically ~⊥ to L too, so N·(-L) ≈ 0. Reject sub-grazing.
     {
-        [loop] for (int dx = -1; dx <= 1; ++dx)
-        {
-            int2 p = clamp(hitPxInt + int2(dx, dy),
-                           int2(0, 0), int2((int)screenW - 1, (int)screenH - 1));
-            float d = gDepth.Load(int3(p, 0));
-            if (d > 0.0)
-            {
-                float linD = LinearizeReverseZ(d);
-                float diff = abs(linRayDepth - linD);
-                if (diff < bestDepthDiff)
-                {
-                    bestDepthDiff     = diff;
-                    bestPxInt         = p;
-                    surfaceDepthAtHit = d;
-                }
-            }
-        }
+        int2 hitPxFull = clamp(int2(hit.xy * float2(renderW, renderH)),
+                               int2(0, 0), int2(renderW - 1, renderH - 1));
+        float3 hitN  = normalize(gNormal.Load(int3(hitPxFull, 0)).rgb * 2.0 - 1.0);
+        float  front = dot(hitN, -L);
+        confidence  *= smoothstep(0.05, 0.20, front);
     }
-    hit.xy = (float2(bestPxInt) + 0.5) / float2(screenW, screenH);
-
-    // No depth-thickness gate — every walker hit (whether on mesh or pure
-    // sky) gets emitted with full confidence. The previous gate based on
-    // bestDepthDiff > traceThickness was killing every mesh hit where the
-    // 3×3 snap couldn't find a mesh neighbour (Hi-Z xy error > 1 pixel),
-    // and those rays then showed up as IBL fallback (sky cubemap colour),
-    // making SSR look "always the same colour" no matter how high the
-    // intensity slider went. Now SSR always contributes; composite still
-    // dampens via Fresnel × envBRDF so over-shoot stays bounded.
-    float confidence = 1.0;
+    if (confidence <= 0.0) return;
 
     // Self-intersection reject — Hi-Z occasionally bottoms out on the
     // origin's own cell. Keep this; without it self-hits draw the floor's
@@ -530,25 +709,28 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     float  minRayLen = max(startLinZ * 0.005, 0.01);
     if (rayLen < minRayLen) return;
 
-    // Cone-footprint mip from the pre-filtered scene-color pyramid.
-    // For mirror / near-mirror surfaces (mipLvl < 0.5) we point-load mip 0
-    // at the snap-corrected pixel — bilinear at mip 0 would still bleed
-    // sky across silhouette edges. For rougher reflections the pyramid's
-    // higher mips have already smoothed silhouettes via Karis-firefly
-    // reduce, so SampleLevel at the requested mip is safe and gives
-    // pre-integrated radiance (variance reduction).
-    float  mipLvl = PickConeMip(roughness, rayLen, hitLinZ);
-    float3 hitColor;
-    if (mipLvl < 0.5)
-    {
-        hitColor = gHdrPyramid.Load(int3(bestPxInt, 0)).rgb;
-    }
-    else
-    {
-        float2 sampleUV = (float2(bestPxInt) + 0.5) /
-                          float2(screenW, screenH);
-        hitColor = gHdrPyramid.SampleLevel(gLinClamp, sampleUV, mipLvl).rgb;
-    }
+    // Cone-footprint mip from the pre-filtered scene-color pyramid. Sample
+    // via SampleLevel using the SUB-PIXEL hit.xy from LinearFinishTrace's
+    // linear-interpolated crossing point — bilinear interp is the partner
+    // of the sub-pixel walker output and prevents 1-pixel stair-step jumps.
+    //
+    // For mirror-ish surfaces (roughness < 0.1) sample mip 1 exactly. The
+    // cone formula yields fractional ~0.43 which SampleLevel turns into a
+    // trilinear blend whose ratio changes pixel-to-pixel with rayLen — that
+    // produced visible horizontal banding on the right-side columns. Mip 0
+    // alone is sharp but exposes the Sponza columns' / banners' sub-pixel
+    // vertical detail (fluting / fabric weave) directly: adjacent floor
+    // pixels' hits land on light vs dark stripes of the source, and TAA
+    // jitter then makes those stripes oscillate frame-to-frame ("TAA
+    // flicker on the vertical lines"). Mip 1 is the Karis-firefly-weighted
+    // 2×2 average of mip 0 — pre-filters that high-frequency content
+    // away with only minor sharpness loss, and being an integer mip there's
+    // no trilinear-ratio variation either. The resolve's 5×5 mirror blur
+    // handles any remaining walker-step pattern.
+    float  mipLvl   = (roughness < 0.1)
+                      ? 1.0
+                      : PickConeMip(roughness, rayLen, hitLinZ);
+    float3 hitColor = gHdrPyramid.SampleLevel(gLinClamp, hit.xy, mipLvl).rgb;
 
     OutHit[pixel]       = float4(hitColor, confidence);
     OutRayDirPDF[pixel] = float4(L, pdf);

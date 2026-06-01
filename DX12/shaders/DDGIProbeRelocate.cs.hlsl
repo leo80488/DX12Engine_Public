@@ -1,27 +1,47 @@
-// DDGIProbeRelocate.cs.hlsl — push probes out of nearby surfaces.
+// DDGIProbeRelocate.cs.hlsl — push probes out of nearby surfaces + classify
+// probes that are buried in solid geometry as INACTIVE.
 //
-// Each probe runs `raysPerProbe` rays (in the trace CS). If many of those
-// rays hit at very short distance, the probe is either inside a wall or
-// pressed against one — the resulting bounce data has wildly wrong
-// magnitude (close-range bounces look like point lights), which feeds back
-// through DDGI multi-bounce and produces "blown-out" indirect lighting.
+// Two cooperating mechanisms in one CS, both reading the per-probe ray buffer:
 //
-// Algorithm (matches WickedEngine ddgi_updateCS_depth.hlsl probe-offset path):
-//   1. Per probe, scan all this-frame rays.
-//   2. For each ray with depth < keepDistance, accumulate
-//      `-rayDir * (keepDistance - depth)` into the offset target.
-//   3. EMA-blend the per-probe ProbeData.offset toward this target (slow
-//      blend = 5%/frame) so probe positions don't jitter on noisy hits.
-//   4. Clamp the offset to ±0.45 × cellSize to keep the probe inside its
-//      authored cell (preserves the tri-linear blend math at sample time).
+//   (A) Frontface close-hit push (the original WickedEngine ddgi_updateCS
+//       probe-offset path):
+//         1. Per probe, scan all this-frame rays.
+//         2. For each ray with depth > 0 and depth < keepDistance, accumulate
+//            `-rayDir * (keepDistance - depth)` into a frontface push target.
+//         3. EMA-blend the per-probe ProbeData.offset toward this target so
+//            probe positions don't jitter on noisy hits.
+//         4. Clamp the offset to ±0.45 × cellSize to keep the probe inside
+//            its authored cell (preserves the tri-linear blend math at sample
+//            time).
 //
-// Sampling already reads `probePos + pd.offset` in DDGISampling.hlsli, so
-// the shader-side change is only this CS — Lighting.ps and the trace's
-// multi-bounce path pick up the new positions automatically next frame.
+//   (B) Backface-ratio probe classification + escape push (this engine's
+//       indoor↔outdoor light-leak fix, 2026-05):
+//         Trace shader writes hitDistance < -1.5 when its closest hit is on a
+//         BACKFACE — meaning the probe sits on the SOLID side of that surface
+//         along that ray direction.
+//         - If > 25% of the probe's rays hit backfaces, the probe is largely
+//           buried; flag it INACTIVE (sampler skips inactive probes and the
+//           trilinear weight redistributes to neighbours).
+//         - Even before INACTIVE kicks in, push the probe OPPOSITE the mean
+//           backface ray direction — pulls partially-buried probes toward
+//           whichever side is open. This is a different signal from (A): (A)
+//           pushes from NEAR FRONTFACES, (B) pulls TOWARD OPEN SPACE based on
+//           which directions don't see solid material.
+//         Hysteresis: > 25% backface flags INACTIVE, < 10% reactivates. Dead
+//         band in between keeps the state from flickering on noise.
+//
+// Hit-distance encoding (set in DDGIRayTrace.cs):
+//   depth > 0       — frontface hit at this distance
+//   depth == -1.0   — miss (no hit, sky)
+//   depth < -1.5    — backface hit, real t = -(depth + 2.0)
+//
+// Sampling already reads `probePos + pd.offset` and skips state==INACTIVE in
+// DDGISampling.hlsli, so the shader-side change is only this CS — Lighting.ps
+// and the trace's multi-bounce path pick up the new positions/states next frame.
 //
 // Bindings:
 //   b0 space0 — DDGIVolumeGPU CB
-//   u0 space0 — RWStructuredBuffer<DDGIProbeData> (write back offset)
+//   u0 space0 — RWStructuredBuffer<DDGIProbeData> (write back offset + state)
 //   t2 space0 — StructuredBuffer<float4> ray data (read depth from .w)
 //   u2 space0 — RWStructuredBuffer<uint>  ray count (per-probe adaptive)
 
@@ -39,14 +59,23 @@ void main(uint3 DTid : SV_DispatchThreadID)
     const uint probeCount = g_Vol.probeCountsX * g_Vol.probeCountsY * g_Vol.probeCountsZ;
     if (probeIdx >= probeCount) return;
 
-    // Bit 1 of flags = enableRelocation (mirror of DDGIVolumeComponent toggle).
-    if ((g_Vol.flags & 2u) == 0u) return;
+    // Flag bits (mirror of DDGIVolumeComponent toggles via DDGIVolumeManager):
+    //   bit 1 — enableRelocation
+    //   bit 2 — enableClassification
+    const bool doRelocate = (g_Vol.flags & 2u) != 0u;
+    const bool doClassify = (g_Vol.flags & 4u) != 0u;
+    if (!doRelocate && !doClassify) return;
 
     // Adaptive ray prefix; direction reconstruction uses Halton(2,3) which
     // is index-stable independent of count (matches trace + relight). Ray
     // data buffer stride is the volume's MAX raysPerProbe.
     const uint adaptiveRays = g_RayCount[probeIdx] * DDGI_RAY_BUCKET_COUNT;
     const uint rayBase      = probeIdx * g_Vol.raysPerProbe;
+    if (adaptiveRays == 0u)
+    {
+        // No rays this frame — nothing to learn; leave probe state intact.
+        return;
+    }
 
     // Probes should keep at least this distance from any surface. Scaled by
     // the smallest cell dimension so the threshold tracks the volume's
@@ -55,14 +84,15 @@ void main(uint3 DTid : SV_DispatchThreadID)
                                    min(g_Vol.probeSpacing.y, g_Vol.probeSpacing.z));
     const float keepDistance = minCell * 0.25;
 
-    // Accumulate "push-away" pressure from every too-close hit.
-    float3 offsetAccum = float3(0, 0, 0);
-    uint   closeHits   = 0;
+    // Per-probe ray-scan totals.
+    float3 offsetAccum     = float3(0, 0, 0);  // (A) close-frontface push
+    uint   closeHits       = 0;
+    float3 backfaceDirAcc  = float3(0, 0, 0);  // (B) mean backface direction
+    uint   backfaceHits    = 0;
 
     [loop] for (uint r = 0; r < adaptiveRays; ++r)
     {
         const float depth = g_RayData[rayBase + r].w;
-        if (depth <= 0.0 || depth >= keepDistance) continue;
 
         // Reconstruct the world-space ray direction. Must mirror the trace +
         // relight reconstruction exactly (same adaptive sample index + random
@@ -71,45 +101,90 @@ void main(uint3 DTid : SV_DispatchThreadID)
         const float3 dirLocal = DDGI_HaltonSphere(sampleIdx);
         const float3 rayDir   = DDGI_ApplyRandomRotation(dirLocal, g_Vol);
 
-        // Push the probe AWAY from the hit (-rayDir), proportional to how
-        // close it was. A ray hitting at depth=0 contributes a full
-        // keepDistance push.
+        // Backface hit — probe is on the solid side along this direction.
+        // Don't add to the close-hit push (the actual t may be larger than
+        // keepDistance, but the geometry is still "wrapping" the probe).
+        if (depth < -1.5)
+        {
+            backfaceHits++;
+            backfaceDirAcc += rayDir;
+            continue;
+        }
+
+        // Miss or far frontface — no relocation pressure either way.
+        if (depth <= 0.0 || depth >= keepDistance) continue;
+
+        // Close frontface hit — push AWAY from it, proportional to how close.
         offsetAccum -= rayDir * (keepDistance - depth);
         closeHits++;
     }
 
     DDGIProbeData pd = g_ProbeData[probeIdx];
 
-    // No close hits this frame → the current offset is already good (probe
-    // is comfortably inside open space). Hold it in place. Resetting to zero
-    // here would tug the probe back toward the grid every "lucky" frame and
-    // produce visible jitter on probes that sit near walls but not inside
-    // them, oscillating between "many close hits → push outward" and "no
-    // close hits → snap back to origin".
-    if (closeHits == 0u)
+    // ---- Classification (B-1) ---------------------------------------------
+    // Hysteresis band: > 25% backface marks INACTIVE; < 10% reactivates. The
+    // 15 pp dead-band swallows per-frame noise so partially-buried probes
+    // sitting near the threshold don't flicker state.
+    if (doClassify)
     {
-        // Still write to keep state field intact for callers that read it.
-        g_ProbeData[probeIdx] = pd;
-        return;
+        if (backfaceHits * 4u > adaptiveRays)
+            pd.state = DDGI_PROBE_STATE_INACTIVE;
+        else if (backfaceHits * 10u < adaptiveRays)
+            pd.state = DDGI_PROBE_STATE_ACTIVE;
+        // else: dead-band — keep current state.
     }
 
-    // AVERAGE the per-ray push (the previous code accumulated unscaled, so
-    // the target magnitude scaled with hit count and saturated the clamp
-    // immediately on probes that had many close hits). With averaging the
-    // target stays in [0, keepDistance] regardless of how many rays hit.
-    const float3 targetOffset = offsetAccum / float(closeHits);
+    // ---- Relocation (A + B-2) ---------------------------------------------
+    if (doRelocate)
+    {
+        const bool anySignal = (closeHits > 0u) || (backfaceHits > 0u);
+        if (!anySignal)
+        {
+            // Probe sits in open space with nothing near it — hold the current
+            // offset (zeroing here would tug it back to the grid every "lucky"
+            // frame and produce visible jitter on probes that sit near walls
+            // but not inside them, oscillating between "many close hits" and
+            // "no close hits" frames).
+            g_ProbeData[probeIdx] = pd;
+            return;
+        }
 
-    // Slow EMA blend; reduced from 0.05 to 0.02 because per-frame target
-    // jitter (different rays each frame after random-rotation damping)
-    // remained noticeable at 0.05 once probes settled near a wall. 0.02
-    // gives ~50-frame settle time which is invisible at 60 fps.
-    float3 newOffset = lerp(pd.offset, targetOffset, 0.02);
+        float3 targetOffset = float3(0, 0, 0);
 
-    // Clamp to the authored cell — going further would put the probe inside
-    // a neighbouring cell and break the trilinear blend at sample time.
-    const float3 limit = g_Vol.probeSpacing * 0.45;
-    newOffset = clamp(newOffset, -limit, limit);
+        // (A) Average the per-ray frontface push so target magnitude stays in
+        // [0, keepDistance] regardless of how many rays hit (the pre-fix code
+        // accumulated unscaled and saturated the ±0.45-cell clamp on probes
+        // with many close hits).
+        if (closeHits > 0u)
+            targetOffset += offsetAccum / float(closeHits);
 
-    pd.offset = newOffset;
+        // (B-2) Backface escape push — opposite of the MEAN backface ray
+        // direction. A probe buried in a wall has rays from many directions
+        // hitting backfaces; their mean roughly points toward whichever side
+        // of the geometry is closest to "open." Pushing OPPOSITE pulls the
+        // probe through the wall toward the open side. Magnitude scaled by
+        // backface fraction (× 2 because the cell clamp will catch overshoot
+        // and we'd rather fully escape than under-shoot).
+        if (backfaceHits > 0u)
+        {
+            const float3 meanBack = backfaceDirAcc / float(backfaceHits);
+            const float  bfFrac   = float(backfaceHits) / float(adaptiveRays);
+            targetOffset += -meanBack * keepDistance * bfFrac * 2.0;
+        }
+
+        // Slow EMA blend; 0.02/frame ≈ 50-frame settle, invisible at 60 fps
+        // and quiet enough that noise on the target doesn't shake settled
+        // probes.
+        float3 newOffset = lerp(pd.offset, targetOffset, 0.02);
+
+        // Clamp to the authored cell — going further would put the probe
+        // inside a neighbouring cell and break the trilinear blend at sample
+        // time.
+        const float3 limit = g_Vol.probeSpacing * 0.45;
+        newOffset = clamp(newOffset, -limit, limit);
+
+        pd.offset = newOffset;
+    }
+
     g_ProbeData[probeIdx] = pd;
 }

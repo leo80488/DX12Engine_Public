@@ -9,6 +9,9 @@
 // parentIndex[i] < i for all i > 0  (root-first / topological order)
 // This invariant guarantees dependency-free traversal in all systems.
 
+#include "ECS/NotifyTypes.h"  // NotifyTrack — clip-authored AnimNotify data (Unreal-style)
+
+#include <cassert>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -139,6 +142,15 @@ struct ClipAsset
         uint32_t nameHash;
     };
     std::vector<AnimEvent> events;
+
+    // ---- AnimNotify tracks (Unreal AnimSequence-style) ---------------------
+    // Authored on the clip asset and carried into the runtime clip by
+    // AnimClipData::BindToSkeleton. TimelineSystem fires these against
+    // AnimationComponent::primaryTime — see ECS/TimelineSystem.h. Notifies are
+    // time-based and skeleton-independent, so a single authored set drives
+    // every entity that plays this clip (no per-entity authoring required).
+    std::vector<NotifyTrack> notifyTracks;
+    uint32_t                 nextNotifyId = 1; // editor id allocator, persisted with the clip
 };
 
 // ===========================================================================
@@ -202,6 +214,11 @@ class ClipLibrary
 public:
     uint32_t         Register(ClipAsset clip);
     const ClipAsset& Get(uint32_t index) const;
+    // Mutable access — used by the animation editor to live-update a bound
+    // clip's notify tracks during preview so "editor sees == game sees".
+    // Caller must ensure index < Count(). Do NOT mutate the SOA keyframe
+    // arrays at runtime (AnimationSystem reads them every frame).
+    ClipAsset&       GetMutable(uint32_t index) { assert(index < m_clips.size()); return m_clips[index]; }
     uint32_t         Count() const { return static_cast<uint32_t>(m_clips.size()); }
 
 private:

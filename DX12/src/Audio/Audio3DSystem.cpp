@@ -23,17 +23,6 @@ DirectX::XMFLOAT3 WorldPositionFromMatrix(const DirectX::XMFLOAT4X4& m)
     return { m._41, m._42, m._43 };
 }
 
-// Build a left-handed forward vector from yaw/pitch — matches CameraSystem's
-// convention. Used as the listener orientation when the listener is the
-// active camera (no GlobalTransform yet, we rely on CameraComponent).
-DirectX::XMFLOAT3 ForwardFromYawPitch(float yaw, float pitch)
-{
-    using namespace DirectX;
-    const float cp = cosf(pitch), sp = sinf(pitch);
-    const float cy = cosf(yaw),   sy = sinf(yaw);
-    return { cp * sy, sp, cp * cy };
-}
-
 } // anonymous
 
 void Audio3DSystem::Update(World& world, float dt)
@@ -43,49 +32,42 @@ void Audio3DSystem::Update(World& world, float dt)
     // ------------------------------------------------------------------------
     // 1. Resolve listener pose. Priority order:
     //    a. Entity flagged AudioListenerComponent + GlobalTransform → use that.
-    //    b. CameraComponent + AudioListenerComponent → derive from yaw/pitch.
-    //    c. Plain CameraComponent (no listener tag) → fallback so 3D works
-    //       out of the box on scenes that didn't tag the camera yet.
+    //    b. Any CameraComponent + GlobalTransform → fallback so 3D audio works
+    //       out of the box on scenes that didn't tag a listener yet.
+    // Both paths read the pose straight from GlobalTransform — the camera is
+    // a normal ECS entity now, its pose lives there like everything else.
     // ------------------------------------------------------------------------
     DirectX::XMFLOAT3 listenerPos { 0.f, 0.f, 0.f };
     DirectX::XMFLOAT3 listenerFwd { 0.f, 0.f, 1.f };
     DirectX::XMFLOAT3 listenerUp  { 0.f, 1.f, 0.f };
     bool              haveListener = false;
 
+    // Forward = +Z row, up = +Y row (row-vector / row-major convention).
+    auto poseFromMatrix = [&](const DirectX::XMFLOAT4X4& m)
+    {
+        listenerPos = WorldPositionFromMatrix(m);
+        listenerFwd = { m._31, m._32, m._33 };
+        listenerUp  = { m._21, m._22, m._23 };
+        haveListener = true;
+    };
+
     world.ForEach<AudioListenerComponent>(
         [&](Entity e, AudioListenerComponent& lc)
         {
             if (haveListener || !lc.active) return;
-
             if (auto* gt = world.GetComponent<GlobalTransform>(e))
-            {
-                listenerPos = WorldPositionFromMatrix(gt->matrix);
-                // Forward = +Z row of world matrix (row-vector convention).
-                listenerFwd = { gt->matrix._31, gt->matrix._32, gt->matrix._33 };
-                listenerUp  = { gt->matrix._21, gt->matrix._22, gt->matrix._23 };
-                haveListener = true;
-                return;
-            }
-            if (auto* cam = world.GetComponent<CameraComponent>(e))
-            {
-                listenerPos = cam->position;
-                listenerFwd = ForwardFromYawPitch(cam->yaw, cam->pitch);
-                listenerUp  = { 0.f, 1.f, 0.f };
-                haveListener = true;
-            }
+                poseFromMatrix(gt->matrix);
         });
 
     if (!haveListener)
     {
         // Fallback: any camera in the world acts as the listener.
         world.ForEach<CameraComponent>(
-            [&](Entity, CameraComponent& cam)
+            [&](Entity e, CameraComponent&)
             {
                 if (haveListener) return;
-                listenerPos = cam.position;
-                listenerFwd = ForwardFromYawPitch(cam.yaw, cam.pitch);
-                listenerUp  = { 0.f, 1.f, 0.f };
-                haveListener = true;
+                if (auto* gt = world.GetComponent<GlobalTransform>(e))
+                    poseFromMatrix(gt->matrix);
             });
     }
 

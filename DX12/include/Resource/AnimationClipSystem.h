@@ -56,6 +56,12 @@ namespace Resource
         // Borrowed pointer — valid only for current call stack.
         const AnimationResource* GetResource(AnimHandle handle) const;
 
+        // Mutable borrowed pointer — EDITOR ONLY. Lets the animation-timeline
+        // editor author notify tracks directly on the loaded resource and
+        // re-serialize it to .ianim. Valid only for the current call stack; do
+        // NOT store. Returns nullptr if the handle isn't ready.
+        AnimationResource* GetResourceMutable(AnimHandle handle);
+
         // ---- Per-frame pump -------------------------------------------------
 
         // Promote ResourceManager-ready clips into the Ready state.

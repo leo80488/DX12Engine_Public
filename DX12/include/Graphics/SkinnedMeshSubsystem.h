@@ -20,6 +20,8 @@
 #include "ECS/AnimationComponents.h"     // MeshSkinnedComponent, SkinningOutputComponent
 #include "ECS/AnimationSystem.h"         // AnimationSystem, LocalToWorldSystem, SkinMatrixSystem
 #include "ECS/IKSystem.h"
+#include "ECS/FootIKTargetSystem.h"
+#include "ECS/CharacterStateSystem.h"
 #include "ECS/SocketSystem.h"
 #include "ECS/FollowSystem.h"
 #include "Physics/ChainPhysicsSystem.h"
@@ -78,6 +80,11 @@ public:
     // ECS systems (may be null before Init).
     AnimationSystem*     GetAnimationSystem()    { return m_animSystem.get();    }
     IKSystem*            GetIKSystem()           { return m_ikSystem.get();      }
+    FootIKTargetSystem*  GetFootIKSystem()       { return m_footIKSystem.get();  }
+    CharacterStateSystem* GetCharacterStateSystem() { return m_characterStateSystem.get(); }
+    void SetAnimationClipSystem(Resource::AnimationClipSystem* cs);
+    void                 SetPhysicsSystem(DX12Physics::PhysicsSystem* p) { m_physics = p; }
+    DX12Physics::PhysicsSystem* GetPhysicsSystem() { return m_physics; }
     ChainPhysicsSystem*  GetChainPhysicsSystem() { return m_chainPhysicsSystem.get(); }
     LocalToWorldSystem*  GetLocalToWorldSystem() { return m_localToWorldSystem.get(); }
     SocketSystem*        GetSocketSystem()       { return m_socketSystem.get();  }
@@ -105,6 +112,9 @@ public:
     std::unordered_map<Entity, PrevPoseEntry>& GetPrevPoseCache() { return m_prevPoseCache; }
 
     // Clear entity-keyed caches (called from Renderer::OnWorldClear).
+    // No re-register needed for the skinned vertex ring: Init() now uses
+    // MeshDescriptorHeap::RegisterPersistentBuffer, so posBindlessIdx[] /
+    // nrmBindlessIdx[] slot indices stay valid across world reloads.
     void OnWorldClear();
 
     // Drop all per-entity caches keyed on `e`. Fired from World's entity-
@@ -129,6 +139,11 @@ private:
     // ECS systems.
     std::unique_ptr<AnimationSystem>    m_animSystem;
     std::unique_ptr<IKSystem>           m_ikSystem;
+    std::unique_ptr<FootIKTargetSystem> m_footIKSystem;
+    std::unique_ptr<CharacterStateSystem> m_characterStateSystem;
+    // Borrowed pointer — App.cpp wires this after PhysicsSystem::Init via
+    // SetPhysicsSystem so FootIKTargetSystem can raycast.
+    DX12Physics::PhysicsSystem*         m_physics = nullptr;
     std::unique_ptr<ChainPhysicsSystem> m_chainPhysicsSystem;
     std::unique_ptr<LocalToWorldSystem> m_localToWorldSystem;
     std::unique_ptr<SocketSystem>       m_socketSystem;

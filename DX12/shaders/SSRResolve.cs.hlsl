@@ -19,14 +19,19 @@ cbuffer SSRResolveCB : register(b0, space2)
 {
     float4x4 invViewProj;
     float3   cameraPos;   float  _pad0;
-    uint     screenW;     uint   screenH;
-    float    invScreenW;  float  invScreenH;
+    // Phase 7: dispatch + outputs at FULL-RES (traceW/H ≡ renderW/H). The CB
+    // keeps both names so the shader stays half-res ready if we re-introduce
+    // that path with a TAA-independent denoiser.
+    uint     traceW;      uint   traceH;
+    float    invTraceW;   float  invTraceH;
     float    nearZ;       float  farZ;
-    uint     frameIndex;  uint   _pad1;
-    // Post-accumulation luminance cap (anti-firefly). Prior builds hardcoded
-    // 16 which clipped legitimate bright speculars; keep it runtime-tunable.
-    float    fireflyCap;  float  _pad3;
+    uint     frameIndex;  uint   renderW;
+    float    fireflyCap;  uint   renderH;
 };
+
+// Phase 7: jitter table removed — resolve runs at full render res; traceW/H
+// equals renderW/H. Kept the renderW/H CB fields so the shader stays half-res
+// ready if we re-introduce that path with a TAA-independent denoiser.
 
 Texture2D<float4>    gNormal    : register(t0, space2);
 Texture2D<float4>    gSurface   : register(t1, space2);
@@ -127,9 +132,11 @@ float2 Hammersley2DRandom(uint i, uint N, uint2 random)
 [numthreads(8, 8, 1)]
 void CSMain(uint3 DTid : SV_DispatchThreadID)
 {
-    if (DTid.x >= screenW || DTid.y >= screenH) return;
+    // Phase 7: full-res dispatch — one thread per GBuffer pixel.
+    if (DTid.x >= traceW || DTid.y >= traceH) return;
+
     const int2   pixel = int2(DTid.xy);
-    const float2 uv    = (float2(pixel) + 0.5) * float2(invScreenW, invScreenH);
+    const float2 uv    = (float2(pixel) + 0.5) / float2(renderW, renderH);
 
     float depth = gDepth.Load(int3(pixel, 0));
     if (depth <= 0.0)
@@ -151,23 +158,67 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     // --- Mirror / near-mirror fast path -----------------------------------
     // For very low roughness the GGX lobe is so tight that neighbour samples'
     // L rarely lie in the current pixel's lobe; GetWeight collapses to zero
-    // for every neighbour and the loop falls back to self. Skip the loop
-    // entirely — just re-use our own trace result.
+    // for every neighbour and the BRDF-weighted loop falls back to self.
+    //
+    // BUT we can't just use self verbatim — the trace walker is pixel-
+    // discrete (1-pixel steps in screen space), so adjacent reflective
+    // pixels whose rays differ by sub-pixel amounts can land on integer hit
+    // pixels that jump by 1 in either direction. On a smooth surface that
+    // would be invisible; at high-contrast edges (column silhouette vs dark
+    // gap, lantern body vs background) it shows up as stair-step / striping
+    // artefacts in the final reflection. Upsample's variance-gated bilateral
+    // blur won't catch it because mirror variance is 0, so the only chance
+    // to smooth is HERE. Do a 3×3 depth-aware average across same-surface
+    // neighbour hits — preserves silhouettes (sky/different-depth neighbours
+    // get 0 weight) but blends out single-pixel walker jumps.
     if (roughness < 0.1)
     {
-        float4 self = gHitBuffer.Load(int3(pixel, 0));
+        float4 acc   = 0;
+        float  wSum  = 0;
         float  selfRL = gRayLength.Load(int3(pixel, 0));
-        OutColor[pixel]       = self;
+
+        // 5×5 separable-style Gaussian-weighted box across same-surface
+        // neighbours. Wider than the previous 3×3 because the walker's
+        // staircase / mip-stripe artefacts span 2–4 pixels at high-contrast
+        // silhouette edges (right-side column reflections in Sponza were
+        // visibly stripped through 3×3). The depth weight is relaxed (32
+        // instead of 64) so a slight slope across the floor doesn't kill
+        // neighbour contributions and re-tighten the staircase. Pure-sky
+        // pixels (sd<=0) are still skipped — they have no plane to align to.
+        [unroll] for (int dy = -2; dy <= 2; ++dy)
+        [unroll] for (int dx = -2; dx <= 2; ++dx)
+        {
+            int2 np = clamp(pixel + int2(dx, dy),
+                            int2(0, 0),
+                            int2(int(renderW) - 1, int(renderH) - 1));
+            float4 s  = gHitBuffer.Load(int3(np, 0));
+            float  sd = gDepth.Load(int3(np, 0));
+            if (sd <= 0.0) continue;
+            float linSd  = LinearizeReverseZ(sd);
+            float relDz  = abs(linSd - linDepth) / max(linDepth, 0.01);
+            float wDepth = exp(-relDz * relDz * 32.0);
+            // Gaussian σ≈1.5 spatial weight (kernel sums ≈ 1).
+            float r2     = float(dx * dx + dy * dy);
+            float wSpat  = exp(-r2 / 4.5);
+            float w      = wDepth * wSpat;
+            acc  += s * w;
+            wSum += w;
+        }
+
+        float4 outC = (wSum > 1e-5)
+            ? (acc / wSum)
+            : gHitBuffer.Load(int3(pixel, 0));
+        OutColor[pixel]       = outC;
         OutVariance[pixel]    = 0.0;
         OutReprojDepth[pixel] = InverseLinearDepth(linDepth + selfRL);
         return;
     }
 
-    // Sample radius: glossy [2..8px] scaled by roughness.
+    // Sample radius: glossy [2..8 px] scaled by roughness.
     const float  spatialSize = lerp(2.0, 8.0, saturate(roughness * 5.0));
     const uint   kSamples    = 4u;
 
-    uint h = WangHash(pixel.x + pixel.y * screenW + frameIndex * 0x9E3779B9u);
+    uint h = WangHash(pixel.x + pixel.y * renderW + frameIndex * 0x9E3779B9u);
     uint2 random = uint2(h & 0xFFFFu, (h >> 16) & 0xFFFFu);
 
     float4 accumColor = 0;
@@ -179,8 +230,9 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     for (uint i = 0; i < kSamples; ++i)
     {
         float2 offset = (Hammersley2DRandom(i, kSamples, random) - 0.5) * spatialSize;
-        int2   np = clamp(pixel + int2(offset),
-                          int2(0, 0), int2(screenW - 1, screenH - 1));
+        int2 np = clamp(pixel + int2(offset),
+                        int2(0, 0),
+                        int2(int(renderW) - 1, int(renderH) - 1));
 
         if (gDepth.Load(int3(np, 0)) <= 0.0) continue;
 
@@ -255,8 +307,7 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     }
     else
     {
-        // No valid neighbour — fall back to self so rough surfaces at least
-        // show their own hit (better than a black hole).
+        // No valid neighbour — fall back to self.
         float4 self = gHitBuffer.Load(int3(pixel, 0));
         colorOut = self.rgb;
         confOut  = self.a;

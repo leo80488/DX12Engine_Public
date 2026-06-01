@@ -38,7 +38,7 @@ void TerrainPass::Setup(RG::RenderGraphBuilder& b)
 }
 
 // ---------------------------------------------------------------------------
-bool TerrainPass::BuildPSO(IGraphicsDevice& gfx)
+bool TerrainPass::BuildPSO(IGraphicsDevice& gfx, bool wireframe, RHI::PipelineState& outPso)
 {
     const RHI::Shader* as = m_shaderLib.GetShader(ShaderID::Terrain_AS);
     const RHI::Shader* ms = m_shaderLib.GetShader(ShaderID::Terrain_MS);
@@ -51,7 +51,7 @@ bool TerrainPass::BuildPSO(IGraphicsDevice& gfx)
     { LOG_ERROR("TerrainPass: Terrain_PS not found"); return false; }
 
     RHI::RasterizerState rs{};
-    rs.fill_mode         = RHI::FillMode::SOLID;
+    rs.fill_mode         = wireframe ? RHI::FillMode::WIREFRAME : RHI::FillMode::SOLID;
     rs.cull_mode         = RHI::CullMode::BACK;
     rs.front_counter_clockwise = false;
     rs.depth_clip_enable = true;
@@ -94,7 +94,7 @@ bool TerrainPass::BuildPSO(IGraphicsDevice& gfx)
     pd.dsv_format     = RHI::Format::D24_UNORM_S8_UINT;     // matches GBufferPass
     pd.sample_count   = 1;
 
-    if (!gfx.CreatePipelineState(pd, m_pso))
+    if (!gfx.CreatePipelineState(pd, outPso))
     {
         LOG_ERROR("TerrainPass: PSO creation failed");
         return false;
@@ -120,8 +120,11 @@ void TerrainPass::Init(IGraphicsDevice& gfx)
     m_shaderLib.Register(ShaderID::Terrain_MS, RHI::ShaderStage::MS, "Terrain.ms.hlsl");
     m_shaderLib.Register(ShaderID::Terrain_PS, RHI::ShaderStage::PS, "Terrain.ps.hlsl");
 
-    if (!BuildPSO(gfx))
+    if (!BuildPSO(gfx, /*wireframe*/false, m_pso))
         return;
+    // Wireframe variant for the global view-mode switch. Non-fatal if it
+    // fails — Execute falls back to the solid PSO.
+    BuildPSO(gfx, /*wireframe*/true, m_psoWire);
 
     // s0 — Trilinear-clamp for heightmap (MS) + splatmap (PS, sampled by the
     // tile-local UV ∈ [0,1]). Clamp avoids the four-tap derivative stencil
@@ -161,7 +164,8 @@ void TerrainPass::ReloadShaders(IGraphicsDevice& gfx)
 {
     if (!m_meshShaderAvailable) return;
     m_shaderLib.ClearCaches();
-    BuildPSO(gfx);
+    BuildPSO(gfx, /*wireframe*/false, m_pso);
+    BuildPSO(gfx, /*wireframe*/true,  m_psoWire);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +179,7 @@ RHI::CommandList TerrainPass::Execute(RHI::CommandList cl)
     cl.SetViewport();
     cl.SetScissorRect();
 
-    cl.SetPipelineState(m_pso);
+    cl.SetPipelineState((m_wireframe && m_psoWire.IsValid()) ? m_psoWire : m_pso);
     cl.BindDescriptorHeaps();
 
     // CBs — slot index here is CB-relative; BindCBByName(0,…) → root b1, (1,…) → root b2.

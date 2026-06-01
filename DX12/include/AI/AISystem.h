@@ -52,6 +52,15 @@ namespace AI
         // with the same path return the cached shared_ptr.
         std::shared_ptr<BTAsset> AcquireTree(const std::string& path);
 
+        // Force-reparse a tree even if it's already cached. Updates the
+        // path → asset cache so subsequent AcquireTree calls return the
+        // fresh asset. Existing AIComponent::tree shared_ptrs are NOT
+        // patched in place — callers must assign the returned pointer
+        // themselves (or rely on CheckHotReload, which does the world-
+        // wide patch via mtime polling). Returns nullptr on parse failure
+        // and leaves the cached entry untouched in that case.
+        std::shared_ptr<BTAsset> ReloadTree(const std::string& path);
+
         // Watch loaded BT files; if the source mtime changed, re-parse
         // and stamp every AIComponent that uses that path. Per-instance
         // state is reset so the new tree starts cleanly. Mirrors the

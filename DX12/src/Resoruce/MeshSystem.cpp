@@ -104,7 +104,7 @@ namespace Resource
             }
         }
 
-        // Vertex buffer — DEFAULT heap, RAW so MeshDescriptorHeap::RegisterRawBuffer can
+        // Vertex buffer — DEFAULT heap, RAW so MeshDescriptorHeap::RegisterBuffer can
         // create a ByteAddressBuffer SRV for PVF fetch (interleaved, 32 bytes/vertex).
         RHI::GPUBufferDesc vbDesc;
         vbDesc.size       = vertexCount * sizeof(Vertex);

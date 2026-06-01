@@ -2,8 +2,8 @@
 
 // PostProcessConfig — a single POD snapshot of every user-tunable
 // post-processing parameter exposed in the editor. Persists as a .ippc file
-// (line-based text, same formatting conventions as .iworld / .ipfb). A World
-// can reference a .ippc by path so that loading a scene restores its entire
+// (line-based text, same formatting conventions as .iscene / .ipfb). A Scene
+// asset can reference a .ippc by path so that loading the scene restores its entire
 // look (bloom strength, exposure curve, AO parameters, volumetric fog,
 // atmosphere / time-of-day, color grading, outline settings, …).
 //
@@ -85,18 +85,10 @@ namespace Resource
         bool              temporalEnabled        = true;
         float             temporalAlpha          = 0.12f;
 
-        // ---- SkyIBLPass ----------------------------------------------------
+        // ---- SkyIBLPass (TOD fields moved to TODConfigComponent in ECS) ----
         bool              atmosphereEnabled      = false;
         uint32_t          skyboxSource           = 0;    // 0 = Atmosphere, 1 = Static
-        bool              timeOfDayEnabled       = false;
-        float             timeOfDay              = 0.35f;
-        float             timeSpeed              = 0.0f;
-        float             latitude               = 0.6f;
-        float             sunIntensityScale      = 1.0f;
         float             iblStrength            = 0.1f;
-        // Default 0 — flat ambient is opt-in. Editor slider / saved .ippc
-        // can dial up; without an explicit value the term contributes nothing.
-        DirectX::XMFLOAT3 skyAmbientColor        { 0.0f, 0.0f, 0.0f };
         bool              aerialCompositeEnabled = false;
 
         // Populate this struct from the renderer's current live parameters.

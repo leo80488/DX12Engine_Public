@@ -29,7 +29,7 @@ void TransformSystem::Propagate(World& world)
     auto* poolLT       = world.GetPool<LocalTransform>();
     auto* poolParent   = world.GetPool<Parent>();
     auto* poolChildren = world.GetPool<Children>();
-    auto* poolVis      = world.GetPool<Visibility>();
+    auto* poolVis      = world.GetPool<VisibilityComponent>();
     auto* poolLAabb    = world.GetPool<LocalAabb>();
     auto* poolWAabb    = world.GetPool<WorldAabb>();
 
@@ -67,8 +67,8 @@ void TransformSystem::Propagate(World& world)
         // Roots have no ancestor to inherit hidden-state from
         if (poolVis)
         {
-            if (Visibility* v = poolVis->Get(e))
-                v->inherited_hidden = false;
+            if (VisibilityComponent* v = poolVis->Get(e))
+                v->inheritedHidden = false;
         }
 
         s_queue.push_back(e);
@@ -80,7 +80,7 @@ void TransformSystem::Propagate(World& world)
         const Entity current = s_queue[head++];
 
         const GlobalTransform* parentGT  = poolGT->Get(current);
-        const Visibility*      parentVis = poolVis ? poolVis->Get(current) : nullptr;
+        const VisibilityComponent* parentVis = poolVis ? poolVis->Get(current) : nullptr;
         const Children*        children  = poolChildren ? poolChildren->Get(current) : nullptr;
 
         if (!children || !parentGT)
@@ -106,11 +106,11 @@ void TransformSystem::Propagate(World& world)
             // Propagate inherited visibility
             if (poolVis)
             {
-                if (Visibility* v = poolVis->Get(child))
+                if (VisibilityComponent* v = poolVis->Get(child))
                 {
                     const bool ancestorHidden = parentHidden
-                        || (parentVis && parentVis->inherited_hidden);
-                    v->inherited_hidden = ancestorHidden;
+                        || (parentVis && parentVis->inheritedHidden);
+                    v->inheritedHidden = ancestorHidden;
                 }
             }
 

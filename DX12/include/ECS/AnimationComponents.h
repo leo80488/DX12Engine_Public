@@ -61,6 +61,15 @@ struct AnimationComponent
     uint8_t _pad[2]{};
 
     uint32_t pendingEventMask = 0; // bitmask of AnimEvents fired this frame (consumed by game)
+
+    // ---- Clip-driven AnimNotify cursor (Unreal AnimSequence-style) ---------
+    // TimelineSystem advances these to detect which notify times the clip
+    // crossed since last frame. prevNotifyTime < 0 means uninitialized: on
+    // first sight (or after a clip switch) TimelineSystem snapshots the time
+    // without firing, so opening a clip doesn't replay every notify at once.
+    // lastNotifyClip detects primaryClip changes to re-arm the snapshot.
+    float    prevNotifyTime = -1.f;
+    uint32_t lastNotifyClip = kInvalidAnimHandle;
 };
 
 // ---------------------------------------------------------------------------
@@ -191,8 +200,14 @@ struct SocketComponent
     {
         char                name[64]    = {};         // user-facing id ("hand_r", "fx_root", …)
         uint32_t            boneIndex   = 0;          // index into SkeletonAsset::boneNames / bindPose
-        DirectX::XMFLOAT4X4 localOffset;              // bone-local offset (static)
+        DirectX::XMFLOAT4X4 localOffset;              // bone-local offset (static) — runtime source of truth
         DirectX::XMFLOAT4X4 worldTransform;           // written every frame by SocketSystem
+        // Editor authoring representation for rotation. Translation is read
+        // directly from localOffset._41/_42/_43; this field exists so the
+        // inspector doesn't have to decompose quaternion→euler every frame
+        // (that would jitter near gimbal lock). On serialize load the
+        // matrix is decomposed once to seed this field.
+        DirectX::XMFLOAT3   rotationEulerDeg = { 0.f, 0.f, 0.f };
 
         Socket()
         {
@@ -222,7 +237,7 @@ struct SocketComponent
 
 // ---------------------------------------------------------------------------
 // PendingAnimBind — deferred animation binding for async-loaded clips.
-// Attached to an entity by PrefabSerializer/WorldSerializer when the clip
+// Attached to an entity by PrefabSerializer/SceneSerializer when the clip
 // hasn't finished loading yet. AnimationClipSystem::Tick() polls this each
 // frame and binds the clip once ready, then removes the component.
 // ---------------------------------------------------------------------------

@@ -45,30 +45,26 @@ void ParticleSystem::Init(IGraphicsDevice& gfx)
     // `emitterIdx * kEmitterSlotStride` — D3D12 requires 256B alignment for
     // CBV offsets. Real emitter data (112B) lives in the first portion of
     // each slot; the rest is zero padding.
+    // Triple-buffered ring — written every frame by CollectEmitters.
     {
         RHI::GPUBufferDesc d{};
         d.size       = static_cast<uint64_t>(kMaxEmittersPerFrame) * kEmitterSlotStride;
         d.usage      = RHI::Usage::UPLOAD;
         d.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(d, m_emitterBuffer))
-            m_emitterMapped = gfx.MapBuffer(m_emitterBuffer);
-        if (!m_emitterMapped)
-            LOG_ERROR("ParticleSystem: emitter buffer map failed");
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(d, m_emitterBuffer[i]))
+                m_emitterMapped[i] = gfx.MapBuffer(m_emitterBuffer[i]);
+            if (!m_emitterMapped[i])
+                LOG_ERROR("ParticleSystem: emitter buffer map failed (slot %u)", i);
+        }
     }
 
     m_emitterSpawnCounts.reserve(kMaxEmittersPerFrame);
 
-    // ---- Per-frame system CB (UPLOAD heap, root CBV) -----------------------
-    {
-        RHI::GPUBufferDesc d{};
-        d.size       = 256;   // 256B-aligned for root CBV
-        d.usage      = RHI::Usage::UPLOAD;
-        d.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(d, m_systemCB))
-            m_systemCBMapped = gfx.MapBuffer(m_systemCB);
-        if (!m_systemCBMapped)
-            LOG_ERROR("ParticleSystem: system CB map failed");
-    }
+    // ---- Per-frame system CB (UPLOAD heap, root CBV) — triple-buffered -----
+    if (!m_systemCB.Create(gfx, "ParticleSystem.CB"))
+        LOG_ERROR("ParticleSystem: system CB create failed");
 
     // Initialize the pool slots to "dead" (lifetime = 0). The DEFAULT heap
     // starts zeroed by the driver on most IHVs, but be explicit: zero the
@@ -83,23 +79,43 @@ void ParticleSystem::Init(IGraphicsDevice& gfx)
 
 void ParticleSystem::Shutdown(IGraphicsDevice& gfx)
 {
-    if (m_systemCBMapped) { gfx.UnmapBuffer(m_systemCB); m_systemCBMapped = nullptr; }
-    if (m_emitterMapped)  { gfx.UnmapBuffer(m_emitterBuffer); m_emitterMapped = nullptr; }
-    if (m_systemCB.IsValid())     gfx.DestroyBuffer(m_systemCB);
-    if (m_emitterBuffer.IsValid())gfx.DestroyBuffer(m_emitterBuffer);
+    m_systemCB.Destroy(gfx);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (m_emitterMapped[i]) { gfx.UnmapBuffer(m_emitterBuffer[i]); m_emitterMapped[i] = nullptr; }
+        if (m_emitterBuffer[i].IsValid()) gfx.DestroyBuffer(m_emitterBuffer[i]);
+    }
     if (m_particlePool.IsValid()) gfx.DestroyBuffer(m_particlePool);
     m_gfx = nullptr;
 }
 
 void ParticleSystem::UpdateSystemCB(float dt, uint32_t frameIndex)
 {
-    if (!m_systemCBMapped) return;
+    if (!m_gfx) return;
+    auto* p = m_systemCB.Current(*m_gfx);
+    if (!p) return;
     ParticleSystemCB cb{};
     cb.deltaTime     = dt;
     cb.particleCount = kMaxGlobalParticles;
     cb.frameIndex    = frameIndex;
     cb.globalGravity = m_globalGravity;
-    std::memcpy(m_systemCBMapped, &cb, sizeof(cb));
+    *p = cb;
+}
+
+const RHI::GPUBuffer& ParticleSystem::GetEmitterBuffer() const
+{
+    const uint32_t s = m_gfx ? m_gfx->GetFrameIndex() : 0;
+    return m_emitterBuffer[s < kFrameCount ? s : 0];
+}
+
+const RHI::GPUBuffer& ParticleSystem::GetSystemCB() const
+{
+    // FrameCB::CurrentBuffer needs a non-const gfx ref (matches the IGraphicsDevice
+    // accessor signature), so const_cast through m_gfx — the operation is
+    // logically const (read-only buffer ref selection).
+    static const RHI::GPUBuffer s_empty{};
+    if (!m_gfx) return s_empty;
+    return m_systemCB.CurrentBuffer(*m_gfx);
 }
 
 void ParticleSystem::CollectEmitters(World& world, float dt, uint32_t frameIndex)
@@ -108,7 +124,10 @@ void ParticleSystem::CollectEmitters(World& world, float dt, uint32_t frameIndex
     m_emitterSpawnCounts.clear();
     m_globalGravity = { 0.0f, 0.0f, 0.0f };
     m_pendingMeshResolves.clear();
-    if (!m_emitterMapped) return;
+    if (!m_gfx) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot >= kFrameCount || !m_emitterMapped[frameSlot]) return;
+    void* emitterMapped = m_emitterMapped[frameSlot];
 
     // Iterate ParticleEmitterComponent pool directly (the hot-path
     // pattern — see memory/feedback_ecs_pool_iteration.md).
@@ -187,7 +206,7 @@ void ParticleSystem::CollectEmitters(World& world, float dt, uint32_t frameIndex
         // Write the emitter record into mapped upload buffer at a
         // 256B-aligned slot offset, zero the padding bytes afterward so the
         // GPU reads deterministic data.
-        uint8_t* slotBytes = static_cast<uint8_t*>(m_emitterMapped)
+        uint8_t* slotBytes = static_cast<uint8_t*>(emitterMapped)
                            + m_emitterCountThisFrame * kEmitterSlotStride;
         std::memset(slotBytes, 0, kEmitterSlotStride);
         ParticleEmitterGPU* slot = reinterpret_cast<ParticleEmitterGPU*>(slotBytes);
@@ -278,11 +297,13 @@ void ParticleSystem::PatchMeshEmitter(uint32_t slotIndex,
                                        uint32_t meshIndexCount,
                                        const DirectX::XMFLOAT4X4& worldMatrix)
 {
-    if (!m_emitterMapped) return;
+    if (!m_gfx) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot >= kFrameCount || !m_emitterMapped[frameSlot]) return;
     if (slotIndex >= m_emitterCountThisFrame) return;
 
     ParticleEmitterGPU* slot = reinterpret_cast<ParticleEmitterGPU*>(
-        static_cast<uint8_t*>(m_emitterMapped)
+        static_cast<uint8_t*>(m_emitterMapped[frameSlot])
         + slotIndex * kEmitterSlotStride);
 
     slot->meshDescSlot    = meshDescSlot;

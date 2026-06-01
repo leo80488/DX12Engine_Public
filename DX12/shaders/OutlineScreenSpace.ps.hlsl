@@ -25,7 +25,10 @@ cbuffer OutlineCB : register(b2, space0)
     float    outlineFadeEnd;
     float    nearZ;
     float    farZ;
+    float3   pickingOutlineColor;   // editor selection color; used when ObjectID bit-31 is set
 };
+
+static const uint kPickingMask = 0x80000000u;
 
 Texture2D<uint>   gObjectID : register(t2, space0);
 Texture2D<float4> gNormal   : register(t3, space0);
@@ -44,6 +47,33 @@ float4 main(PSIn i) : SV_TARGET
 {
     int2 px = int2(i.pos.xy);
 
+    // ---- Object ID edge ----------------------------------------------------
+    uint id00 = gObjectID.Load(int3(px + int2(0,0), 0));
+    uint id10 = gObjectID.Load(int3(px + int2(1,0), 0));
+    uint id01 = gObjectID.Load(int3(px + int2(0,1), 0));
+    uint id11 = gObjectID.Load(int3(px + int2(1,1), 0));
+
+    // Picking edge: silhouette transition in the bit-31 mask. Ignores depth /
+    // normal / distance fade so the editor selection shows through walls and
+    // never fades with distance — Blender / Unity style.
+    bool p00 = (id00 & kPickingMask) != 0;
+    bool p10 = (id10 & kPickingMask) != 0;
+    bool p01 = (id01 & kPickingMask) != 0;
+    bool p11 = (id11 & kPickingMask) != 0;
+    bool pickingEdge = (p00 != p10) || (p00 != p01) || (p00 != p11)
+                    || (p10 != p01) || (p10 != p11) || (p01 != p11);
+
+    if (pickingEdge)
+        return float4(pickingOutlineColor, 1.0);
+
+    // Inside (or fully outside) the picking silhouette — any neighbor tagged
+    // means this pixel is covered by the picked entity. The depth buffer here
+    // still belongs to the OCCLUDER, so the regular depth / normal edge logic
+    // below would paint stray dark outlines on top of the wall.  Discard.
+    if (p00 || p10 || p01 || p11)
+        discard;
+
+    // ---- Below: regular (material) outline — depth-tested, depth-fade ------
     float d00 = gDepth.Load(int3(px, 0));
     float linearDist = LinearizeDepth(d00);
     if (linearDist > outlineFadeEnd) discard;
@@ -52,11 +82,6 @@ float4 main(PSIn i) : SV_TARGET
         (linearDist - outlineFadeStart) / max(outlineFadeEnd - outlineFadeStart, 0.01)
     );
 
-    // ---- Object ID edge ----------------------------------------------------
-    uint id00 = gObjectID.Load(int3(px + int2(0,0), 0));
-    uint id10 = gObjectID.Load(int3(px + int2(1,0), 0));
-    uint id01 = gObjectID.Load(int3(px + int2(0,1), 0));
-    uint id11 = gObjectID.Load(int3(px + int2(1,1), 0));
     bool idEdge = false;
     if (id00 != 0 || id10 != 0 || id01 != 0 || id11 != 0)
     {

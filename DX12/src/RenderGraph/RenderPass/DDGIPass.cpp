@@ -1,6 +1,7 @@
 #include "RenderGraph/RenderPass/DDGIPass.h"
 #include "Graphics/DDGIVolumeManager.h"
 #include "Graphics/GraphicsDX12.h"
+#include "Graphics/MeshDescriptorHeap.h"   // kMaxBuffers — root-sig bindless table size
 #include "Graphics/DxcCompiler.h"
 #include "System/Log.h"
 
@@ -120,7 +121,7 @@ bool DDGIPass::BuildRootSignature(IGraphicsDevice& gfx)
     //   [3]  DESC_TABLE 1 UAV  u0 space0  (atlas / ray data)
     //   [4]  DESC_TABLE 1 SRV  t2 space0  (ray data SRV)
     //   [5]  ROOT_SRV          t3 space0  (per-instance data buffer)
-    //   [6]  DESC_TABLE 4096 SRV t0 space1 (bindless g_DDGIBuffers[])
+    //   [6]  DESC_TABLE 16384 SRV t0 space1 (bindless g_DDGIBuffers[], matches kMaxBindlessBuffers)
     //   [7]  DESC_TABLE 1 UAV  u1 space0  (variance buffer — irradiance relight only)
     //   [8]  DESC_TABLE 1 SRV  t4 space0  (irradiance atlas SRV — trace's multi-bounce read)
     //   [9]  DESC_TABLE 1 SRV  t5 space0  (depth atlas SRV — trace's multi-bounce read)
@@ -182,7 +183,10 @@ bool DDGIPass::BuildRootSignature(IGraphicsDevice& gfx)
     // face normal.
     static D3D12_DESCRIPTOR_RANGE bindlessRange{};
     bindlessRange.RangeType        = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    bindlessRange.NumDescriptors   = 4096;
+    // Must match MeshDescriptorHeap::kMaxBuffers (the shader sees this size as
+    // `g_DDGIBuffers[N]` in DDGIRayTrace.cs.hlsl). DDGIPass has its own root
+    // signature so the count is inlined here rather than cross-included.
+    bindlessRange.NumDescriptors   = MeshDescriptorHeap::kMaxBuffers;
     bindlessRange.BaseShaderRegister = 0;
     bindlessRange.RegisterSpace      = 1;
     params[6].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -263,11 +267,11 @@ bool DDGIPass::BuildRootSignature(IGraphicsDevice& gfx)
     }
 
     // [15] Bindless texture table (engine-wide `g_AllTextures[]` at t0 space2,
-    // matches GraphicsDX12::kMaxBindlessTextures = 4096). Used by closest-hit
+    // matches GraphicsDX12::kMaxBindlessTextures). Used by closest-hit
     // to sample emissive textures for emission-into-DDGI.
     static D3D12_DESCRIPTOR_RANGE bindlessTexRange{};
     bindlessTexRange.RangeType        = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    bindlessTexRange.NumDescriptors   = 4096;
+    bindlessTexRange.NumDescriptors   = GraphicsDX12::kMaxBindlessTextures;
     bindlessTexRange.BaseShaderRegister = 0;
     bindlessTexRange.RegisterSpace      = 2;
     params[15].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -413,7 +417,8 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
     // the DX12 backend (IGraphicsDevice does not expose CB GPU VA queries
     // directly).
     {
-        const RHI::GPUBuffer* cb = mgr.GetVolumeCB(volumeSlot);
+        // Per-frame ring slot — Tick() writes the matching index above.
+        const RHI::GPUBuffer* cb = mgr.GetVolumeCB(gfx, volumeSlot);
         if (!cb || !cb->IsValid())
         {
             LOG_INFO("DDGIPass: skipping volume %u — CB not allocated", volumeSlot);
@@ -477,27 +482,44 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
         cmd4->ResourceBarrier(1, &uavb);
     };
 
+    // Per-step GPU timestamps — sub-steps appear nested under the outer
+    // "DDGI" region wrapped by Renderer. Names match the SkyIBL / VolFog
+    // convention; multi-volume scenes will see one entry per volume per
+    // step (typical case is a single volume).
+    auto pBegin = [&](const char* name) -> uint32_t {
+        return gfx.BeginGPUTimestamp(cmd, name);
+    };
+    auto pEnd = [&](uint32_t r) {
+        gfx.EndGPUTimestamp(cmd, r);
+    };
+
     // ---- 1a. Prepare per-probe ray count from variance ---------------------
     {
+        uint32_t r = pBegin("DDGI.PrepareRayCount");
         cmd4->SetPipelineState(m_prepareRayCountPSO.Get());
         const uint32_t groups = (probeCount + 63u) / 64u;
         cmd4->Dispatch(groups, 1, 1);
         uavBarrier();
+        pEnd(r);
     }
 
     // ---- 1b. Pack ray descriptors via atomic InterlockedAdd ----------------
     {
+        uint32_t r = pBegin("DDGI.RayAllocation");
         cmd4->SetPipelineState(m_rayAllocationPSO.Get());
         const uint32_t groups = (probeCount + 63u) / 64u;
         cmd4->Dispatch(groups, 1, 1);
         uavBarrier();
+        pEnd(r);
     }
 
     // ---- 1c. Finalize indirect dispatch args -------------------------------
     {
+        uint32_t r = pBegin("DDGI.FinalizeIndirect");
         cmd4->SetPipelineState(m_finalizeIndirectPSO.Get());
         cmd4->Dispatch(1, 1, 1);
         uavBarrier();
+        pEnd(r);
     }
 
     // The dispatch-args buffer is about to be read by ExecuteIndirect in
@@ -559,6 +581,7 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
 
     // ---- 2. Trace ExecuteIndirect ------------------------------------------
     {
+        uint32_t r = pBegin("DDGI.Trace");
         uint64_t rayUav = mgr.GetRayDataUav(volumeSlot);
         if (rayUav)
             cmd4->SetComputeRootDescriptorTable(3, D3D12_GPU_DESCRIPTOR_HANDLE{ rayUav });
@@ -576,6 +599,7 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
             cmd4->ExecuteIndirect(m_traceCmdSig.Get(), 1, argsRes, 0,
                                   nullptr, 0);
         uavBarrier();
+        pEnd(r);
     }
 
     // Args buffer back to UAV for the next frame's dispatches.
@@ -634,6 +658,7 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
 
     if (uint64_t pdUav = mgr.GetProbeDataUav(volumeSlot))
     {
+        uint32_t r = pBegin("DDGI.Relocate");
         cmd4->SetPipelineState(m_relocatePSO.Get());
         cmd4->SetComputeRootDescriptorTable(3, D3D12_GPU_DESCRIPTOR_HANDLE{ pdUav });
         if (uint64_t raySrv = mgr.GetRayDataSrv(volumeSlot))
@@ -641,6 +666,7 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
         const uint32_t groups = (probeCount + 63u) / 64u;
         cmd4->Dispatch(groups, 1, 1);
         uavBarrier();
+        pEnd(r);
     }
 
     // Restore ProbeData to kSHReadState so LightingPass + next-frame trace's
@@ -674,12 +700,20 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
     };
     // Irradiance path now writes to the per-probe SH structured buffer (no
     // longer a Texture2D atlas).
-    runRelight(m_relightIrradiancePSO,
-               mgr.GetProbeSHUav(volumeSlot),
-               mgr.GetRayDataSrv(volumeSlot));
-    runRelight(m_relightDepthPSO,
-               mgr.GetDepthAtlasUav(volumeSlot),
-               mgr.GetRayDataSrv(volumeSlot));
+    {
+        uint32_t r = pBegin("DDGI.Relight.Irr");
+        runRelight(m_relightIrradiancePSO,
+                   mgr.GetProbeSHUav(volumeSlot),
+                   mgr.GetRayDataSrv(volumeSlot));
+        pEnd(r);
+    }
+    {
+        uint32_t r = pBegin("DDGI.Relight.Dep");
+        runRelight(m_relightDepthPSO,
+                   mgr.GetDepthAtlasUav(volumeSlot),
+                   mgr.GetRayDataSrv(volumeSlot));
+        pEnd(r);
+    }
 
     // ---- 5 + 6. Border update ----------------------------------------------
     auto runBorder = [&](Microsoft::WRL::ComPtr<ID3D12PipelineState>& pso, uint64_t atlasUav)
@@ -696,7 +730,11 @@ void DDGIPass::Execute(IGraphicsDevice& gfx,
     // Irradiance border CS is no longer needed — SH probes have no octahedral
     // seams. Only the depth atlas still needs border replication for
     // bilinear-correct chebyshev sampling.
-    runBorder(m_borderDepthPSO,      mgr.GetDepthAtlasUav(volumeSlot));
+    {
+        uint32_t r = pBegin("DDGI.Border");
+        runBorder(m_borderDepthPSO, mgr.GetDepthAtlasUav(volumeSlot));
+        pEnd(r);
+    }
 
     // SH buffer restoration — leave in kSHReadState so:
     //   (a) the lighting pass's t29 PSR read works without a transition,

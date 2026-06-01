@@ -20,6 +20,7 @@
 //         a camera-facing ribbon quad.
 
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include "ECS/ECS.h"
 
 #include <vector>
@@ -53,6 +54,8 @@ struct alignas(16) TrailHeaderGPU
 static_assert(sizeof(TrailHeaderGPU) == 80, "TrailHeaderGPU drift");
 
 // ---- One append request from CPU. 32 bytes (256B-aligned CB slot on upload).
+// flags: bit0 = reset header before append (slot reuse); bit1 = reset-only
+// (freed slot with no new owner this frame — clear header, skip append).
 struct alignas(16) TrailAppendRequestGPU
 {
     DirectX::XMFLOAT3 position;    // 12 — new segment world position
@@ -60,11 +63,17 @@ struct alignas(16) TrailAppendRequestGPU
     uint32_t          trailSlot;   // 4  — target trail index in segment pool
     float             width;       // 4
     float             maxAge;      // 4
-    float             _pad0;       // 4
+    uint32_t          flags;       // 4  — TrailRequestFlag bits
     DirectX::XMFLOAT4 startColor;  // 16 — header is refreshed every frame
     DirectX::XMFLOAT4 endColor;    // 16
 };
 static_assert(sizeof(TrailAppendRequestGPU) == 64, "TrailAppendRequestGPU drift");
+
+enum TrailRequestFlag : uint32_t
+{
+    TrailRequest_ResetHeader = 1u << 0,  // zero head/count before appending (slot reuse)
+    TrailRequest_ResetOnly   = 1u << 1,  // clear a freed slot's header, no append
+};
 
 // ---- Per-frame globals (cbuffer). 16 bytes.
 struct alignas(16) TrailSystemCB
@@ -104,8 +113,11 @@ public:
     // Buffer accessors for passes.
     const RHI::GPUBuffer& GetSegmentBuffer() const { return m_segmentBuffer; }
     const RHI::GPUBuffer& GetHeaderBuffer()  const { return m_headerBuffer; }
-    const RHI::GPUBuffer& GetRequestBuffer() const { return m_requestBuffer; }
-    const RHI::GPUBuffer& GetSystemCB()      const { return m_systemCB; }
+    // Triple-buffered — caller must pass the device so we can index into the
+    // current frame slot. (Stale callers that ignored the frame slot would
+    // race the GPU on every other frame.)
+    const RHI::GPUBuffer& GetRequestBuffer(IGraphicsDevice& gfx) const;
+    const RHI::GPUBuffer& GetSystemCB(IGraphicsDevice& gfx)      const { return m_systemCB.CurrentBuffer(gfx); }
 
     uint64_t GetSegmentSRVHandle() const { return m_segSrv; }
     uint64_t GetSegmentUAVHandle() const { return m_segUav; }
@@ -128,14 +140,15 @@ private:
     uint64_t       m_segSrv = 0, m_segUav = 0;
     uint64_t       m_hdrSrv = 0, m_hdrUav = 0;
 
-    // Per-frame append requests (UPLOAD, SR).
-    RHI::GPUBuffer m_requestBuffer;
-    void*          m_requestMapped = nullptr;
-    uint64_t       m_requestSrv    = 0;
+    // Per-frame append requests (UPLOAD, SR) — triple-buffered manual ring.
+    // 3 == GraphicsDX12::FrameCount.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_requestBuffer[kFrameCount];
+    void*          m_requestMapped[kFrameCount] = {};
+    uint64_t       m_requestSrv[kFrameCount]    = {};
 
     // Per-frame globals (UPLOAD, CB).
-    RHI::GPUBuffer m_systemCB;
-    void*          m_systemCBMapped = nullptr;
+    FrameCB<TrailSystemCB> m_systemCB;
 
     // Slot allocator — simple bitset. 64 slots × 1 bit = 8 bytes.
     uint64_t m_slotUsedMask         = 0;

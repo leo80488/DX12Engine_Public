@@ -56,14 +56,7 @@ void SceneVoxelPass::Init(IGraphicsDevice& gfx)
     }
 
     // ---- Per-dispatch CB (ring of kMaxDraws+1 slots) ----------------------
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = static_cast<uint64_t>(kCBSlotStride) * (kMaxDraws + 1);
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "SceneVoxel.CB");
 
     LOG_SUCCESS("SceneVoxelPass: Tier-2 triangle voxelization initialised (%u^3 R8_UINT)",
                 kGridDim);
@@ -80,7 +73,7 @@ uint64_t SceneVoxelPass::GetOccupancySrvHandle() const
 RHI::CommandList SceneVoxelPass::Execute(RHI::CommandList cl)
 {
     if (!m_voxelizePSO.IsValid() || !m_clearPSO.IsValid()) return cl;
-    if (!m_occupancyTex.IsValid() || !m_cbMapped)          return cl;
+    if (!m_occupancyTex.IsValid() || !m_cb.IsValid())      return cl;
 
     // Nothing to voxelise this frame (e.g. volumetric fog disabled → Renderer
     // skipped SetSceneBindings / PushDraw). Skip the clear too — the grid's
@@ -90,6 +83,11 @@ RHI::CommandList SceneVoxelPass::Execute(RHI::CommandList cl)
     if (m_draws.empty()) return cl;
 
     IGraphicsDevice& gfx = *m_gfx;
+
+    auto* cbMapped = m_cb.Current(gfx);
+    if (!cbMapped) return cl;
+    uint8_t* cbBaseRaw = cbMapped->bytes;
+    const RHI::GPUBuffer& cbBuf = m_cb.CurrentBuffer(gfx);
 
     // Make the 3D texture UAV-writable (it comes back in SR_COMPUTE from the
     // previous frame's LightInject read).
@@ -106,11 +104,10 @@ RHI::CommandList SceneVoxelPass::Execute(RHI::CommandList cl)
     {
         ClearCB cc{};
         cc.gridDim = kGridDim;
-        uint8_t* dst = static_cast<uint8_t*>(m_cbMapped); // slot 0 = clear
-        std::memcpy(dst, &cc, sizeof(cc));
+        std::memcpy(cbBaseRaw, &cc, sizeof(cc)); // slot 0 = clear
 
         gfx.BindComputePipelineState(m_clearPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, 0, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, 0, cl);
         gfx.SetComputeDescriptorTable(kUAVSlot, occupancyUav, cl);
 
         const uint32_t groups = (kGridDim + 7) / 8;
@@ -139,7 +136,7 @@ RHI::CommandList SceneVoxelPass::Execute(RHI::CommandList cl)
             m_gridMax.z - m_gridMin.z
         };
 
-        uint8_t* cbBase = static_cast<uint8_t*>(m_cbMapped);
+        uint8_t* cbBase = cbBaseRaw;
         for (size_t i = 0; i < m_draws.size(); ++i)
         {
             const DrawEntry& d = m_draws[i];
@@ -157,7 +154,7 @@ RHI::CommandList SceneVoxelPass::Execute(RHI::CommandList cl)
             c.numTriangles   = d.triangleCount;
             std::memcpy(cbBase + byteOffset, &c, sizeof(c));
 
-            gfx.SetComputeRootCBV(kCBSlot, m_cb, byteOffset, cl);
+            gfx.SetComputeRootCBV(kCBSlot, cbBuf, byteOffset, cl);
 
             const uint32_t groups = (d.triangleCount + 63) / 64;
             gfx.DispatchCompute(groups, 1, 1, cl);

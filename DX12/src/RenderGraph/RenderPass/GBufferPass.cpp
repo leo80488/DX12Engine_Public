@@ -2,6 +2,7 @@
 #include "Graphics/IGraphicsDevice.h"
 #include "Graphics/GraphicsDX12.h"
 #include "Graphics/RenderTypes.h"
+#include "ECS/HierarchyComponents.h"   // ViewBit (Phase 3 per-view filter)
 #include "RenderGraph/RenderContext.h"
 #include "System/TaskSystem.h"
 #include "System/Log.h"
@@ -139,6 +140,9 @@ PSODesc GBufferPass::BuildPSODesc(PermutationKey perm, uint32_t customPSID) cons
     desc.rs.cull_mode         = perm.Has(PermutationKey::DOUBLE_SIDED)
                                 ? RHI::CullMode::NONE
                                 : RHI::CullMode::BACK;
+    // Global view-mode wireframe (PSOCache hashes rs.fill_mode → distinct PSO).
+    desc.rs.fill_mode         = m_wireframe ? RHI::FillMode::WIREFRAME
+                                            : RHI::FillMode::SOLID;
     desc.rs.depth_clip_enable = true;
     desc.dss.depth_enable     = true;
     desc.dss.depth_write_mask = RHI::DepthWriteMask::ALL;
@@ -219,6 +223,13 @@ void GBufferPass::RecordChunk(RHI::CommandList cl, DrawList draws, size_t begin,
     for (size_t di = begin; di < end; ++di)
     {
         const DrawPacket& dp = draws[di];
+
+        // Phase 3: main pass honors VisibilityComponent.RenderInMainPass and
+        // viewMask. A shadow-only proxy (e.g. invisible character) leaves the
+        // packet in the Opaque list (so it shares the same sort/batch path) but
+        // bails out here before any state binding.
+        if (!dp.renderInMainPass) continue;
+        if ((dp.viewMask & ViewBit::MainCamera) == 0) continue;
 
         const RHI::PipelineState* pso =
             m_psoCache.GetOrCreate(BuildPSODesc(dp.permutation, dp.customPSID));

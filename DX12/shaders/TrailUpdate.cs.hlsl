@@ -57,6 +57,20 @@ void CSMain(uint3 id : SV_DispatchThreadID)
 
         TrailHeader hdr = gHeaders[req.trailSlot];
 
+        // Slot reuse: a trail slot recycled from a destroyed trail still holds
+        // the dead trail's head/count, which would draw frozen ghost segments
+        // (and append on top of them). flags bit0 zeroes the ring so the slot
+        // starts clean. bit1 is a reset-only request (a freed slot with no new
+        // owner this frame) — clear the header so nothing renders, then bail.
+        if (req.flags & 1u) { hdr.head = 0; hdr.count = 0; }
+        if (req.flags & 2u)
+        {
+            hdr.count = 0;
+            hdr.head  = 0;
+            gHeaders[req.trailSlot] = hdr;
+            return;
+        }
+
         // New segment goes at head (ring cursor).
         const uint writeLocal = hdr.head;
         const uint writeGlobal = req.trailSlot * gParams.maxSegments + writeLocal;

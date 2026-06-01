@@ -1,4 +1,6 @@
 #include "Graphics/GraphicsDX12.h"
+#include "Graphics/GraphicsDX12Internal.h"
+#include "Graphics/VideoDecoderDX12.h"
 #include "Graphics/DxcCompiler.h"
 #include "System/Log.h"
 #include <cstring>
@@ -14,9 +16,13 @@
 #include <d3d12sdklayers.h>
 using Microsoft::WRL::ComPtr;
 
-// ===========================================================================
-// ThrowIfFailed
-// ===========================================================================
+// The GPUProfiler readback ring is read with kFrameCount-1 frames of latency
+// to match the swap-chain pipelining. If its ring depth ever diverges from the
+// swap-chain FrameCount, BeginFrame would read a slot whose resolve is still
+// in flight (a data race). The header documents this as a hard requirement;
+// enforce it at compile time.
+static_assert(GPUProfiler::kFrameCount == GraphicsDX12::FrameCount,
+              "GPUProfiler::kFrameCount must match GraphicsDX12::FrameCount");
 
 void ThrowIfFailedImpl(HRESULT hr, const char* expr, const char* file, int line)
 {
@@ -27,339 +33,6 @@ void ThrowIfFailedImpl(HRESULT hr, const char* expr, const char* file, int line)
     }
 }
 
-// ===========================================================================
-// Internal DX12 resource types — stored in per-type pools inside GraphicsDX12.
-// Accessed by GPUResource::handle_id (pool index).  No virtual dispatch, no heap
-// allocation per resource — pools are std::vector<T> grown at creation time.
-// ===========================================================================
-
-struct Texture_DX12
-{
-    ComPtr<ID3D12Resource>  resource;
-    D3D12_RESOURCE_STATES   state = D3D12_RESOURCE_STATE_COMMON;
-    DescriptorAllocation    srv;        // CBV_SRV_UAV shader-visible heap (native format, incl. SRGB)
-    DescriptorAllocation    previewSrv; // UNORM alias SRV for editor preview (only if texture is SRGB)
-    DescriptorAllocation    uav;        // CBV_SRV_UAV shader-visible heap
-    DescriptorAllocation    rtv;        // RTV heap
-    DescriptorAllocation    dsv;        // DSV heap
-    // Per-mip UAVs (only populated when mip_levels > 1 + UAV bind flag).
-    // For TextureCube / Texture2DArray: each UAV views all array slices at that mip.
-    // For Texture3D: volume UAV at that mip. For plain 2D: 2D UAV at that mip.
-    std::vector<DescriptorAllocation> mipUavs;
-    // Per-array-slice DSVs (only populated when array_size > 1 + DEPTH_STENCIL bind flag).
-    // Used by CSM cascades to render/clear one cascade at a time.
-    std::vector<DescriptorAllocation> sliceDsvs;
-
-    // Lazy per-(cube, face, mip) RTVs for cubemap-array render targets — keys
-    // pack as (cubeIdx<<16)|(face<<8)|mip. Allocated on first request from
-    // GetTextureCubeFaceRTVCpuHandle so probes that are never baked don't
-    // burn descriptor slots.
-    std::unordered_map<uint32_t, DescriptorAllocation> cubeFaceRtvs;
-    // Lazy per-(cube, mip) UAVs viewing the 6 slices [cubeIdx*6..+5] at one
-    // mip — feeds the prefilter compute shader. Key = (cubeIdx<<8)|mip.
-    std::unordered_map<uint32_t, DescriptorAllocation> cubeMipUavs;
-};
-
-struct GPUBuffer_DX12
-{
-    ComPtr<ID3D12Resource>   resource;
-    D3D12_RESOURCE_STATES    state = D3D12_RESOURCE_STATE_COMMON;
-    D3D12_VERTEX_BUFFER_VIEW vbv{};
-    D3D12_INDEX_BUFFER_VIEW  ibv{};
-    DescriptorAllocation     cbv;   // CBV_SRV_UAV shader-visible heap
-    DescriptorAllocation     srv;   // CBV_SRV_UAV shader-visible heap (structured/typed)
-    DescriptorAllocation     uav;   // CBV_SRV_UAV shader-visible heap
-};
-
-struct Shader_DX12
-{
-    std::vector<uint8_t> bytecode;
-    // Content-addressed hash of `bytecode`, computed once at CreateShader
-    // time. Used by ComputePSOName's fallback so compute/post PSOs (which
-    // don't go through PSOCache to set a stable cache_key) still get
-    // deterministic names across runs — without it, every launch generated
-    // new disk-library entries and pso_cache.bin grew unbounded.
-    uint64_t             bytecodeHash = 0;
-};
-
-struct PipelineState_DX12
-{
-    ComPtr<ID3D12PipelineState>    pso;
-    ComPtr<ID3D12RootSignature>    rootSignature;
-    bool                           isCompute = false;
-};
-
-
-// ===========================================================================
-// Root signature slot constants (PVF layout)
-// [0]      ROOT_CONSTANTS 3×uint32 b0              → meshDescIdx / instanceOffset / materialIndex
-// [1..7]   ROOT_CBV b1-b7                          → BindConstantBuffer(slot 0-6)
-// [8]      ROOT_SRV t0 space0                       → InstanceBuffer
-// [9]      ROOT_SRV t1 space0                       → MeshDescriptors
-// [10..13] DESC_TABLE 1 SRV each t2-t5 space0       → BindResource(slot 0-3)
-// [14]     DESC_TABLE 64 SRV t0 space1              → bindless g_Buffers[]
-// [15..18] DESC_TABLE 1 sampler each s0-s3          → BindSampler(slot 0-3)
-// ===========================================================================
-static constexpr UINT kRootConstantsSlot  =  0;
-static constexpr UINT kCBVSlotBase        =  1;   // root params 1-7  → b1-b7
-static constexpr UINT kCBVSlotCount       =  7;
-static constexpr UINT kInstanceBufSlot    =  8;   // root param 8     → t0 space0
-static constexpr UINT kMeshDescSlot       =  9;   // root param 9     → t1 space0
-static constexpr UINT kSRVSlotBase        = 10;   // root params 10-13 → t2-t5 space0
-static constexpr UINT kSRVSlotCount       =  4;
-static constexpr UINT kBindlessSlot       = 14;   // root param 14    → t0 space1 (64 slots)
-static constexpr UINT kSamplerSlotBase    = 15;   // root params 15-18 → s0-s3
-static constexpr UINT kSamplerSlotCount   =  4;
-static constexpr UINT kIBLSRVSlotBase     = 19;   // root params 19-21 → t6-t8 space0 (IBL cubemaps + BRDF LUT)
-static constexpr UINT kIBLSRVSlotCount    =  3;
-static constexpr UINT kShadowSRVSlot      = 22;   // root param 22     → t9-t11 space0 (CSM shadow cascade array, 3 entries)
-static constexpr UINT kShadowSRVCount     =  3;
-static constexpr UINT kClusterSRVSlotBase = 23;   // root params 23-25 → t10-t12 space0 (clustered lights, index list, grid)
-static constexpr UINT kClusterSRVSlotCount=  3;
-static constexpr UINT kMaxBindlessBuffers = 4096;  // must match kMaxBuffers in MeshDescriptorHeap.h and g_Buffers[] in pvf_fetch.hlsli
-
-// ===========================================================================
-// DX12 enum / format conversion helpers
-// ===========================================================================
-
-DXGI_FORMAT GraphicsDX12::ToDxgiFormat(RHI::Format f)
-{
-    switch (f)
-    {
-    case RHI::Format::UNKNOWN:               return DXGI_FORMAT_UNKNOWN;
-    case RHI::Format::R32G32B32A32_FLOAT:    return DXGI_FORMAT_R32G32B32A32_FLOAT;
-    case RHI::Format::R32G32B32A32_UINT:     return DXGI_FORMAT_R32G32B32A32_UINT;
-    case RHI::Format::R32G32B32A32_SINT:     return DXGI_FORMAT_R32G32B32A32_SINT;
-    case RHI::Format::R32G32B32_FLOAT:       return DXGI_FORMAT_R32G32B32_FLOAT;
-    case RHI::Format::R32G32B32_UINT:        return DXGI_FORMAT_R32G32B32_UINT;
-    case RHI::Format::R32G32B32_SINT:        return DXGI_FORMAT_R32G32B32_SINT;
-    case RHI::Format::R16G16B16A16_FLOAT:    return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    case RHI::Format::R16G16B16A16_UNORM:    return DXGI_FORMAT_R16G16B16A16_UNORM;
-    case RHI::Format::R16G16B16A16_UINT:     return DXGI_FORMAT_R16G16B16A16_UINT;
-    case RHI::Format::R16G16B16A16_SNORM:    return DXGI_FORMAT_R16G16B16A16_SNORM;
-    case RHI::Format::R16G16B16A16_SINT:     return DXGI_FORMAT_R16G16B16A16_SINT;
-    case RHI::Format::R32G32_FLOAT:          return DXGI_FORMAT_R32G32_FLOAT;
-    case RHI::Format::R32G32_UINT:           return DXGI_FORMAT_R32G32_UINT;
-    case RHI::Format::R32G32_SINT:           return DXGI_FORMAT_R32G32_SINT;
-    case RHI::Format::D32_FLOAT_S8X24_UINT:  return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-    case RHI::Format::R10G10B10A2_UNORM:     return DXGI_FORMAT_R10G10B10A2_UNORM;
-    case RHI::Format::R10G10B10A2_UINT:      return DXGI_FORMAT_R10G10B10A2_UINT;
-    case RHI::Format::R11G11B10_FLOAT:       return DXGI_FORMAT_R11G11B10_FLOAT;
-    case RHI::Format::R8G8B8A8_UNORM:        return DXGI_FORMAT_R8G8B8A8_UNORM;
-    case RHI::Format::R8G8B8A8_UNORM_SRGB:  return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-    case RHI::Format::R8G8B8A8_UINT:         return DXGI_FORMAT_R8G8B8A8_UINT;
-    case RHI::Format::R8G8B8A8_SNORM:        return DXGI_FORMAT_R8G8B8A8_SNORM;
-    case RHI::Format::R8G8B8A8_SINT:         return DXGI_FORMAT_R8G8B8A8_SINT;
-    case RHI::Format::B8G8R8A8_UNORM:        return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case RHI::Format::B8G8R8A8_UNORM_SRGB:  return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-    case RHI::Format::R16G16_FLOAT:          return DXGI_FORMAT_R16G16_FLOAT;
-    case RHI::Format::R16G16_UNORM:          return DXGI_FORMAT_R16G16_UNORM;
-    case RHI::Format::R16G16_UINT:           return DXGI_FORMAT_R16G16_UINT;
-    case RHI::Format::R16G16_SNORM:          return DXGI_FORMAT_R16G16_SNORM;
-    case RHI::Format::R16G16_SINT:           return DXGI_FORMAT_R16G16_SINT;
-    case RHI::Format::D32_FLOAT:             return DXGI_FORMAT_D32_FLOAT;
-    case RHI::Format::R32_FLOAT:             return DXGI_FORMAT_R32_FLOAT;
-    case RHI::Format::R32_UINT:              return DXGI_FORMAT_R32_UINT;
-    case RHI::Format::R32_SINT:              return DXGI_FORMAT_R32_SINT;
-    case RHI::Format::D24_UNORM_S8_UINT:     return DXGI_FORMAT_D24_UNORM_S8_UINT;
-    case RHI::Format::R9G9B9E5_SHAREDEXP:    return DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
-    case RHI::Format::R8G8_UNORM:            return DXGI_FORMAT_R8G8_UNORM;
-    case RHI::Format::R8G8_UINT:             return DXGI_FORMAT_R8G8_UINT;
-    case RHI::Format::R8G8_SNORM:            return DXGI_FORMAT_R8G8_SNORM;
-    case RHI::Format::R8G8_SINT:             return DXGI_FORMAT_R8G8_SINT;
-    case RHI::Format::R16_FLOAT:             return DXGI_FORMAT_R16_FLOAT;
-    case RHI::Format::D16_UNORM:             return DXGI_FORMAT_D16_UNORM;
-    case RHI::Format::R16_UNORM:             return DXGI_FORMAT_R16_UNORM;
-    case RHI::Format::R16_UINT:              return DXGI_FORMAT_R16_UINT;
-    case RHI::Format::R16_SNORM:             return DXGI_FORMAT_R16_SNORM;
-    case RHI::Format::R16_SINT:              return DXGI_FORMAT_R16_SINT;
-    case RHI::Format::R8_UNORM:              return DXGI_FORMAT_R8_UNORM;
-    case RHI::Format::R8_UINT:               return DXGI_FORMAT_R8_UINT;
-    case RHI::Format::R8_SNORM:              return DXGI_FORMAT_R8_SNORM;
-    case RHI::Format::R8_SINT:               return DXGI_FORMAT_R8_SINT;
-    case RHI::Format::BC1_UNORM:             return DXGI_FORMAT_BC1_UNORM;
-    case RHI::Format::BC1_UNORM_SRGB:        return DXGI_FORMAT_BC1_UNORM_SRGB;
-    case RHI::Format::BC2_UNORM:             return DXGI_FORMAT_BC2_UNORM;
-    case RHI::Format::BC2_UNORM_SRGB:        return DXGI_FORMAT_BC2_UNORM_SRGB;
-    case RHI::Format::BC3_UNORM:             return DXGI_FORMAT_BC3_UNORM;
-    case RHI::Format::BC3_UNORM_SRGB:        return DXGI_FORMAT_BC3_UNORM_SRGB;
-    case RHI::Format::BC4_UNORM:             return DXGI_FORMAT_BC4_UNORM;
-    case RHI::Format::BC4_SNORM:             return DXGI_FORMAT_BC4_SNORM;
-    case RHI::Format::BC5_UNORM:             return DXGI_FORMAT_BC5_UNORM;
-    case RHI::Format::BC5_SNORM:             return DXGI_FORMAT_BC5_SNORM;
-    case RHI::Format::BC6H_UF16:             return DXGI_FORMAT_BC6H_UF16;
-    case RHI::Format::BC6H_SF16:             return DXGI_FORMAT_BC6H_SF16;
-    case RHI::Format::BC7_UNORM:             return DXGI_FORMAT_BC7_UNORM;
-    case RHI::Format::BC7_UNORM_SRGB:        return DXGI_FORMAT_BC7_UNORM_SRGB;
-    case RHI::Format::NV12:                  return DXGI_FORMAT_NV12;
-    default:                                 return DXGI_FORMAT_UNKNOWN;
-    }
-}
-
-D3D12_RESOURCE_STATES GraphicsDX12::ToD3D12ResourceState(RHI::ResourceState s)
-{
-    // Map the first set bit (single state assumed)
-    using RS = RHI::ResourceState;
-    switch (s)
-    {
-    case RS::UNDEFINED:                         return D3D12_RESOURCE_STATE_COMMON;
-    case RS::SHADER_RESOURCE:                   return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    case RS::SHADER_RESOURCE_COMPUTE:           return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    case RS::UNORDERED_ACCESS:                  return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-    case RS::COPY_SRC:                          return D3D12_RESOURCE_STATE_COPY_SOURCE;
-    case RS::COPY_DST:                          return D3D12_RESOURCE_STATE_COPY_DEST;
-    case RS::RENDERTARGET:                      return D3D12_RESOURCE_STATE_RENDER_TARGET;
-    case RS::DEPTHSTENCIL:                      return D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    case RS::DEPTHSTENCIL_READONLY:             return D3D12_RESOURCE_STATE_DEPTH_READ;
-    case RS::DEPTH_READ_SRV:                    return D3D12_RESOURCE_STATE_DEPTH_READ |
-                                                       D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                                                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-    case RS::VERTEX_BUFFER:                     return D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-    case RS::INDEX_BUFFER:                      return D3D12_RESOURCE_STATE_INDEX_BUFFER;
-    case RS::CONSTANT_BUFFER:                   return D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-    case RS::INDIRECT_ARGUMENT:                 return D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-    case RS::RAYTRACING_ACCELERATION_STRUCTURE: return D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
-    case RS::PREDICATION:                       return D3D12_RESOURCE_STATE_PREDICATION;
-    default:                                    return D3D12_RESOURCE_STATE_COMMON;
-    }
-}
-
-D3D12_FILTER GraphicsDX12::ToD3D12Filter(RHI::Filter f)
-{
-    switch (f)
-    {
-    case RHI::Filter::MIN_MAG_MIP_POINT:              return D3D12_FILTER_MIN_MAG_MIP_POINT;
-    case RHI::Filter::MIN_MAG_POINT_MIP_LINEAR:       return D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
-    case RHI::Filter::MIN_POINT_MAG_LINEAR_MIP_POINT: return D3D12_FILTER_MIN_POINT_MAG_LINEAR_MIP_POINT;
-    case RHI::Filter::MIN_POINT_MAG_MIP_LINEAR:       return D3D12_FILTER_MIN_POINT_MAG_MIP_LINEAR;
-    case RHI::Filter::MIN_LINEAR_MAG_MIP_POINT:       return D3D12_FILTER_MIN_LINEAR_MAG_MIP_POINT;
-    case RHI::Filter::MIN_LINEAR_MAG_POINT_MIP_LINEAR:return D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
-    case RHI::Filter::MIN_MAG_LINEAR_MIP_POINT:       return D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
-    case RHI::Filter::MIN_MAG_MIP_LINEAR:             return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    case RHI::Filter::ANISOTROPIC:                    return D3D12_FILTER_ANISOTROPIC;
-    case RHI::Filter::COMPARISON_MIN_MAG_MIP_POINT:   return D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
-    case RHI::Filter::COMPARISON_MIN_MAG_MIP_LINEAR:  return D3D12_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR;
-    case RHI::Filter::COMPARISON_ANISOTROPIC:         return D3D12_FILTER_COMPARISON_ANISOTROPIC;
-    default:                                          return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    }
-}
-
-D3D12_TEXTURE_ADDRESS_MODE GraphicsDX12::ToD3D12AddressMode(RHI::TextureAddressMode m)
-{
-    switch (m)
-    {
-    case RHI::TextureAddressMode::WRAP:        return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    case RHI::TextureAddressMode::MIRROR:      return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
-    case RHI::TextureAddressMode::CLAMP:       return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    case RHI::TextureAddressMode::BORDER:      return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
-    case RHI::TextureAddressMode::MIRROR_ONCE: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
-    default:                                   return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-    }
-}
-
-D3D12_COMPARISON_FUNC GraphicsDX12::ToD3D12ComparisonFunc(RHI::ComparisonFunc f)
-{
-    switch (f)
-    {
-    case RHI::ComparisonFunc::NEVER:         return D3D12_COMPARISON_FUNC_NEVER;
-    case RHI::ComparisonFunc::LESS:          return D3D12_COMPARISON_FUNC_LESS;
-    case RHI::ComparisonFunc::EQUAL:         return D3D12_COMPARISON_FUNC_EQUAL;
-    case RHI::ComparisonFunc::LESS_EQUAL:    return D3D12_COMPARISON_FUNC_LESS_EQUAL;
-    case RHI::ComparisonFunc::GREATER:       return D3D12_COMPARISON_FUNC_GREATER;
-    case RHI::ComparisonFunc::NOT_EQUAL:     return D3D12_COMPARISON_FUNC_NOT_EQUAL;
-    case RHI::ComparisonFunc::GREATER_EQUAL: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-    case RHI::ComparisonFunc::ALWAYS:        return D3D12_COMPARISON_FUNC_ALWAYS;
-    default:                                 return D3D12_COMPARISON_FUNC_NEVER;
-    }
-}
-
-D3D12_BLEND GraphicsDX12::ToD3D12Blend(RHI::Blend b)
-{
-    switch (b)
-    {
-    case RHI::Blend::ZERO:             return D3D12_BLEND_ZERO;
-    case RHI::Blend::ONE:              return D3D12_BLEND_ONE;
-    case RHI::Blend::SRC_COLOR:        return D3D12_BLEND_SRC_COLOR;
-    case RHI::Blend::INV_SRC_COLOR:    return D3D12_BLEND_INV_SRC_COLOR;
-    case RHI::Blend::SRC_ALPHA:        return D3D12_BLEND_SRC_ALPHA;
-    case RHI::Blend::INV_SRC_ALPHA:    return D3D12_BLEND_INV_SRC_ALPHA;
-    case RHI::Blend::DEST_ALPHA:       return D3D12_BLEND_DEST_ALPHA;
-    case RHI::Blend::INV_DEST_ALPHA:   return D3D12_BLEND_INV_DEST_ALPHA;
-    case RHI::Blend::DEST_COLOR:       return D3D12_BLEND_DEST_COLOR;
-    case RHI::Blend::INV_DEST_COLOR:   return D3D12_BLEND_INV_DEST_COLOR;
-    case RHI::Blend::SRC_ALPHA_SAT:    return D3D12_BLEND_SRC_ALPHA_SAT;
-    case RHI::Blend::BLEND_FACTOR:     return D3D12_BLEND_BLEND_FACTOR;
-    case RHI::Blend::INV_BLEND_FACTOR: return D3D12_BLEND_INV_BLEND_FACTOR;
-    case RHI::Blend::SRC1_COLOR:       return D3D12_BLEND_SRC1_COLOR;
-    case RHI::Blend::INV_SRC1_COLOR:   return D3D12_BLEND_INV_SRC1_COLOR;
-    case RHI::Blend::SRC1_ALPHA:       return D3D12_BLEND_SRC1_ALPHA;
-    case RHI::Blend::INV_SRC1_ALPHA:   return D3D12_BLEND_INV_SRC1_ALPHA;
-    default:                           return D3D12_BLEND_ZERO;
-    }
-}
-
-D3D12_BLEND_OP GraphicsDX12::ToD3D12BlendOp(RHI::BlendOp op)
-{
-    switch (op)
-    {
-    case RHI::BlendOp::ADD:          return D3D12_BLEND_OP_ADD;
-    case RHI::BlendOp::SUBTRACT:     return D3D12_BLEND_OP_SUBTRACT;
-    case RHI::BlendOp::REV_SUBTRACT: return D3D12_BLEND_OP_REV_SUBTRACT;
-    case RHI::BlendOp::MIN:          return D3D12_BLEND_OP_MIN;
-    case RHI::BlendOp::MAX:          return D3D12_BLEND_OP_MAX;
-    default:                         return D3D12_BLEND_OP_ADD;
-    }
-}
-
-D3D12_FILL_MODE GraphicsDX12::ToD3D12FillMode(RHI::FillMode m)
-{
-    return (m == RHI::FillMode::WIREFRAME) ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
-}
-
-D3D12_CULL_MODE GraphicsDX12::ToD3D12CullMode(RHI::CullMode m)
-{
-    switch (m)
-    {
-    case RHI::CullMode::NONE:  return D3D12_CULL_MODE_NONE;
-    case RHI::CullMode::FRONT: return D3D12_CULL_MODE_FRONT;
-    case RHI::CullMode::BACK:  return D3D12_CULL_MODE_BACK;
-    default:                   return D3D12_CULL_MODE_NONE;
-    }
-}
-
-D3D12_RESOURCE_FLAGS GraphicsDX12::ToD3D12ResourceFlags(RHI::BindFlag flags)
-{
-    D3D12_RESOURCE_FLAGS out = D3D12_RESOURCE_FLAG_NONE;
-    auto f = static_cast<uint32_t>(flags);
-    if (f & static_cast<uint32_t>(RHI::BindFlag::RENDER_TARGET))    out |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    if (f & static_cast<uint32_t>(RHI::BindFlag::DEPTH_STENCIL))    out |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    if (f & static_cast<uint32_t>(RHI::BindFlag::UNORDERED_ACCESS)) out |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-    return out;
-}
-
-D3D12_HEAP_TYPE GraphicsDX12::ToD3D12HeapType(RHI::Usage usage)
-{
-    switch (usage)
-    {
-    case RHI::Usage::UPLOAD:   return D3D12_HEAP_TYPE_UPLOAD;
-    case RHI::Usage::READBACK: return D3D12_HEAP_TYPE_READBACK;
-    default:                   return D3D12_HEAP_TYPE_DEFAULT;
-    }
-}
-
-D3D12_PRIMITIVE_TOPOLOGY GraphicsDX12::ToD3D12Topology(RHI::PrimitiveTopology t)
-{
-    switch (t)
-    {
-    case RHI::PrimitiveTopology::POINTLIST:     return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-    case RHI::PrimitiveTopology::LINELIST:      return D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-    case RHI::PrimitiveTopology::LINESTRIP:     return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;
-    case RHI::PrimitiveTopology::TRIANGLELIST:  return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    case RHI::PrimitiveTopology::TRIANGLESTRIP: return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
-    default:                                    return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-    }
-}
 
 // ===========================================================================
 // Default root signature builder
@@ -367,25 +40,7 @@ D3D12_PRIMITIVE_TOPOLOGY GraphicsDX12::ToD3D12Topology(RHI::PrimitiveTopology t)
 
 ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
 {
-    // PVF root signature — 23 parameters, no IA input layout flag.
-    //  [0]      ROOT_CONSTANTS 3×uint32 b0 space0
-    //  [1..7]   ROOT_CBV b1-b7 space0
-    //  [8]      ROOT_SRV t0 space0  (InstanceBuffer)
-    //  [9]      ROOT_SRV t1 space0  (MeshDescriptors)
-    //  [10..13] DESC_TABLE 1 SRV t2-t5 space0
-    //  [14]     DESC_TABLE 64 SRV t0 space1 (bindless g_Buffers[])
-    //  [15..18] DESC_TABLE 1 sampler s0-s3
-    //  [19..21] DESC_TABLE 1 SRV t6-t8 space0 (IBL irradiance / radiance cubemaps + BRDF LUT)
-    //  [22]     DESC_TABLE 3 SRV t9-t11 space0 (CSM shadow cascade maps)
-    //  [23..25] DESC_TABLE 1 SRV t13-t15 space0 (clustered lights, index list, grid)
-    //  [26]     DESC_TABLE 1 SRV t16 space0 (NPR ramp texture)
-    //  [27]     DESC_TABLE N SRV t0 space2 (bindless texture array)
-    //  [28]     DESC_TABLE 1 SRV t12 space0 (MaterialBuffer)
-    //  [29]     DESC_TABLE 1 SRV t17 space0 (GBuffer emissive)
-    //  [30]     DESC_TABLE 1 SRV t18 space0 (SSAO / XeGTAO)
-    //  [31]     DESC_TABLE 1 SRV t19 space0 (Sky SH coefficient buffer — StructuredBuffer<float4>)
-    //  [32]     DESC_TABLE 1 SRV t20 space0 (Aerial Perspective 3D LUT — Texture3D<float4>)
-
+    // Full slot map lives in the GraphicsDX12.h class-banner comment.
     constexpr UINT kRampTexSlot      = 26; // t16 space0 — NPR ramp texture
     constexpr UINT kBindlessTexSlot  = 27; // t0 space2 — bindless texture array
     constexpr UINT kMaterialBufSlot  = 28; // t12 space0 — MaterialBuffer (for NPR per-material params)
@@ -405,16 +60,9 @@ ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
     constexpr UINT kReflectionProbeGridSlot   = 39; // t25 space0 — StructuredBuffer<ProbeGridEntry>
     constexpr UINT kReflectionProbeIndexSlot  = 40; // t26 space0 — StructuredBuffer<uint> probe index list
     constexpr UINT kSSRResultSlot             = 41; // t27 space0 — Texture2D<float4> SSR trace (prev-frame)
-    // DDGI bindings — multi-volume. Each per-volume table holds DDGI_MAX_VOLUMES
-    // contiguous SRVs into the GPU heap, populated by DDGIVolumeManager when a
-    // slot is allocated/freed. Lighting.ps loops `vi < ddgiVolumeCount` to skip
-    // unused entries (which still hold valid null SRVs to satisfy validation).
-    //
-    // Register layout (must match Lighting.ps.hlsl + DDGICommon.hlsli DDGI_MAX_VOLUMES):
-    //   t28           — StructuredBuffer<DDGIVolumeGPU> (single, count gates loop)
-    //   t29..t32      — StructuredBuffer<DDGIProbeSH>[4]
-    //   t33..t36      — Texture2D<float2>[4] (depth atlas)
-    //   t37..t40      — StructuredBuffer<DDGIProbeData>[4]
+    // DDGI multi-volume: each per-volume table holds DDGI_MAX_VOLUMES SRVs.
+    // Lighting.ps gates the read via `vi < ddgiVolumeCount`; unused entries
+    // still hold null SRVs for validation. Must match Lighting.ps.hlsl + DDGICommon.hlsli.
     constexpr UINT kDDGIMaxVolumes      = 4; // mirror of DDGI::kMaxVolumes / DDGI_MAX_VOLUMES
     constexpr UINT kDDGIVolumeBufSlot   = 42; // t28 space0
     constexpr UINT kDDGIProbeSHSlot     = 43; // t29..t32 space0 (NumDescriptors=4)
@@ -468,7 +116,7 @@ ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
         params[kSRVSlotBase + i].ShaderVisibility          = D3D12_SHADER_VISIBILITY_ALL;
     }
 
-    // [14] Descriptor table — 64 SRVs at t0 space1 (bindless g_Buffers[])
+    // [14] Descriptor table — kMaxBindlessBuffers SRVs at t0 space1 (bindless g_Buffers[])
     static D3D12_DESCRIPTOR_RANGE bindlessRange = {};
     bindlessRange.RangeType                         = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     bindlessRange.NumDescriptors                    = kMaxBindlessBuffers;
@@ -826,39 +474,7 @@ ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
 
 Microsoft::WRL::ComPtr<ID3D12RootSignature> GraphicsDX12::CreateComputeRootSignature()
 {
-    // [0] ROOT_CBV       b0 space2   — SkinJobDesc / generic compute CB
-    // [1] DESC_TABLE  1x SRV t0 space2 — rest positions
-    // [2] DESC_TABLE  1x SRV t1 space2 — rest normals
-    // [3] DESC_TABLE  1x SRV t2 space2 — blend data
-    // [4] DESC_TABLE  1x UAV u0 space2 — output positions
-    // [5] DESC_TABLE  1x UAV u1 space2 — output normals
-    // [6] DESC_TABLE  1x SRV t5 space2 — morph weights (ByteAddressBuffer)
-    // [7] DESC_TABLE  1x SRV t3 space2 — pose matrices
-    // [8] DESC_TABLE  1x SRV t4 space2 — morph target deltas
-    //   NEW — only used by SceneVoxelize.cs, harmlessly ignored by others:
-    // [9]  DESC_TABLE 1 SRV t0 space0 — StructuredBuffer<GPUInstanceData>
-    // [10] DESC_TABLE 1 SRV t1 space0 — StructuredBuffer<MeshDescriptor>
-    // [11] DESC_TABLE N SRV t0 space1 — bindless ByteAddressBuffer g_Buffers[]
-    //   NEW — used by FroxelLightInject.cs to sample SpotShadowPass:
-    // [12] DESC_TABLE 1 SRV t6 space2 — Texture2DArray<float> spot shadow atlas
-    // [13] DESC_TABLE 1 SRV t7 space2 — StructuredBuffer<float4x4> per-slice VPs
-    //   NEW — used by XeGTAO depth prefilter (5-mip pyramid in one dispatch):
-    // [14] DESC_TABLE 1 UAV u2 space2
-    // [15] DESC_TABLE 1 UAV u3 space2
-    // [16] DESC_TABLE 1 UAV u4 space2
-    // static samplers (s0/s1 space2) stay the same; s1 is the comparison
-    // sampler and gets reused for atlas PCF taps.
-
-    // [14] DESC_TABLE 1 UAV u2 space2 ─┐
-    // [15] DESC_TABLE 1 UAV u3 space2  ├─ extra UAV slots for XeGTAO prefilter,
-    // [16] DESC_TABLE 1 UAV u4 space2 ─┘  which writes 5 mip levels in one
-    //      dispatch (u0..u4, matching Intel's XeGTAO_PrefilterDepths16x16).
-    //      Legal to leave these unbound for other compute shaders — they
-    //      simply don't reference the registers.
-    // [17] DESC_TABLE N SRV t0 space3 — bindless Texture2D[] (same heap region
-    //      as graphics slot kBindlessTexSlot). Used by DecalApply.cs to sample
-    //      decal textures through a material's bindlessIndex. Unbound leaves
-    //      it undefined, harmless when the shader never references t*space3.
+    // Full slot map lives in the GraphicsDX12.h class-banner comment.
     CD3DX12_ROOT_PARAMETER1 params[18];
     params[0].InitAsConstantBufferView(0, 2, D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
                                        D3D12_SHADER_VISIBILITY_ALL);
@@ -884,13 +500,8 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> GraphicsDX12::CreateComputeRootSigna
     params[5].InitAsDescriptorTable(1, &uavRanges[1], D3D12_SHADER_VISIBILITY_ALL);
     params[6].InitAsDescriptorTable(1, &srvRange5,    D3D12_SHADER_VISIBILITY_ALL);
 
-    // [9], [10] — mirror of graphics [8], [9] so compute can do the same PVF
-    // fetch. Filled only when SceneVoxelize runs; other compute shaders just
-    // don't touch these root params (legal: the runtime leaves the descriptor
-    // table pointer undefined if the shader never references the registers).
-    // We use descriptor tables (not root SRVs) because the existing RHI
-    // compute helper surface exposes SetComputeDescriptorTable(handle) and we
-    // get those GPU handles straight from GetBufferSRVGpuHandle().
+    // [9], [10] — mirror of graphics [8], [9] for PVF under compute. Only
+    // SceneVoxelize binds them today; unused slots are legal.
     static CD3DX12_DESCRIPTOR_RANGE1 instanceRange;
     static CD3DX12_DESCRIPTOR_RANGE1 meshDescRange;
     instanceRange.Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0); // t0 space0
@@ -1004,7 +615,10 @@ GraphicsDX12::GraphicsDX12(HWND hWnd, UINT width, UINT height)
     LoadAssets();
     // ImGui init lives in the editor (EditorImGuiBridge::Attach) — engine is
     // UI-agnostic. Game builds never touch ImGui at all.
-    m_gpuProfiler.Init(m_device.Get(), m_commandQueue.Get());
+    m_gpuProfiler.Init(m_device.Get(),
+                       m_queues[0].Get(),  // GRAPHICS
+                       m_queues[1].Get(),  // COMPUTE
+                       m_queues[2].Get()); // COPY
 
     // Pre-reserve the command-list pointer table so that concurrent calls to
     // BeginCommandList (from render workers) never trigger a vector reallocation
@@ -1023,6 +637,12 @@ GraphicsDX12::~GraphicsDX12()
     }
 
     if (m_fenceEvent) { CloseHandle(m_fenceEvent); m_fenceEvent = nullptr; }
+
+    // Release the video backend before any other DX12 objects — its
+    // destructor CPU-blocks on the video queue + drops decoder ComPtrs.
+    // Doing it here (instead of letting member-order destruction handle it)
+    // keeps the ID3D12Device alive while the video resources unwind.
+    m_videoBackend.reset();
 
     // Release all resource pools + command-list pool *before* live-object reporting.
     // Otherwise ReportLiveDeviceObjects() will list objects that are only still
@@ -1115,19 +735,6 @@ GraphicsDX12::~GraphicsDX12()
     // Member ComPtr destructors release the rest (device, factory, heaps, pools).
 }
 
-// ===========================================================================
-// DX12 translation helper — queue type
-// ===========================================================================
-
-D3D12_COMMAND_LIST_TYPE GraphicsDX12::ToD3D12CommandListType(RHI::QUEUE_TYPE q)
-{
-    switch (q)
-    {
-    case RHI::QUEUE_TYPE::COMPUTE: return D3D12_COMMAND_LIST_TYPE_COMPUTE;
-    case RHI::QUEUE_TYPE::COPY:    return D3D12_COMMAND_LIST_TYPE_COPY;
-    default:                       return D3D12_COMMAND_LIST_TYPE_DIRECT;
-    }
-}
 
 // ===========================================================================
 // Pool helpers
@@ -1586,6 +1193,11 @@ void GraphicsDX12::WaitForPreviousFrame()
     // current backbuffer's), so Resize / destructors can safely Release resources.
     ProcessAllDeferredReleases();
 
+    // GPU is fully idle, so every fence-keyed entry's target value must have
+    // completed too. Drain them so callers (e.g. ~GraphicsDX12, Resize) see
+    // a fully-empty release queue.
+    ProcessFenceKeyedReleases();
+
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 }
 
@@ -1605,7 +1217,39 @@ void GraphicsDX12::ProcessDeferredReleases(uint32_t idx)
     // Return pool slots to their free lists.
     std::lock_guard<std::mutex> lk(m_resourceMutex);
     for (uint32_t s : local.bufferSlots)  m_bufferFreeList.push_back(s);
-    for (uint32_t s : local.textureSlots) m_textureFreeList.push_back(s);
+    if (!local.textureSlots.empty())
+    {
+        // Null each freed texture's bindless-table slot before recycling it.
+        // CreateTexture CopyDescriptorsSimple'd the texture's SRV into the
+        // GPU-visible bindless heap at slot [handle_id]; DestroyTexture frees
+        // only the source DescriptorAllocation, leaving that COPY dangling at a
+        // released resource. A shader still holding the recycled bindless index
+        // would then sample a dead descriptor — or, if the slot is later reused
+        // by a non-SRV (RTV/DSV/UAV-only) texture, the stale SRV survives
+        // indefinitely. Nulling here is safe: this drains FrameCount frames
+        // after Destroy, so the GPU is provably done with the slot. Symmetric
+        // with the null-fill at Init. Serialized with CreateTexture's bindless
+        // write via m_resourceMutex (held here).
+        const bool tableValid = m_bindlessTexTable.IsValid();
+        const UINT descInc = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv{};
+        nullSrv.Format                  = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullSrv.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullSrv.Texture2D.MipLevels     = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE base = tableValid
+            ? m_bindlessTexTable.GetGpuCpuHandle() : D3D12_CPU_DESCRIPTOR_HANDLE{};
+        for (uint32_t s : local.textureSlots)
+        {
+            if (tableValid && s < kMaxBindlessTextures)
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE dst = base;
+                dst.ptr += static_cast<SIZE_T>(s) * descInc;
+                m_device->CreateShaderResourceView(nullptr, &nullSrv, dst);
+            }
+            m_textureFreeList.push_back(s);
+        }
+    }
 }
 
 void GraphicsDX12::ProcessAllDeferredReleases()
@@ -1630,61 +1274,6 @@ void GraphicsDX12::FlushAndWait()
     }
 }
 
-void GraphicsDX12::BeginBufferUploadBatch()
-{
-    // Nested scopes are flattened into a counter — only the outermost pair
-    // triggers a flush. The upload command list is already "open" for
-    // recording (Reset at the end of LoadAssets / FlushUploadAndWait), so
-    // buffers created inside the scope simply accumulate copies on it.
-    ++m_batchUploadDepth;
-}
-
-void GraphicsDX12::EndBufferUploadBatch()
-{
-    if (m_batchUploadDepth == 0)
-    {
-        LOG_ERROR("EndBufferUploadBatch called without matching Begin");
-        return;
-    }
-    --m_batchUploadDepth;
-    if (m_batchUploadDepth == 0)
-    {
-        // Final flush for any staging still queued. Mid-batch auto-flushes
-        // may have already trimmed this down, but there's usually a last
-        // unflushed tail smaller than kBatchFlushBytes.
-        FlushUploadAndWait();
-        m_batchStagingKeepAlive.clear();
-        m_batchStagingBytes = 0;
-    }
-}
-
-void GraphicsDX12::FlushBatchStagingIfNeeded()
-{
-    if (m_batchStagingBytes    < kBatchFlushBytes &&
-        m_batchStagingKeepAlive.size() < kBatchFlushCount)
-        return;
-
-    // Mid-batch flush: execute the accumulated copies, wait for GPU to
-    // complete (so staging buffers are safe to release), then reset. Scope
-    // stays open — m_batchUploadDepth is unchanged and subsequent
-    // CreateBuffer calls keep deferring per-buffer waits.
-    FlushUploadAndWait();
-    m_batchStagingKeepAlive.clear();
-    m_batchStagingBytes = 0;
-}
-
-void GraphicsDX12::FlushUploadAndWait()
-{
-    ThrowIfFailed(m_commandList->Close());
-    ID3D12CommandList* lists[] = { m_commandList.Get() };
-    m_commandQueue->ExecuteCommandLists(1, lists);
-    // Use FlushAndWait (not WaitForPreviousFrame) so we don't mutate m_frameIndex
-    // mid-frame when this is called from TextureSystem::Tick after BeginFrame.
-    FlushAndWait();
-    // Re-open for subsequent staging commands
-    ThrowIfFailed(m_uploadAllocator->Reset());
-    ThrowIfFailed(m_commandList->Reset(m_uploadAllocator.Get(), nullptr));
-}
 
 // ===========================================================================
 // HDR render target
@@ -1752,45 +1341,65 @@ void GraphicsDX12::ReleaseHdrRenderTarget()
 // Frame lifecycle
 // ===========================================================================
 
-RHI::CommandList GraphicsDX12::BeginFrame()
+void GraphicsDX12::WaitForNextFrameSlot()
 {
-    // Full drain — wait for ALL previous GPU work to finish before the new frame.
-    // Pipelined wait (only waiting on the fence from FrameCount frames ago) was
-    // suspected of causing a startup flicker; reverted to the safe semantics so
-    // every call-site that destroys resources (TextureSystem::Tick, Destroy*,
-    // SetViewportSize→ReleaseHdrRenderTarget) gets the old "previous frame is
-    // complete after BeginFrame" guarantee.
-    {
-        const uint64_t fence = ++m_fenceValue;
-        ThrowIfFailed(m_queues[0]->Signal(m_fence.Get(), fence));
-        if (m_fence->GetCompletedValue() < fence)
-        {
-            ThrowIfFailed(m_fence->SetEventOnCompletion(fence, m_fenceEvent));
-            WaitForSingleObject(m_fenceEvent, INFINITE);
-        }
-    }
-    for (UINT q = 1; q <= 2; ++q)
-    {
-        if (m_queueFenceValues[q] == 0) continue;
-        if (m_queueFences[q]->GetCompletedValue() < m_queueFenceValues[q])
-        {
-            ThrowIfFailed(m_queueFences[q]->SetEventOnCompletion(
-                m_queueFenceValues[q], m_fenceEvent));
-            WaitForSingleObject(m_fenceEvent, INFINITE);
-        }
-    }
+    // Idempotent within a frame — BeginFrame also calls this. Cleared by
+    // BeginFrame once it's consumed the prepared slot.
+    if (m_frameSlotPrepared) return;
 
+    // Wait ONLY on the fence value from the last time this backbuffer slot
+    // was used (kFrameCount frames ago) — CPU runs up to kFrameCount-1 frames
+    // ahead. App calls this BEFORE the Animation phase so per-frame CPU
+    // writes don't tear in-flight GPU reads.
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
-    // GPU is fully idle — drain EVERY deferred-release slot (not just the
-    // current backbuffer's). Keeps the deferred-destruction infrastructure in
-    // place so Destroy{Buffer,Texture} / ReleaseHdrRenderTarget callers don't
-    // need to change, but matches old immediate-release semantics in effect.
-    ProcessAllDeferredReleases();
+    // Wait for slot's graphics-queue fence (0 == slot never used yet — first
+    // kFrameCount frames after startup).
+    const uint64_t gfxFence = m_frameFenceValues[m_frameIndex];
+    if (gfxFence != 0 && m_fence->GetCompletedValue() < gfxFence)
+    {
+        ThrowIfFailed(m_fence->SetEventOnCompletion(gfxFence, m_fenceEvent));
+        WaitForSingleObject(m_fenceEvent, INFINITE);
+    }
 
-    // Read back previous frame's GPU timestamps (GPU has finished for this slot).
+    // Wait for slot's compute + copy queue fences (per-slot snapshots).
+    for (UINT q = 1; q <= 2; ++q)
+    {
+        const uint64_t qf = m_frameQueueFenceValues[m_frameIndex][q];
+        if (qf == 0) continue;
+        if (m_queueFences[q]->GetCompletedValue() < qf)
+        {
+            ThrowIfFailed(m_queueFences[q]->SetEventOnCompletion(qf, m_fenceEvent));
+            WaitForSingleObject(m_fenceEvent, INFINITE);
+        }
+    }
+
+    m_frameSlotPrepared = true;
+}
+
+RHI::CommandList GraphicsDX12::BeginFrame()
+{
+    // kFrameCount-deep pipelining: per-slot allocators / deferred-release /
+    // profiler readback all key off m_frameIndex so other slots stay
+    // untouched. WaitForPreviousFrame() is still the hard-sync path used by
+    // dtor / resize / Picking / capture helpers.
+    WaitForNextFrameSlot();
+    m_frameSlotPrepared = false;
+
+    // Drain ONLY this slot's deferred-release queue. The other slots may
+    // still have GPU work in flight; their queues will drain when their own
+    // backbuffer comes around in kFrameCount frames.
+    ProcessDeferredReleases(m_frameIndex);
+
+    // Drain fence-keyed releases whose target fence value has completed —
+    // independent of the slot-rotation cycle, so resources tied to async-
+    // compute fences (DDGI) can outlive kFrameCount safely without forcing
+    // a WaitForPreviousFrame stall.
+    ProcessFenceKeyedReleases();
+
+    // Read back this slot's GPU timestamps — resolved kFrameCount frames ago.
     if (m_gpuProfiler.enabled)
-        m_gpuProfiler.BeginFrame();
+        m_gpuProfiler.BeginFrame(m_frameIndex);
 
     // Reset the pool — this slot's entries are no longer in-flight.
     m_commandListCount = 0;
@@ -1817,7 +1426,7 @@ void GraphicsDX12::EndFrame()
     // Resolve GPU timestamp queries before closing the primary CL.
     auto* primaryCmd = m_commandLists[0]->GetCommandList();
     if (m_gpuProfiler.enabled)
-        m_gpuProfiler.ResolveQueries(primaryCmd);
+        m_gpuProfiler.ResolveQueries(primaryCmd, m_frameIndex);
 
     // Transition swap-chain back buffer RENDER_TARGET → PRESENT on the primary CL.
     auto b = CD3DX12_RESOURCE_BARRIER::Transition(
@@ -2385,913 +1994,43 @@ uint64_t GraphicsDX12::GetTexturePreviewSrvGpuHandle(const RHI::Texture& texture
     return entry.srv.IsValid() ? entry.srv.GetGpuHandle().ptr : 0ull;
 }
 
-// ===========================================================================
-// Resource creation — CreateBuffer
-// ===========================================================================
-
-bool GraphicsDX12::CreateBuffer(const RHI::GPUBufferDesc& desc,
-                                RHI::GPUBuffer& outBuffer,
-                                const void* initialData)
+uint64_t GraphicsDX12::GetTextureStencilSRVGpuHandle(const RHI::Texture& texture) const
 {
-    if (desc.size == 0) { LOG_ERROR("CreateBuffer: size == 0"); return false; }
-
-    GPUBuffer_DX12 entry;
-    D3D12_HEAP_PROPERTIES hp{ ToD3D12HeapType(desc.usage) };
-
-    const bool isCBV = RHI::HasFlag(desc.bind_flags, RHI::BindFlag::CONSTANT_BUFFER);
-    UINT64 allocSize = isCBV ? (desc.size + 255) & ~255ull : desc.size;
-
-    D3D12_RESOURCE_DESC rd = CD3DX12_RESOURCE_DESC::Buffer(allocSize);
-    rd.Flags = ToD3D12ResourceFlags(desc.bind_flags);
-
-    D3D12_RESOURCE_STATES initState = D3D12_RESOURCE_STATE_COMMON;
-    if (desc.usage == RHI::Usage::UPLOAD)
-        initState = D3D12_RESOURCE_STATE_GENERIC_READ;
-    else if (desc.usage == RHI::Usage::READBACK)
-        initState = D3D12_RESOURCE_STATE_COPY_DEST;
-
-    if (FAILED(m_device->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_NONE, &rd, initState, nullptr,
-            IID_PPV_ARGS(&entry.resource))))
-    {
-        LOG_ERROR("CreateBuffer: CreateCommittedResource failed");
-        return false;
-    }
-    entry.state = initState;
-
-    if (initialData && desc.usage == RHI::Usage::UPLOAD)
-    {
-        void* mapped = nullptr;
-        D3D12_RANGE readRange{ 0, 0 };
-        if (SUCCEEDED(entry.resource->Map(0, &readRange, &mapped)))
-        {
-            std::memcpy(mapped, initialData, static_cast<size_t>(desc.size));
-            entry.resource->Unmap(0, nullptr);
-        }
-    }
-    else if (initialData && desc.usage == RHI::Usage::DEFAULT)
-    {
-        ComPtr<ID3D12Resource> staging;
-        D3D12_HEAP_PROPERTIES uploadHp{ D3D12_HEAP_TYPE_UPLOAD };
-        D3D12_RESOURCE_DESC   stageDesc = CD3DX12_RESOURCE_DESC::Buffer(desc.size);
-        ThrowIfFailed(m_device->CreateCommittedResource(
-            &uploadHp, D3D12_HEAP_FLAG_NONE, &stageDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)));
-        void* mapped = nullptr; D3D12_RANGE rr{ 0, 0 };
-        ThrowIfFailed(staging->Map(0, &rr, &mapped));
-        std::memcpy(mapped, initialData, static_cast<size_t>(desc.size));
-        staging->Unmap(0, nullptr);
-
-        // After copy, transition to an appropriate shader-readable state.
-        const bool isSRV = RHI::HasFlag(desc.bind_flags, RHI::BindFlag::SHADER_RESOURCE);
-        const D3D12_RESOURCE_STATES finalState = isSRV
-            ? (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
-            : D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
-
-        auto b1 = CD3DX12_RESOURCE_BARRIER::Transition(
-            entry.resource.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        m_commandList->ResourceBarrier(1, &b1);
-        m_commandList->CopyBufferRegion(entry.resource.Get(), 0, staging.Get(), 0, desc.size);
-        auto b2 = CD3DX12_RESOURCE_BARRIER::Transition(
-            entry.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, finalState);
-        m_commandList->ResourceBarrier(1, &b2);
-        entry.state = finalState;
-
-        // Inside a batch scope: defer the fence wait until EndBufferUploadBatch(),
-        // but cap how much staging piles up so the batch doesn't OOM on
-        // scenes with thousands of small meshes.
-        if (m_batchUploadDepth > 0)
-        {
-            m_batchStagingBytes += desc.size;
-            m_batchStagingKeepAlive.push_back(std::move(staging));
-            FlushBatchStagingIfNeeded();
-        }
-        else
-        {
-            FlushUploadAndWait();
-        }
-    }
-
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::VERTEX_BUFFER))
-    {
-        entry.vbv.BufferLocation = entry.resource->GetGPUVirtualAddress();
-        entry.vbv.SizeInBytes    = static_cast<UINT>(desc.size);
-        entry.vbv.StrideInBytes  = desc.stride;
-    }
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::INDEX_BUFFER))
-    {
-        entry.ibv.BufferLocation = entry.resource->GetGPUVirtualAddress();
-        entry.ibv.SizeInBytes    = static_cast<UINT>(desc.size);
-        entry.ibv.Format         = (desc.format == RHI::Format::R16_UINT)
-                                   ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
-    }
-    if (isCBV)
-    {
-        entry.cbv = m_cbvSrvUavAllocator.Allocate(1);
-        D3D12_CONSTANT_BUFFER_VIEW_DESC cbvd{};
-        cbvd.BufferLocation = entry.resource->GetGPUVirtualAddress();
-        cbvd.SizeInBytes    = static_cast<UINT>(allocSize);
-        m_device->CreateConstantBufferView(&cbvd, entry.cbv.GetCpuHandle());
-        entry.cbv.CopyToGpu();
-    }
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::SHADER_RESOURCE))
-    {
-        entry.srv = m_cbvSrvUavAllocator.Allocate(1);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
-        srvd.ViewDimension           = D3D12_SRV_DIMENSION_BUFFER;
-        srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-
-        if (RHI::HasFlag(desc.misc_flags, RHI::ResourceMiscFlag::BUFFER_RAW))
-        {
-            // ByteAddressBuffer — raw 32-bit access
-            srvd.Format               = DXGI_FORMAT_R32_TYPELESS;
-            srvd.Buffer.NumElements   = static_cast<UINT>(desc.size / 4);
-            srvd.Buffer.Flags         = D3D12_BUFFER_SRV_FLAG_RAW;
-        }
-        else
-        {
-            // StructuredBuffer or typed buffer
-            srvd.Format                     = ToDxgiFormat(desc.format);
-            srvd.Buffer.NumElements         = (desc.stride > 0)
-                                              ? static_cast<UINT>(desc.size / desc.stride)
-                                              : static_cast<UINT>(desc.size / 4);
-            srvd.Buffer.StructureByteStride = desc.stride;
-        }
-        m_device->CreateShaderResourceView(entry.resource.Get(), &srvd, entry.srv.GetCpuHandle());
-        entry.srv.CopyToGpu();
-    }
-
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::UNORDERED_ACCESS))
-    {
-        entry.uav = m_cbvSrvUavAllocator.Allocate(1);
-        D3D12_UNORDERED_ACCESS_VIEW_DESC uavd{};
-        uavd.ViewDimension              = D3D12_UAV_DIMENSION_BUFFER;
-
-        if (RHI::HasFlag(desc.misc_flags, RHI::ResourceMiscFlag::BUFFER_RAW))
-        {
-            // RWByteAddressBuffer — raw 32-bit access. Mirror the SRV path
-            // above (R32_TYPELESS + RAW flag) or D3D12 rejects the view as
-            // "Format (0, UNKNOWN) cannot be used with a typed View of a
-            // Buffer" → device-removed cascade.
-            uavd.Format                     = DXGI_FORMAT_R32_TYPELESS;
-            uavd.Buffer.NumElements         = static_cast<UINT>(desc.size / 4);
-            uavd.Buffer.StructureByteStride = 0;
-            uavd.Buffer.Flags               = D3D12_BUFFER_UAV_FLAG_RAW;
-        }
-        else
-        {
-            // RWStructuredBuffer or typed buffer.
-            uavd.Format                     = DXGI_FORMAT_UNKNOWN;
-            uavd.Buffer.NumElements         = (desc.stride > 0)
-                                              ? static_cast<UINT>(desc.size / desc.stride)
-                                              : static_cast<UINT>(desc.size / 4);
-            uavd.Buffer.StructureByteStride = desc.stride;
-        }
-
-        m_device->CreateUnorderedAccessView(entry.resource.Get(), nullptr, &uavd, entry.uav.GetCpuHandle());
-        entry.uav.CopyToGpu();
-    }
-
-    std::lock_guard<std::mutex> lock(m_resourceMutex);
-    if (!m_bufferFreeList.empty())
-    {
-        outBuffer.handle_id         = m_bufferFreeList.back();
-        m_bufferFreeList.pop_back();
-        m_bufferPool[outBuffer.handle_id] = std::move(entry);
-    }
-    else
-    {
-        outBuffer.handle_id = static_cast<uint32_t>(m_bufferPool.size());
-        m_bufferPool.push_back(std::move(entry));
-    }
-    outBuffer.type = RHI::GPUResource::Type::Buffer;
-    outBuffer.desc = desc;
-    LOG_SUCCESS("CreateBuffer: %llu bytes", (unsigned long long)desc.size);
-    return true;
+    if (!texture.IsValid()) return 0ull;
+    if (texture.handle_id >= static_cast<uint32_t>(m_texturePool.size())) return 0ull;
+    const Texture_DX12& entry = m_texturePool[texture.handle_id];
+    return entry.stencilSrv.IsValid() ? entry.stencilSrv.GetGpuHandle().ptr : 0ull;
 }
 
-// ===========================================================================
-// Resource creation — CreateTexture
-// ===========================================================================
-
-bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
-                                 RHI::Texture& outTexture,
-                                 const RHI::SubresourceData* initialData)
+uint64_t GraphicsDX12::GetTextureUVPlaneSRVGpuHandle(const RHI::Texture& texture) const
 {
-    Texture_DX12 entry;
-    DXGI_FORMAT dxgiFmt = ToDxgiFormat(desc.format);
-    D3D12_HEAP_PROPERTIES hp{ ToD3D12HeapType(desc.usage) };
-
-    // Depth texture that also needs to be sampled as SRV requires a typeless resource format.
-    const bool isDepthFmt = (dxgiFmt == DXGI_FORMAT_D32_FLOAT || dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT);
-    const bool needsDepthSRV = isDepthFmt
-        && RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL)
-        && RHI::HasFlag(desc.bind_flags, RHI::BindFlag::SHADER_RESOURCE);
-
-    D3D12_RESOURCE_DESC rd{};
-    switch (desc.type)
-    {
-    case RHI::TextureDesc::Type::TEXTURE_1D: rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D; break;
-    case RHI::TextureDesc::Type::TEXTURE_3D: rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D; break;
-    default:                                 rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; break;
-    }
-    rd.Width              = desc.width;
-    rd.Height             = desc.height;
-    rd.DepthOrArraySize   = static_cast<UINT16>((rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? desc.depth : desc.array_size);
-    rd.MipLevels          = static_cast<UINT16>(desc.mip_levels);
-    // Typeless resource format for depth textures that need SRV access.
-    DXGI_FORMAT resourceFmt = dxgiFmt;
-    if (needsDepthSRV)
-    {
-        if (dxgiFmt == DXGI_FORMAT_D32_FLOAT)          resourceFmt = DXGI_FORMAT_R32_TYPELESS;
-        else if (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT) resourceFmt = DXGI_FORMAT_R24G8_TYPELESS;
-    }
-    rd.Format             = resourceFmt;
-    rd.SampleDesc.Count   = desc.sample_count;
-    rd.SampleDesc.Quality = 0;
-    rd.Layout             = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    rd.Flags              = ToD3D12ResourceFlags(desc.bind_flags);
-
-    D3D12_RESOURCE_STATES initState = ToD3D12ResourceState(desc.layout);
-    D3D12_CLEAR_VALUE cv{};
-    D3D12_CLEAR_VALUE* pCv = nullptr;
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::RENDER_TARGET))
-    {
-        cv.Format = dxgiFmt;
-        std::memcpy(cv.Color, desc.clear.color, sizeof(cv.Color));
-        pCv = &cv; initState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    }
-    else if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL))
-    {
-        cv.Format               = dxgiFmt; // use the original depth format (D32_FLOAT or D24_S8)
-        cv.DepthStencil.Depth   = desc.clear.depth_stencil.depth;
-        cv.DepthStencil.Stencil = static_cast<UINT8>(desc.clear.depth_stencil.stencil);
-        pCv = &cv; initState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    }
-
-    if (FAILED(m_device->CreateCommittedResource(
-            &hp, D3D12_HEAP_FLAG_NONE, &rd, initState, pCv,
-            IID_PPV_ARGS(&entry.resource))))
-    {
-        LOG_ERROR("CreateTexture: CreateCommittedResource failed");
-        return false;
-    }
-    entry.state = initState;
-
-    // Optional debug name → ID3D12Resource::SetName so D3D12 validation
-    // messages and PIX/RenderDoc captures show a meaningful identifier.
-    if (desc.debug_name && desc.debug_name[0] != '\0')
-    {
-        const int needed = MultiByteToWideChar(CP_UTF8, 0, desc.debug_name, -1, nullptr, 0);
-        if (needed > 0)
-        {
-            std::wstring wname(static_cast<size_t>(needed - 1), L'\0');
-            MultiByteToWideChar(CP_UTF8, 0, desc.debug_name, -1, wname.data(), needed);
-            entry.resource->SetName(wname.c_str());
-        }
-    }
-
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::SHADER_RESOURCE))
-    {
-        entry.srv = m_cbvSrvUavAllocator.Allocate(1);
-        D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
-        // SRV format for depth textures: R32_FLOAT for D32, R24_UNORM_X8 for D24_S8.
-        DXGI_FORMAT srvFmt = dxgiFmt;
-        if (needsDepthSRV)
-        {
-            if (dxgiFmt == DXGI_FORMAT_D32_FLOAT)              srvFmt = DXGI_FORMAT_R32_FLOAT;
-            else if (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT) srvFmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-        }
-        srvd.Format                  = srvFmt;
-        srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-        switch (rd.Dimension)
-        {
-        case D3D12_RESOURCE_DIMENSION_TEXTURE1D:
-            if (desc.array_size > 1) {
-                srvd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
-                srvd.Texture1DArray.MipLevels = desc.mip_levels;
-                srvd.Texture1DArray.ArraySize = desc.array_size;
-            } else {
-                srvd.ViewDimension       = D3D12_SRV_DIMENSION_TEXTURE1D;
-                srvd.Texture1D.MipLevels = desc.mip_levels;
-            }
-            break;
-        case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
-            srvd.ViewDimension       = D3D12_SRV_DIMENSION_TEXTURE3D;
-            srvd.Texture3D.MipLevels = desc.mip_levels;
-            break;
-        default: // 2D
-            if (desc.sample_count > 1) {
-                srvd.ViewDimension = (desc.array_size > 1) ? D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
-                                                           : D3D12_SRV_DIMENSION_TEXTURE2DMS;
-            } else if (RHI::HasFlag(desc.misc_flags, RHI::ResourceMiscFlag::TEXTURECUBE)
-                       && desc.array_size == 6) {
-                srvd.ViewDimension              = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                srvd.TextureCube.MipLevels      = desc.mip_levels;
-                srvd.TextureCube.MostDetailedMip = 0;
-                LOG_INFO("CreateTexture: created TextureCube SRV (%ux%u mips=%u)", desc.width, desc.height, desc.mip_levels);
-            } else if (RHI::HasFlag(desc.misc_flags, RHI::ResourceMiscFlag::TEXTURECUBE)
-                       && desc.array_size > 6 && (desc.array_size % 6) == 0) {
-                srvd.ViewDimension                          = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
-                srvd.TextureCubeArray.MipLevels             = desc.mip_levels;
-                srvd.TextureCubeArray.MostDetailedMip       = 0;
-                srvd.TextureCubeArray.First2DArrayFace      = 0;
-                srvd.TextureCubeArray.NumCubes              = desc.array_size / 6;
-                srvd.TextureCubeArray.ResourceMinLODClamp   = 0.0f;
-                LOG_INFO("CreateTexture: created TextureCubeArray SRV (%ux%u mips=%u cubes=%u)",
-                         desc.width, desc.height, desc.mip_levels, desc.array_size / 6);
-            } else if (desc.array_size > 1) {
-                srvd.ViewDimension              = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-                srvd.Texture2DArray.MipLevels   = desc.mip_levels;
-                srvd.Texture2DArray.ArraySize   = desc.array_size;
-            } else {
-                srvd.ViewDimension       = D3D12_SRV_DIMENSION_TEXTURE2D;
-                srvd.Texture2D.MipLevels = desc.mip_levels;
-            }
-            break;
-        }
-        m_device->CreateShaderResourceView(entry.resource.Get(), &srvd, entry.srv.GetCpuHandle());
-        entry.srv.CopyToGpu();
-
-        // For SRGB textures, create a UNORM alias SRV for editor preview.
-        // ImGui renders to a UNORM RTV, so sampling an SRGB SRV would linearize
-        // the values without re-encoding on write → preview appears too dark.
-        // The UNORM alias returns raw sRGB texel data, matching what the user expects.
-        auto stripSrgb = [](DXGI_FORMAT f) -> DXGI_FORMAT {
-            switch (f) {
-            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return DXGI_FORMAT_R8G8B8A8_UNORM;
-            case DXGI_FORMAT_BC1_UNORM_SRGB:      return DXGI_FORMAT_BC1_UNORM;
-            case DXGI_FORMAT_BC2_UNORM_SRGB:      return DXGI_FORMAT_BC2_UNORM;
-            case DXGI_FORMAT_BC3_UNORM_SRGB:      return DXGI_FORMAT_BC3_UNORM;
-            case DXGI_FORMAT_BC7_UNORM_SRGB:      return DXGI_FORMAT_BC7_UNORM;
-            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8A8_UNORM;
-            case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB: return DXGI_FORMAT_B8G8R8X8_UNORM;
-            default: return f;
-            }
-        };
-        DXGI_FORMAT unormFmt = stripSrgb(dxgiFmt);
-        if (unormFmt != dxgiFmt)
-        {
-            entry.previewSrv = m_cbvSrvUavAllocator.Allocate(1);
-            D3D12_SHADER_RESOURCE_VIEW_DESC previewSrvd = srvd;
-            previewSrvd.Format = unormFmt;
-            m_device->CreateShaderResourceView(entry.resource.Get(), &previewSrvd, entry.previewSrv.GetCpuHandle());
-            entry.previewSrv.CopyToGpu();
-        }
-    }
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::RENDER_TARGET))
-    {
-        entry.rtv = m_rtvAllocator.Allocate(1);
-        D3D12_RENDER_TARGET_VIEW_DESC rtvd{ dxgiFmt, D3D12_RTV_DIMENSION_TEXTURE2D };
-        m_device->CreateRenderTargetView(entry.resource.Get(), &rtvd, entry.rtv.GetCpuHandle());
-    }
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL))
-    {
-        entry.dsv = m_dsvAllocator.Allocate(1);
-        D3D12_DEPTH_STENCIL_VIEW_DESC dsvd{};
-        dsvd.Format = dxgiFmt;
-        if (desc.array_size > 1)
-        {
-            dsvd.ViewDimension                   = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-            dsvd.Texture2DArray.MipSlice         = 0;
-            dsvd.Texture2DArray.FirstArraySlice  = 0;
-            dsvd.Texture2DArray.ArraySize        = desc.array_size;
-        }
-        else
-        {
-            dsvd.ViewDimension                   = D3D12_DSV_DIMENSION_TEXTURE2D;
-        }
-        m_device->CreateDepthStencilView(entry.resource.Get(), &dsvd, entry.dsv.GetCpuHandle());
-
-        // Per-slice DSVs for array depth textures (CSM cascades, etc.)
-        if (desc.array_size > 1)
-        {
-            entry.sliceDsvs.resize(desc.array_size);
-            D3D12_DEPTH_STENCIL_VIEW_DESC sliceDsvd{};
-            sliceDsvd.Format                             = dxgiFmt;
-            sliceDsvd.ViewDimension                      = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
-            sliceDsvd.Texture2DArray.MipSlice            = 0;
-            sliceDsvd.Texture2DArray.ArraySize           = 1;
-            for (uint32_t s = 0; s < desc.array_size; ++s)
-            {
-                entry.sliceDsvs[s] = m_dsvAllocator.Allocate(1);
-                sliceDsvd.Texture2DArray.FirstArraySlice = s;
-                m_device->CreateDepthStencilView(entry.resource.Get(), &sliceDsvd,
-                                                 entry.sliceDsvs[s].GetCpuHandle());
-            }
-        }
-    }
-
-    if (RHI::HasFlag(desc.bind_flags, RHI::BindFlag::UNORDERED_ACCESS))
-    {
-        // Whole-resource (mip 0) UAV — covers all array slices when array_size > 1.
-        entry.uav = m_cbvSrvUavAllocator.Allocate(1);
-        auto fillUav = [&](D3D12_UNORDERED_ACCESS_VIEW_DESC& uavd, uint32_t mip)
-        {
-            uavd.Format = dxgiFmt;
-            if (desc.type == RHI::TextureDesc::Type::TEXTURE_3D)
-            {
-                uavd.ViewDimension          = D3D12_UAV_DIMENSION_TEXTURE3D;
-                uavd.Texture3D.MipSlice     = mip;
-                uavd.Texture3D.FirstWSlice  = 0;
-                uavd.Texture3D.WSize        = (std::max)(desc.depth >> mip, 1u);
-            }
-            else if (desc.array_size > 1)
-            {
-                // Cube or 2D array — UAV covers all array slices at this mip.
-                uavd.ViewDimension                       = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
-                uavd.Texture2DArray.MipSlice             = mip;
-                uavd.Texture2DArray.FirstArraySlice      = 0;
-                uavd.Texture2DArray.ArraySize            = desc.array_size;
-                uavd.Texture2DArray.PlaneSlice           = 0;
-            }
-            else
-            {
-                uavd.ViewDimension          = D3D12_UAV_DIMENSION_TEXTURE2D;
-                uavd.Texture2D.MipSlice     = mip;
-            }
-        };
-        {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC uavd{};
-            fillUav(uavd, 0);
-            m_device->CreateUnorderedAccessView(entry.resource.Get(), nullptr, &uavd, entry.uav.GetCpuHandle());
-            entry.uav.CopyToGpu();
-        }
-
-        // Per-mip UAVs for multi-mip textures (cubemap prefilter chains, etc.)
-        if (desc.mip_levels > 1)
-        {
-            entry.mipUavs.resize(desc.mip_levels);
-            for (uint32_t mip = 0; mip < desc.mip_levels; ++mip)
-            {
-                entry.mipUavs[mip] = m_cbvSrvUavAllocator.Allocate(1);
-                D3D12_UNORDERED_ACCESS_VIEW_DESC uavd{};
-                fillUav(uavd, mip);
-                m_device->CreateUnorderedAccessView(entry.resource.Get(), nullptr, &uavd,
-                                                    entry.mipUavs[mip].GetCpuHandle());
-                entry.mipUavs[mip].CopyToGpu();
-            }
-        }
-    }
-
-    if (initialData && desc.usage == RHI::Usage::DEFAULT)
-    {
-        const UINT subresourceCount = desc.mip_levels * desc.array_size;
-        UINT64 uploadSize = 0;
-        m_device->GetCopyableFootprints(&rd, 0, subresourceCount, 0, nullptr, nullptr, nullptr, &uploadSize);
-
-        ComPtr<ID3D12Resource> staging;
-        D3D12_HEAP_PROPERTIES uploadHp{ D3D12_HEAP_TYPE_UPLOAD };
-        const auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadSize);
-        ThrowIfFailed(m_device->CreateCommittedResource(
-            &uploadHp, D3D12_HEAP_FLAG_NONE, &uploadBufferDesc,
-            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&staging)));
-
-        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresourceCount);
-        std::vector<UINT>   numRows(subresourceCount);
-        std::vector<UINT64> rowSizes(subresourceCount);
-        m_device->GetCopyableFootprints(&rd, 0, subresourceCount, 0,
-            footprints.data(), numRows.data(), rowSizes.data(), nullptr);
-
-        uint8_t* stagingPtr = nullptr;
-        D3D12_RANGE rr{ 0, 0 };
-        ThrowIfFailed(staging->Map(0, &rr, reinterpret_cast<void**>(&stagingPtr)));
-        for (UINT sub = 0; sub < subresourceCount; ++sub)
-        {
-            const auto& fp  = footprints[sub];
-            uint8_t* dstRow = stagingPtr + fp.Offset;
-            const uint8_t* srcRow = static_cast<const uint8_t*>(initialData[sub].data_ptr);
-            for (UINT row = 0; row < numRows[sub]; ++row)
-            {
-                std::memcpy(dstRow, srcRow, static_cast<size_t>(rowSizes[sub]));
-                dstRow  += fp.Footprint.RowPitch;
-                srcRow  += initialData[sub].row_pitch;
-            }
-        }
-        staging->Unmap(0, nullptr);
-
-        auto toTransfer = CD3DX12_RESOURCE_BARRIER::Transition(
-            entry.resource.Get(), entry.state, D3D12_RESOURCE_STATE_COPY_DEST);
-        m_commandList->ResourceBarrier(1, &toTransfer);
-        for (UINT sub = 0; sub < subresourceCount; ++sub)
-        {
-            CD3DX12_TEXTURE_COPY_LOCATION dst(entry.resource.Get(), sub);
-            CD3DX12_TEXTURE_COPY_LOCATION src(staging.Get(), footprints[sub]);
-            m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-        }
-        auto fromTransfer = CD3DX12_RESOURCE_BARRIER::Transition(
-            entry.resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST, entry.state);
-        m_commandList->ResourceBarrier(1, &fromTransfer);
-        FlushUploadAndWait();
-    }
-
-    std::lock_guard<std::mutex> lock(m_resourceMutex);
-    if (!m_textureFreeList.empty())
-    {
-        outTexture.handle_id          = m_textureFreeList.back();
-        m_textureFreeList.pop_back();
-        m_texturePool[outTexture.handle_id] = std::move(entry);
-    }
-    else
-    {
-        outTexture.handle_id = static_cast<uint32_t>(m_texturePool.size());
-        m_texturePool.push_back(std::move(entry));
-    }
-    outTexture.type = RHI::GPUResource::Type::Texture;
-    outTexture.desc = desc;
-
-    // Copy SRV into bindless texture table at slot [handle_id].
-    if (m_bindlessTexTable.IsValid() && outTexture.handle_id < kMaxBindlessTextures)
-    {
-        const auto& poolEntry = m_texturePool[outTexture.handle_id];
-        if (poolEntry.srv.IsValid())
-        {
-            UINT descInc = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            D3D12_CPU_DESCRIPTOR_HANDLE dst = m_bindlessTexTable.GetGpuCpuHandle();
-            dst.ptr += static_cast<SIZE_T>(outTexture.handle_id) * descInc;
-            m_device->CopyDescriptorsSimple(1, dst, poolEntry.srv.GetCpuHandle(),
-                                             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        }
-    }
-
-    LOG_SUCCESS("CreateTexture: %ux%u fmt=%u", desc.width, desc.height, (unsigned)desc.format);
-    return true;
+    if (!texture.IsValid()) return 0ull;
+    if (texture.handle_id >= static_cast<uint32_t>(m_texturePool.size())) return 0ull;
+    const Texture_DX12& entry = m_texturePool[texture.handle_id];
+    return entry.uvPlaneSrv.IsValid() ? entry.uvPlaneSrv.GetGpuHandle().ptr : 0ull;
 }
 
-// ===========================================================================
-// Resource creation — CreateShader
-// ===========================================================================
-
-bool GraphicsDX12::CreateShader(RHI::ShaderStage stage,
-                                const void* bytecode, size_t bytecodeSize,
-                                RHI::Shader& outShader)
+RHI::IVideoDecoderBackend* GraphicsDX12::GetVideoBackend()
 {
-    if (!bytecode || bytecodeSize == 0)
-    {
-        LOG_ERROR("CreateShader: empty bytecode");
-        return false;
-    }
-    Shader_DX12 entry;
-    const auto* ptr = static_cast<const uint8_t*>(bytecode);
-    entry.bytecode.assign(ptr, ptr + bytecodeSize);
+    // Fast path — already constructed.
+    if (m_videoBackend) return m_videoBackend.get();
 
-    // Stable FNV-1a over bytecode — same HLSL compile produces the same
-    // DXBC produces the same hash, so PSO cache names are stable across
-    // engine restarts even when the caller didn't set desc.cache_key.
+    // Lazy init under lock so concurrent first-callers don't double-create.
+    std::lock_guard<std::mutex> lock(m_videoBackendMutex);
+    if (!m_videoBackend)
     {
-        uint64_t h = 14695981039346656037ull;
-        for (uint8_t b : entry.bytecode) { h ^= b; h *= 1099511628211ull; }
-        entry.bytecodeHash = h;
+        auto backend = std::make_unique<RHI::DX12::VideoDecoderDX12>(*this);
+        if (!backend->IsAvailable())
+        {
+            // Construction logged the failure; expose nullptr so callers can
+            // fall back to a no-video code path without further noise.
+            return nullptr;
+        }
+        m_videoBackend = std::move(backend);
     }
-
-    std::lock_guard<std::mutex> lock(m_resourceMutex);
-    outShader.handle_id = static_cast<uint32_t>(m_shaderPool.size());
-    outShader.type      = RHI::GPUResource::Type::Shader;
-    outShader.stage     = stage;
-    m_shaderPool.push_back(std::move(entry));
-    LOG_SUCCESS("CreateShader: stage=%u, %zu bytes", (unsigned)stage, bytecodeSize);
-    return true;
+    return m_videoBackend.get();
 }
 
-// ===========================================================================
-// Resource creation — CreateSampler
-// ===========================================================================
-
-bool GraphicsDX12::CreateSampler(const RHI::SamplerDesc& desc, int& outDescriptorIndex)
-{
-    auto allocation = m_samplerAllocator.Allocate(1);
-    if (!allocation.IsValid())
-    {
-        LOG_ERROR("CreateSampler: sampler heap exhausted (max %u)", MaxSamplers);
-        outDescriptorIndex = -1;
-        return false;
-    }
-
-    D3D12_SAMPLER_DESC sd{};
-    sd.Filter         = ToD3D12Filter(desc.filter);
-    sd.AddressU       = ToD3D12AddressMode(desc.address_u);
-    sd.AddressV       = ToD3D12AddressMode(desc.address_v);
-    sd.AddressW       = ToD3D12AddressMode(desc.address_w);
-    sd.MipLODBias     = desc.mip_lod_bias;
-    sd.MaxAnisotropy  = desc.max_anisotropy;
-    sd.ComparisonFunc = ToD3D12ComparisonFunc(desc.comparison_func);
-    sd.MinLOD         = desc.min_lod;
-    sd.MaxLOD         = desc.max_lod;
-    switch (desc.border_color)
-    {
-    case RHI::SamplerBorderColor::OPAQUE_BLACK:
-        sd.BorderColor[0]=sd.BorderColor[1]=sd.BorderColor[2]=0.0f; sd.BorderColor[3]=1.0f; break;
-    case RHI::SamplerBorderColor::OPAQUE_WHITE:
-        sd.BorderColor[0]=sd.BorderColor[1]=sd.BorderColor[2]=sd.BorderColor[3]=1.0f; break;
-    default: break; // transparent black (all zero)
-    }
-
-    m_device->CreateSampler(&sd, allocation.GetCpuHandle());
-    allocation.CopyToGpu();
-
-    std::lock_guard<std::mutex> lock(m_resourceMutex);
-    outDescriptorIndex = static_cast<int>(m_samplerPool.size());
-    m_samplerPool.push_back(std::move(allocation));
-
-    LOG_SUCCESS("CreateSampler: descriptor index=%d", outDescriptorIndex);
-    return true;
-}
-
-// ===========================================================================
-// Resource creation — CreatePipelineState
-// ===========================================================================
-
-bool GraphicsDX12::CreatePipelineState(const RHI::PipelineStateDesc& desc,
-                                       RHI::PipelineState& outPSO)
-{
-    PipelineState_DX12 internal;
-
-    // If a compute shader is set and no vertex shader, create a compute PSO.
-    if (desc.cs && !desc.vs)
-    {
-        if (!m_computeRootSignature)
-        { LOG_ERROR("CreatePipelineState: compute root signature not initialized"); return false; }
-        internal.rootSignature = m_computeRootSignature;
-        internal.isCompute     = true;
-
-        const Shader_DX12& csBytecode = m_shaderPool[desc.cs->handle_id];
-        D3D12_COMPUTE_PIPELINE_STATE_DESC cpsoDesc{};
-        cpsoDesc.pRootSignature = m_computeRootSignature.Get();
-        cpsoDesc.CS             = { csBytecode.bytecode.data(), csBytecode.bytecode.size() };
-
-        const HRESULT hr = m_device->CreateComputePipelineState(&cpsoDesc, IID_PPV_ARGS(&internal.pso));
-        if (FAILED(hr))
-        {
-            LOG_ERROR("CreatePipelineState: CreateComputePipelineState failed 0x%08X", static_cast<unsigned>(hr));
-            return false;
-        }
-
-        std::lock_guard<std::mutex> lock(m_resourceMutex);
-        outPSO.handle_id = static_cast<uint32_t>(m_psoPool.size());
-        outPSO.type      = RHI::GPUResource::Type::PipelineState;
-        m_psoPool.push_back(std::make_unique<PipelineState_DX12>(std::move(internal)));
-        LOG_SUCCESS("CreatePipelineState (compute): OK");
-        return true;
-    }
-
-    // Reuse the root signature built once in LoadAssets().
-    if (!m_defaultRootSignature)
-    { LOG_ERROR("CreatePipelineState: default root signature not initialised"); return false; }
-    internal.rootSignature = m_defaultRootSignature;
-
-    // Helper to extract bytecode from a Shader handle
-    auto getByteCode = [this](const RHI::Shader* s) -> D3D12_SHADER_BYTECODE
-    {
-        if (!s || !s->IsValid()) return { nullptr, 0 };
-        const Shader_DX12& p = m_shaderPool[s->handle_id];
-        return { p.bytecode.data(), p.bytecode.size() };
-    };
-
-    // Translate blend state
-    D3D12_BLEND_DESC blendDesc{};
-    if (desc.bs)
-    {
-        blendDesc.AlphaToCoverageEnable  = desc.bs->alpha_to_coverage_enable;
-        blendDesc.IndependentBlendEnable = desc.bs->independent_blend_enable;
-        for (int i = 0; i < 8; ++i)
-        {
-            const auto& s = desc.bs->render_target[i];
-            auto& d = blendDesc.RenderTarget[i];
-            d.BlendEnable           = s.blend_enable;
-            d.SrcBlend              = ToD3D12Blend(s.src_blend);
-            d.DestBlend             = ToD3D12Blend(s.dest_blend);
-            d.BlendOp               = ToD3D12BlendOp(s.blend_op);
-            d.SrcBlendAlpha         = ToD3D12Blend(s.src_blend_alpha);
-            d.DestBlendAlpha        = ToD3D12Blend(s.dest_blend_alpha);
-            d.BlendOpAlpha          = ToD3D12BlendOp(s.blend_op_alpha);
-            // D3D12 allows only the least significant 4 bits (R/G/B/A); RHI::ColorWrite::ENABLE_ALL is ~0u
-            d.RenderTargetWriteMask = static_cast<UINT8>(s.render_target_write_mask) & 0x0Fu;
-        }
-    }
-    else
-    {
-        for (auto& rt : blendDesc.RenderTarget)
-            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    }
-
-    // Translate rasterizer state
-    D3D12_RASTERIZER_DESC rasterDesc{};
-    if (desc.rs)
-    {
-        rasterDesc.FillMode              = ToD3D12FillMode(desc.rs->fill_mode);
-        rasterDesc.CullMode              = ToD3D12CullMode(desc.rs->cull_mode);
-        rasterDesc.FrontCounterClockwise = desc.rs->front_counter_clockwise;
-        rasterDesc.DepthBias             = desc.rs->depth_bias;
-        rasterDesc.DepthBiasClamp        = desc.rs->depth_bias_clamp;
-        rasterDesc.SlopeScaledDepthBias  = desc.rs->slope_scaled_depth_bias;
-        rasterDesc.DepthClipEnable       = desc.rs->depth_clip_enable;
-        rasterDesc.MultisampleEnable     = desc.rs->multisample_enable;
-        rasterDesc.AntialiasedLineEnable = desc.rs->antialiased_line_enable;
-        rasterDesc.ConservativeRaster    = desc.rs->conservative_rasterization_enable
-                                          ? D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON
-                                          : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    }
-    else
-    {
-        rasterDesc = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
-    }
-
-    // Translate depth-stencil state
-    D3D12_DEPTH_STENCIL_DESC dsDesc{};
-    if (desc.dss)
-    {
-        auto toStencilOp = [](RHI::StencilOp o) -> D3D12_STENCIL_OP {
-            switch(o) {
-            case RHI::StencilOp::KEEP:     return D3D12_STENCIL_OP_KEEP;
-            case RHI::StencilOp::ZERO:     return D3D12_STENCIL_OP_ZERO;
-            case RHI::StencilOp::REPLACE:  return D3D12_STENCIL_OP_REPLACE;
-            case RHI::StencilOp::INCR_SAT: return D3D12_STENCIL_OP_INCR_SAT;
-            case RHI::StencilOp::DECR_SAT: return D3D12_STENCIL_OP_DECR_SAT;
-            case RHI::StencilOp::INVERT:   return D3D12_STENCIL_OP_INVERT;
-            case RHI::StencilOp::INCR:     return D3D12_STENCIL_OP_INCR;
-            case RHI::StencilOp::DECR:     return D3D12_STENCIL_OP_DECR;
-            default:                       return D3D12_STENCIL_OP_KEEP;
-            }
-        };
-        dsDesc.DepthEnable      = desc.dss->depth_enable;
-        dsDesc.DepthWriteMask   = (desc.dss->depth_write_mask == RHI::DepthWriteMask::ALL)
-                                  ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-        dsDesc.DepthFunc        = ToD3D12ComparisonFunc(desc.dss->depth_func);
-        dsDesc.StencilEnable    = desc.dss->stencil_enable;
-        dsDesc.StencilReadMask  = desc.dss->stencil_read_mask;
-        dsDesc.StencilWriteMask = desc.dss->stencil_write_mask;
-        dsDesc.FrontFace = { toStencilOp(desc.dss->front_face.stencil_fail_op),
-                             toStencilOp(desc.dss->front_face.stencil_depth_fail_op),
-                             toStencilOp(desc.dss->front_face.stencil_pass_op),
-                             ToD3D12ComparisonFunc(desc.dss->front_face.stencil_func) };
-        dsDesc.BackFace  = { toStencilOp(desc.dss->back_face.stencil_fail_op),
-                             toStencilOp(desc.dss->back_face.stencil_depth_fail_op),
-                             toStencilOp(desc.dss->back_face.stencil_pass_op),
-                             ToD3D12ComparisonFunc(desc.dss->back_face.stencil_func) };
-    }
-
-    // -----------------------------------------------------------------------
-    // Mesh-shader path: AS + MS (+ optional PS) via stream pipeline desc.
-    // Uses ID3D12Device2::CreatePipelineState. PSO library bypassed for now —
-    // ID3D12PipelineLibrary1::LoadPipeline is needed for stream descs and
-    // can be added later once warm-start is observed to be slow.
-    // -----------------------------------------------------------------------
-    if (desc.ms || desc.as)
-    {
-        ComPtr<ID3D12Device2> device2;
-        if (FAILED(m_device.As(&device2)))
-        {
-            LOG_ERROR("CreatePipelineState (mesh): ID3D12Device2 unavailable");
-            return false;
-        }
-
-        struct MeshPSOStream
-        {
-            CD3DX12_PIPELINE_STATE_STREAM_ROOT_SIGNATURE        rootSig;
-            CD3DX12_PIPELINE_STATE_STREAM_AS                    as;
-            CD3DX12_PIPELINE_STATE_STREAM_MS                    ms;
-            CD3DX12_PIPELINE_STATE_STREAM_PS                    ps;
-            CD3DX12_PIPELINE_STATE_STREAM_BLEND_DESC            blend;
-            CD3DX12_PIPELINE_STATE_STREAM_RASTERIZER            raster;
-            CD3DX12_PIPELINE_STATE_STREAM_DEPTH_STENCIL         depth;
-            CD3DX12_PIPELINE_STATE_STREAM_DEPTH_STENCIL_FORMAT  dsFormat;
-            CD3DX12_PIPELINE_STATE_STREAM_RENDER_TARGET_FORMATS rtFormats;
-            CD3DX12_PIPELINE_STATE_STREAM_SAMPLE_DESC           sample;
-            CD3DX12_PIPELINE_STATE_STREAM_SAMPLE_MASK           sampleMask;
-        } stream{};
-
-        stream.rootSig  = internal.rootSignature.Get();
-        stream.as       = getByteCode(desc.as);
-        stream.ms       = getByteCode(desc.ms);
-        stream.ps       = getByteCode(desc.ps);
-        stream.blend    = CD3DX12_BLEND_DESC(blendDesc);
-        stream.raster   = CD3DX12_RASTERIZER_DESC(rasterDesc);
-        stream.depth    = CD3DX12_DEPTH_STENCIL_DESC(dsDesc);
-        stream.dsFormat = ToDxgiFormat(desc.dsv_format);
-
-        D3D12_RT_FORMAT_ARRAY rtfa{};
-        rtfa.NumRenderTargets = desc.rtv_count;
-        for (UINT i = 0; i < desc.rtv_count && i < 8u; ++i)
-            rtfa.RTFormats[i] = ToDxgiFormat(desc.rtv_formats[i]);
-        stream.rtFormats = rtfa;
-
-        DXGI_SAMPLE_DESC sd{};
-        sd.Count   = desc.sample_count ? desc.sample_count : 1;
-        sd.Quality = 0;
-        stream.sample     = sd;
-        stream.sampleMask = desc.sample_mask;
-
-        D3D12_PIPELINE_STATE_STREAM_DESC streamDesc{ sizeof(stream), &stream };
-        const HRESULT hr = device2->CreatePipelineState(&streamDesc, IID_PPV_ARGS(&internal.pso));
-        if (FAILED(hr))
-        {
-            LOG_ERROR("CreatePipelineState (mesh): CreatePipelineState failed 0x%08X",
-                      static_cast<unsigned>(hr));
-            return false;
-        }
-
-        std::lock_guard<std::mutex> lock(m_resourceMutex);
-        outPSO.handle_id = static_cast<uint32_t>(m_psoPool.size());
-        outPSO.type      = RHI::GPUResource::Type::PipelineState;
-        m_psoPool.push_back(std::make_unique<PipelineState_DX12>(std::move(internal)));
-        LOG_SUCCESS("CreatePipelineState (mesh): OK");
-        return true;
-    }
-
-    // Translate input layout
-    std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
-    if (desc.il)
-    {
-        for (const auto& e : desc.il->elements)
-        {
-            D3D12_INPUT_ELEMENT_DESC ied{};
-            ied.SemanticName         = e.semantic_name;
-            ied.SemanticIndex        = e.semantic_index;
-            ied.Format               = ToDxgiFormat(e.format);
-            ied.InputSlot            = e.input_slot;
-            ied.AlignedByteOffset    = (e.aligned_byte_offset == RHI::InputLayout::APPEND_ALIGNED_ELEMENT)
-                                       ? D3D12_APPEND_ALIGNED_ELEMENT : e.aligned_byte_offset;
-            ied.InputSlotClass       = (e.input_slot_class == RHI::InputClassification::PER_INSTANCE_DATA)
-                                       ? D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
-                                       : D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
-            ied.InstanceDataStepRate = (ied.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA) ? 1 : 0;
-            inputElements.push_back(ied);
-        }
-    }
-
-    // Map RHI topology to D3D12 topology type
-    auto toTopologyType = [](RHI::PrimitiveTopology t) -> D3D12_PRIMITIVE_TOPOLOGY_TYPE {
-        switch (t) {
-        case RHI::PrimitiveTopology::POINTLIST:   return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
-        case RHI::PrimitiveTopology::LINELIST:
-        case RHI::PrimitiveTopology::LINESTRIP:   return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
-        case RHI::PrimitiveTopology::PATCHLIST:   return D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
-        default:                                  return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-        }
-    };
-
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
-    psoDesc.pRootSignature        = internal.rootSignature.Get();
-    psoDesc.VS                    = getByteCode(desc.vs);
-    psoDesc.PS                    = getByteCode(desc.ps);
-    psoDesc.HS                    = getByteCode(desc.hs);
-    psoDesc.DS                    = getByteCode(desc.ds);
-    psoDesc.GS                    = getByteCode(desc.gs);
-    psoDesc.BlendState            = blendDesc;
-    psoDesc.SampleMask            = desc.sample_mask;
-    psoDesc.RasterizerState       = rasterDesc;
-    psoDesc.DepthStencilState     = dsDesc;
-    psoDesc.InputLayout           = { inputElements.data(), static_cast<UINT>(inputElements.size()) };
-    psoDesc.PrimitiveTopologyType = toTopologyType(desc.pt);
-    psoDesc.NumRenderTargets      = desc.rtv_count;
-    for (UINT i = 0; i < 8u; ++i)
-        psoDesc.RTVFormats[i] = (i < desc.rtv_count) ? ToDxgiFormat(desc.rtv_formats[i]) : DXGI_FORMAT_UNKNOWN;
-    psoDesc.DSVFormat             = ToDxgiFormat(desc.dsv_format);
-    const UINT sampleCount = desc.sample_count ? desc.sample_count : 1;
-    psoDesc.SampleDesc.Count      = sampleCount;
-    psoDesc.SampleDesc.Quality    = 0;  // 0 required when Count==1; for MSAA use device CheckFeatureSupport
-
-    // Compute a stable name for this PSO (used by PipelineLibrary cache)
-    wchar_t psoName[64] = {};
-    ComputePSOName(desc, psoName, 64);
-
-    // Try loading from PSO library (avoids ISA recompilation on warm start)
-    bool loadedFromLibrary = false;
-    if (m_psoLibrary)
-    {
-        HRESULT hrLoad = m_psoLibrary->LoadGraphicsPipeline(psoName, &psoDesc,
-                                                             IID_PPV_ARGS(&internal.pso));
-        if (SUCCEEDED(hrLoad))
-            loadedFromLibrary = true;
-        // E_INVALIDARG = not in cache (miss or bytecode mismatch), E_FAIL = incompatible —
-        // both are expected on first use; fall through to CreateGraphicsPipelineState.
-    }
-
-    if (!loadedFromLibrary)
-    {
-        const HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&internal.pso));
-        if (FAILED(hr))
-        {
-            LOG_ERROR("CreatePipelineState: CreateGraphicsPipelineState failed, HRESULT=0x%08X (see D3D12 docs / WinError.h)", static_cast<unsigned>(hr));
-            return false;
-        }
-
-        // Store in library for next warm start
-        if (m_psoLibrary)
-        {
-            HRESULT hrStore = m_psoLibrary->StorePipeline(psoName, internal.pso.Get());
-            if (FAILED(hrStore))
-                LOG_WARNING("CreatePipelineState: StorePipeline failed (HRESULT=0x%08X)", static_cast<unsigned>(hrStore));
-        }
-    }
-
-    std::lock_guard<std::mutex> lock(m_resourceMutex);
-    outPSO.handle_id = static_cast<uint32_t>(m_psoPool.size());
-    outPSO.type      = RHI::GPUResource::Type::PipelineState;
-    m_psoPool.push_back(std::make_unique<PipelineState_DX12>(std::move(internal)));
-    LOG_SUCCESS("CreatePipelineState: OK");
-    return true;
-}
 
 // ===========================================================================
 // Command recording — state
@@ -3796,9 +2535,27 @@ void GraphicsDX12::ClearDepthStencil(const RHI::Texture& texture,
     if (!texture.IsValid()) return;
     auto* cl = GetPoolEntry(cmd).GetCommandList();
     if (!cl) return;
+    auto& tex = m_texturePool[texture.handle_id];
+
+    // Also clear the STENCIL plane when the format carries one. The deferred
+    // pipeline stencil-gates LightingPass on per-pixel shading-model ids that
+    // GBuffer writes via REPLACE; if stencil is never cleared, pixels NOT
+    // rasterized this frame keep stale ids and get re-shaded next frame. That's
+    // invisible when geometry+sky cover every pixel, but Wireframe view (sparse
+    // edge coverage + suppressed sky) makes the stale ids accumulate as a
+    // "never cleared" smear. Gate on a stencil-bearing format so depth-only
+    // targets (shadow maps, D32) don't trip the debug layer.
+    D3D12_CLEAR_FLAGS flags = D3D12_CLEAR_FLAG_DEPTH;
+    if (tex.resource)
+    {
+        const DXGI_FORMAT f = tex.resource->GetDesc().Format;
+        if (f == DXGI_FORMAT_D24_UNORM_S8_UINT  || f == DXGI_FORMAT_R24G8_TYPELESS ||
+            f == DXGI_FORMAT_D32_FLOAT_S8X24_UINT || f == DXGI_FORMAT_R32G8X24_TYPELESS)
+            flags |= D3D12_CLEAR_FLAG_STENCIL;
+    }
     cl->ClearDepthStencilView(
-        m_texturePool[texture.handle_id].dsv.GetCpuHandle(),
-        D3D12_CLEAR_FLAG_DEPTH, depth, stencil, 0, nullptr);
+        tex.dsv.GetCpuHandle(),
+        flags, depth, stencil, 0, nullptr);
 }
 
 void GraphicsDX12::SetDepthStencilSlice(const RHI::Texture& depthTex,
@@ -3932,9 +2689,13 @@ uint64_t GraphicsDX12::GetTextureCubeMipUAVGpuHandle(const RHI::Texture& tex,
 uint32_t GraphicsDX12::BeginGPUTimestamp(RHI::CommandList cmd, const char* name)
 {
     if (!m_gpuProfiler.enabled) return ~0u;
-    auto* cl = GetPoolEntry(cmd).GetCommandList();
+    auto& entry = GetPoolEntry(cmd);
+    auto* cl = entry.GetCommandList();
     if (!cl) return ~0u;
-    return m_gpuProfiler.BeginTimestamp(cl, name);
+    // CL pool entry already tracks which queue it was opened on; just forward
+    // it so the profiler can split totals + compute the critical path.
+    return m_gpuProfiler.BeginTimestamp(cl, name,
+                                        static_cast<uint8_t>(entry.queue));
 }
 
 void GraphicsDX12::EndGPUTimestamp(RHI::CommandList cmd, uint32_t regionIndex)
@@ -4003,50 +2764,68 @@ void GraphicsDX12::CopyTexturePixelToBuffer(const RHI::Texture& src,
     cl->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &srcBox);
 }
 
-void GraphicsDX12::DestroyBuffer(RHI::GPUBuffer& buffer)
+
+void GraphicsDX12::DeferReleaseResource(Microsoft::WRL::ComPtr<ID3D12Resource> resource)
 {
-    if (!buffer.IsValid()) return;
-    const uint32_t id = buffer.handle_id;
-    auto& entry = m_bufferPool[id];
-    // Queue resource + descriptors for release once the GPU is done with this
-    // backbuffer slot (FrameCount frames from now, processed in BeginFrame).
+    if (!resource) return;
+    // Same deferral discipline as Destroy{Buffer,Texture}: hand the resource to
+    // the current backbuffer's release slot so it survives until BeginFrame has
+    // waited out the GPU. No pool slot to recycle — this is a non-pool resource.
     std::lock_guard<std::mutex> lock(m_deferredMutex);
-    auto& dr = m_deferredRelease[m_frameIndex];
-    if (entry.cbv.IsValid()) { dr.descriptors.push_back(entry.cbv); entry.cbv = {}; }
-    if (entry.srv.IsValid()) { dr.descriptors.push_back(entry.srv); entry.srv = {}; }
-    if (entry.resource)      { dr.resources.push_back(std::move(entry.resource)); }
-    dr.bufferSlots.push_back(id);
-    buffer.Reset();
+    m_deferredRelease[m_frameIndex].resources.push_back(std::move(resource));
 }
 
-void GraphicsDX12::DestroyTexture(RHI::Texture& texture)
+void GraphicsDX12::DeferReleaseResource(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+                                        uint32_t queueIndex,
+                                        uint64_t fenceValue)
 {
-    if (!texture.IsValid()) return;
-    const uint32_t id = texture.handle_id;
-    auto& entry = m_texturePool[id];
-    // Queue everything for deferred release (GPU may still be reading this
-    // texture / its descriptors for up to FrameCount frames).
+    if (!resource) return;
+    if (queueIndex >= 3)
+    {
+        // Bad queue index — fall back to slot-based defer so resource still gets freed.
+        DeferReleaseResource(std::move(resource));
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_deferredMutex);
-    auto& dr = m_deferredRelease[m_frameIndex];
-    auto steal = [&](DescriptorAllocation& a) {
-        if (a.IsValid()) { dr.descriptors.push_back(a); a = {}; }
-    };
-    steal(entry.rtv);
-    steal(entry.dsv);
-    steal(entry.srv);
-    steal(entry.uav);
-    steal(entry.previewSrv);
-    for (auto& a : entry.mipUavs)   steal(a);
-    for (auto& a : entry.sliceDsvs) steal(a);
-    for (auto& kv : entry.cubeFaceRtvs) steal(kv.second);
-    for (auto& kv : entry.cubeMipUavs)  steal(kv.second);
-    entry.mipUavs.clear();
-    entry.sliceDsvs.clear();
-    entry.cubeFaceRtvs.clear();
-    entry.cubeMipUavs.clear();
-    if (entry.resource) dr.resources.push_back(std::move(entry.resource));
-    dr.textureSlots.push_back(id);
-    texture.Reset();
+    m_fenceKeyedReleases.push_back({ queueIndex, fenceValue, std::move(resource) });
+}
+
+uint64_t GraphicsDX12::GetLastSignaledFenceValue(uint32_t queueIndex) const
+{
+    if (queueIndex >= 3) return 0;
+    return m_queueFenceValues[queueIndex];
+}
+
+void GraphicsDX12::ProcessFenceKeyedReleases()
+{
+    std::deque<FenceKeyedRelease> drained;
+    {
+        std::lock_guard<std::mutex> lock(m_deferredMutex);
+        // Walk the queue; move entries whose fence has completed into `drained`
+        // so the ComPtr destruction happens OUTSIDE the lock (Release() can
+        // re-enter graphics-device calls in theory; defensive).
+        for (auto it = m_fenceKeyedReleases.begin(); it != m_fenceKeyedReleases.end(); )
+        {
+            const uint32_t qi = it->queueIndex;
+            ID3D12Fence* fence = (qi == 0) ? m_fence.Get() : m_queueFences[qi].Get();
+            if (!fence)
+            {
+                // Fence not initialized — safest to keep the entry (drop later).
+                ++it;
+                continue;
+            }
+            if (fence->GetCompletedValue() >= it->fenceValue)
+            {
+                drained.push_back(std::move(*it));
+                it = m_fenceKeyedReleases.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+    // `drained` destructs here; ComPtrs release ID3D12Resources outside the lock.
 }
 
 // ===========================================================================
@@ -4141,329 +2920,3 @@ void GraphicsDX12::SavePSOLibrary(const char* cacheFilePath)
         LOG_ERROR("SavePSOLibrary: write error for '%s'", cacheFilePath);
 }
 
-// ===========================================================================
-// CaptureTextureToPNG — synchronous read-back of a 2D R8G8B8A8 texture into
-// a PNG file. Targets ShaderLab's "Capture Frame" button.
-// ===========================================================================
-
-#include "DirectXTex.h"
-
-bool GraphicsDX12::CaptureTextureToPNG(const RHI::Texture& tex,
-                                       RHI::ResourceState  currentState,
-                                       const char*         path)
-{
-    if (!path || !*path)
-    {
-        LOG_ERROR("CaptureTextureToPNG: null/empty path");
-        return false;
-    }
-
-    ID3D12Resource* res = GetTextureResource(tex);
-    if (!res)
-    {
-        LOG_ERROR("CaptureTextureToPNG: source texture has no D3D12 resource");
-        return false;
-    }
-
-    const D3D12_RESOURCE_DESC desc = res->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D)
-    {
-        LOG_ERROR("CaptureTextureToPNG: only Texture2D supported (got dim=%d)",
-                  desc.Dimension);
-        return false;
-    }
-    // Limit to formats DirectXTex SaveToWICFile + PNG codec accept directly.
-    if (desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
-        desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
-        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
-    {
-        LOG_ERROR("CaptureTextureToPNG: unsupported format %d", desc.Format);
-        return false;
-    }
-
-    // Compute footprint for a single-subresource readback.
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT   numRows      = 0;
-    UINT64 rowSizeBytes = 0;
-    UINT64 totalSize    = 0;
-    m_device->GetCopyableFootprints(&desc, 0, 1, 0,
-                                    &footprint, &numRows, &rowSizeBytes, &totalSize);
-
-    // READBACK buffer for the GPU → CPU copy.
-    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
-    {
-        D3D12_HEAP_PROPERTIES hp{};
-        hp.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC bd{};
-        bd.Dimension          = D3D12_RESOURCE_DIMENSION_BUFFER;
-        bd.Width              = totalSize;
-        bd.Height             = 1;
-        bd.DepthOrArraySize   = 1;
-        bd.MipLevels          = 1;
-        bd.Format             = DXGI_FORMAT_UNKNOWN;
-        bd.SampleDesc.Count   = 1;
-        bd.Layout             = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        if (FAILED(m_device->CreateCommittedResource(
-                &hp, D3D12_HEAP_FLAG_NONE,
-                &bd, D3D12_RESOURCE_STATE_COPY_DEST,
-                nullptr, IID_PPV_ARGS(&readback))))
-        {
-            LOG_ERROR("CaptureTextureToPNG: readback buffer alloc failed");
-            return false;
-        }
-    }
-
-    // Make sure prior submissions touching the source are done so the state
-    // we transition from matches what the renderer last left.
-    FlushAndWait();
-
-    // One-shot command list dedicated to the copy. Cheap (no allocator reuse
-    // since this only runs on a tools button press).
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator>     ca;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>  cl;
-    if (FAILED(m_device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&ca))))
-    {
-        LOG_ERROR("CaptureTextureToPNG: command allocator alloc failed");
-        return false;
-    }
-    if (FAILED(m_device->CreateCommandList(
-            0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ca.Get(), nullptr, IID_PPV_ARGS(&cl))))
-    {
-        LOG_ERROR("CaptureTextureToPNG: command list alloc failed");
-        return false;
-    }
-
-    const D3D12_RESOURCE_STATES fromState = ToD3D12ResourceState(currentState);
-
-    // Transition: from caller-provided state → COPY_SOURCE
-    {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource   = res;
-        b.Transition.StateBefore = fromState;
-        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cl->ResourceBarrier(1, &b);
-    }
-
-    {
-        D3D12_TEXTURE_COPY_LOCATION src{};
-        src.pResource         = res;
-        src.Type              = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex  = 0;
-        D3D12_TEXTURE_COPY_LOCATION dst{};
-        dst.pResource         = readback.Get();
-        dst.Type              = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint   = footprint;
-        cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
-
-    // Transition back so the renderer's tracker stays consistent.
-    {
-        D3D12_RESOURCE_BARRIER b{};
-        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource   = res;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter  = fromState;
-        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        cl->ResourceBarrier(1, &b);
-    }
-
-    cl->Close();
-    ID3D12CommandList* lists[] = { cl.Get() };
-    m_commandQueue->ExecuteCommandLists(1, lists);
-
-    // Block until the copy is done — synchronous read-back is the whole point.
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    if (FAILED(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence))))
-    {
-        LOG_ERROR("CaptureTextureToPNG: fence alloc failed");
-        return false;
-    }
-    m_commandQueue->Signal(fence.Get(), 1);
-    if (fence->GetCompletedValue() < 1)
-    {
-        HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (!evt) return false;
-        fence->SetEventOnCompletion(1, evt);
-        WaitForSingleObject(evt, INFINITE);
-        CloseHandle(evt);
-    }
-
-    // Map readback + densify rows (footprint.RowPitch is 256-aligned, the
-    // DirectXTex Image we hand to SaveToWICFile wants a tight rowPitch).
-    void* mapped = nullptr;
-    D3D12_RANGE readRange{ 0, static_cast<SIZE_T>(totalSize) };
-    if (FAILED(readback->Map(0, &readRange, &mapped)))
-    {
-        LOG_ERROR("CaptureTextureToPNG: readback Map failed");
-        return false;
-    }
-
-    const uint64_t denseRowPitch = rowSizeBytes;
-    const uint64_t denseSize     = denseRowPitch * static_cast<uint64_t>(numRows);
-    std::vector<uint8_t> dense(static_cast<size_t>(denseSize));
-    const uint8_t* srcBytes = static_cast<const uint8_t*>(mapped);
-    for (UINT row = 0; row < numRows; ++row)
-    {
-        std::memcpy(dense.data() + row * denseRowPitch,
-                    srcBytes + row * footprint.Footprint.RowPitch,
-                    static_cast<size_t>(denseRowPitch));
-    }
-
-    D3D12_RANGE writeNothing{ 0, 0 };
-    readback->Unmap(0, &writeNothing);
-
-    // Save via DirectXTex. Convert path UTF-8 → wide for SaveToWICFile.
-    std::wstring wpath;
-    {
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
-        if (wlen > 0) { wpath.resize(wlen - 1); MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen); }
-    }
-
-    // Make sure parent dir exists — most users will pick captures/foo.png.
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(
-            std::filesystem::path(wpath).parent_path(), ec);
-    }
-
-    DirectX::Image img{};
-    img.width      = footprint.Footprint.Width;
-    img.height     = footprint.Footprint.Height;
-    img.format     = footprint.Footprint.Format;
-    img.rowPitch   = static_cast<size_t>(denseRowPitch);
-    img.slicePitch = static_cast<size_t>(denseSize);
-    img.pixels     = dense.data();
-
-    const HRESULT hr = DirectX::SaveToWICFile(
-        img, DirectX::WIC_FLAGS_NONE,
-        DirectX::GetWICCodec(DirectX::WIC_CODEC_PNG),
-        wpath.c_str());
-    if (FAILED(hr))
-    {
-        LOG_ERROR("CaptureTextureToPNG: SaveToWICFile failed (hr=0x%08X)",
-                  static_cast<unsigned>(hr));
-        return false;
-    }
-
-    LOG_SUCCESS("CaptureTextureToPNG: saved '%s' (%ux%u)",
-                path, img.width, img.height);
-    return true;
-}
-
-void GraphicsDX12::ComputePSOName(const RHI::PipelineStateDesc& desc,
-                                   wchar_t* outName, size_t maxChars) const
-{
-    // If a stable cache_key was provided (set by PSOCache using ShaderID-based hash),
-    // use it directly — this is deterministic across runs regardless of pool indices.
-    if (desc.cache_key != 0)
-    {
-        swprintf_s(outName, maxChars, L"PSO_%016llX",
-                   static_cast<unsigned long long>(desc.cache_key));
-        return;
-    }
-
-    // Fallback for callers that didn't set cache_key (compute / post
-    // pipelines, DebugWirePass, etc.): per-field hash over shader BYTECODE
-    // hashes + render-state SCALAR fields. Prior versions did
-    // `mix(desc.rs, sizeof(*desc.rs))`, which folded in struct padding bytes
-    // — those are NOT zero-initialised on PSO descs constructed on the stack,
-    // so cache_key was effectively random and pso_cache.bin grew unboundedly.
-    constexpr uint64_t kPrime = 1099511628211ull;
-    uint64_t h = 14695981039346656037ull;
-
-    auto mixU8  = [&h](uint8_t v)  { h ^= v; h *= kPrime; };
-    auto mixU32 = [&](uint32_t v) {
-        mixU8(static_cast<uint8_t>(v));
-        mixU8(static_cast<uint8_t>(v >>  8));
-        mixU8(static_cast<uint8_t>(v >> 16));
-        mixU8(static_cast<uint8_t>(v >> 24));
-    };
-    auto mixU64 = [&](uint64_t v) {
-        mixU32(static_cast<uint32_t>(v));
-        mixU32(static_cast<uint32_t>(v >> 32));
-    };
-    auto mixI32  = [&](int32_t v) { mixU32(static_cast<uint32_t>(v)); };
-    auto mixF32  = [&](float   v) { uint32_t u; std::memcpy(&u, &v, 4); mixU32(u); };
-    auto mixBool = [&](bool    v) { mixU8(v ? 1 : 0); };
-    auto mixEnum = [&](auto    v) { mixU32(static_cast<uint32_t>(v)); };
-
-    auto mixShader = [&](const RHI::Shader* s)
-    {
-        if (!s) { mixU64(0); return; }
-        if (s->handle_id < m_shaderPool.size())
-            mixU64(m_shaderPool[s->handle_id].bytecodeHash);
-        else
-            mixU64(0);
-    };
-    mixShader(desc.vs);
-    mixShader(desc.ps);
-    mixShader(desc.cs);
-    mixShader(desc.gs);
-    mixShader(desc.hs);
-    mixShader(desc.ds);
-
-    if (desc.rs)
-    {
-        const auto& rs = *desc.rs;
-        mixEnum(rs.fill_mode);
-        mixEnum(rs.cull_mode);
-        mixBool(rs.front_counter_clockwise);
-        mixI32 (rs.depth_bias);
-        mixF32 (rs.depth_bias_clamp);
-        mixF32 (rs.slope_scaled_depth_bias);
-        mixBool(rs.depth_clip_enable);
-        mixBool(rs.multisample_enable);
-        mixBool(rs.antialiased_line_enable);
-        mixBool(rs.conservative_rasterization_enable);
-        mixU32 (rs.forced_sample_count);
-    }
-    if (desc.dss)
-    {
-        const auto& ds = *desc.dss;
-        mixBool(ds.depth_enable);
-        mixEnum(ds.depth_write_mask);
-        mixEnum(ds.depth_func);
-        mixBool(ds.stencil_enable);
-        mixU8  (ds.stencil_read_mask);
-        mixU8  (ds.stencil_write_mask);
-        auto mixOp = [&](const RHI::DepthStencilState::DepthStencilOp& op) {
-            mixEnum(op.stencil_fail_op);
-            mixEnum(op.stencil_depth_fail_op);
-            mixEnum(op.stencil_pass_op);
-            mixEnum(op.stencil_func);
-        };
-        mixOp  (ds.front_face);
-        mixOp  (ds.back_face);
-        mixBool(ds.depth_bounds_test_enable);
-    }
-    if (desc.bs)
-    {
-        const auto& bs = *desc.bs;
-        mixBool(bs.alpha_to_coverage_enable);
-        mixBool(bs.independent_blend_enable);
-        for (uint32_t i = 0; i < 8; ++i)
-        {
-            const auto& rt = bs.render_target[i];
-            mixBool(rt.blend_enable);
-            mixEnum(rt.src_blend);
-            mixEnum(rt.dest_blend);
-            mixEnum(rt.blend_op);
-            mixEnum(rt.src_blend_alpha);
-            mixEnum(rt.dest_blend_alpha);
-            mixEnum(rt.blend_op_alpha);
-            mixEnum(rt.render_target_write_mask);
-        }
-    }
-
-    mixU32 (desc.rtv_count);
-    mixEnum(desc.dsv_format);
-    for (uint32_t i = 0; i < desc.rtv_count && i < 8; ++i)
-        mixEnum(desc.rtv_formats[i]);
-    mixU32 (desc.sample_count);
-
-    swprintf_s(outName, maxChars, L"PSO_%016llX", static_cast<unsigned long long>(h));
-}

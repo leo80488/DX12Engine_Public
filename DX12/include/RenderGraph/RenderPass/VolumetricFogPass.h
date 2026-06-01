@@ -18,9 +18,69 @@
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #include <vector>
 #include <DirectXMath.h>
+
+// HLSL-mirror structs hoisted from VolumetricFogPass.cpp so the per-frame CBs
+// can be FrameCB<> members of the pass. Layout MUST match FroxelParams /
+// VolApplyCB in the shaders — keep this in sync with shaders/Volumetric*.hlsl.
+struct alignas(16) FroxelConstants
+{
+    float    viewProj[16];
+    float    invViewProj[16];
+    float    prevViewProj[16];
+
+    float    cameraPos[3];   float nearPlane;
+    float    farPlane;       float froxelNear;
+    float    froxelFar;      float temporalAlpha;
+
+    uint32_t frameIndex;
+    uint32_t froxelW;
+    uint32_t froxelH;
+    uint32_t froxelD;
+
+    float    fogDensity;
+    float    fogScattering;
+    float    fogAbsorption;
+    float    anisotropy;
+
+    float    heightFogStart;
+    float    heightFogFalloff;
+    float    ambientContribution;
+    float    _pad0;
+
+    float    sunDir[3];      float sunStrength;
+    float    sunColor[3];    float _pad1;
+    float    ambientColor[3];float _pad2;
+
+    // CSM (matches HLSL FroxelParams tail).
+    float    shadowMatrix0[16];
+    float    shadowMatrix1[16];
+    float    shadowMatrix2[16];
+    float    cascadeSplits[4];
+    float    shadowParams[4]; // x=texelSize, y=blendRange, z=bias, w=strength
+    float    cameraForward[3];float _pad3;
+
+    // Voxel occupancy grid — written by SceneVoxelPass, consumed by
+    // FroxelLightInject for spot/point light occlusion. Grid is a
+    // world-space AABB snapped to voxel size around the camera.
+    float    voxelGridMin[3];    float _padVG0;
+    float    voxelGridExtent[3]; uint32_t voxelGridDim; // extent = gridMax - gridMin
+};
+
+struct alignas(16) VolApplyConstants
+{
+    float    nearZ;
+    float    farZ;
+    float    froxelNear;
+    float    froxelFar;
+    uint32_t froxelDepth;
+    uint32_t _pad0;
+    uint32_t _pad1;
+    uint32_t _pad2;
+};
 
 class VolumetricFogPass : public RG::RenderPass
 {
@@ -38,6 +98,11 @@ public:
     // ---- Editor / Renderer-side configuration ------------------------------
     void  SetEnabled(bool on)      { m_enabled = on; }
     bool  IsEnabled() const        { return m_enabled; }
+
+    // Global view-mode suppress — hide fog in Wireframe view (independent of
+    // SetEnabled so it never clobbers the FogVolume-driven enable). Set every
+    // frame by Renderer.
+    void  SetViewModeHidden(bool h) { m_viewModeHidden = h; }
 
     void  SetDensity(float d)      { m_fogDensity = d; }
     float GetDensity() const       { return m_fogDensity; }
@@ -154,9 +219,11 @@ public:
         m_voxelGridDim      = gridDim;
     }
 
-    /** Returns the CB so Renderer can register it with the RenderGraph
-     *  ("VolApplyCB" → bound to b3 space0 in the apply PS). */
-    const RHI::GPUBuffer& GetApplyCB() const { return m_applyCB; }
+    /** Returns the current-frame slot of the triple-buffered VolApplyCB so
+     *  Renderer can register it with the RenderGraph each frame.
+     *  ("VolApplyCB" → bound to b3 space0 in the apply PS). Caller must
+     *  rebind every frame because the underlying buffer rotates. */
+    const RHI::GPUBuffer& GetApplyCB(IGraphicsDevice& gfx) const { return m_applyCB.CurrentBuffer(gfx); }
 
 private:
     static constexpr uint32_t kFroxelW = 160;
@@ -207,6 +274,14 @@ private:
     uint32_t                               m_historyReadIdx  = 0;
     uint32_t                               m_historyWriteIdx = 1;
     bool                                   m_historyValid    = false;
+    // External hard-cut signal — see XeGTAOPass::m_externalHistoryValid.
+    // ANDed with m_historyValid inside the temporal-alpha decision so a
+    // single camera-stack hard cut clears every temporal effect in lockstep.
+    bool                                   m_externalHistoryValid = true;
+
+public:
+    void SetExternalHistoryValid(bool b) { m_externalHistoryValid = b; }
+private:
     bool                                   m_temporalEnabled = true;
     // 0.05 was too aggressive on history retention — under any camera motion
     // the history became too stale and left smears. 0.12 still weights history
@@ -215,15 +290,12 @@ private:
 
     // Two CBs:
     //   m_paramCB  — FroxelParams (matches HLSL FroxelCB layout)
-    //   m_shadowCB — CSM matrices + cascade splits + sampling params
-    RHI::GPUBuffer  m_paramCB;
-    void*           m_paramCBMapped  = nullptr;
-    RHI::GPUBuffer  m_shadowCB;
-    void*           m_shadowCBMapped = nullptr;
+    //   (m_shadowCB was declared previously but never created/used — CSM
+    //    matrices live inside FroxelConstants. Removed.)
+    FrameCB<FroxelConstants>  m_paramCB;
     // Apply-pass CB (graphics root sig at b3 space0). Tiny — only enough state
     // for the PS to recover view-Z from depth and slice the froxel grid.
-    RHI::GPUBuffer  m_applyCB;
-    void*           m_applyCBMapped  = nullptr;
+    FrameCB<VolApplyConstants> m_applyCB;
     int             m_shadowSampler  = -1;       // CMP < sampler for CSM
     int             m_linearSampler  = -1;       // for trilinear scattering / depth read
 
@@ -232,6 +304,7 @@ private:
     RG::RGTextureHandle m_hdrColor{};
     uint64_t            m_depthSrv = 0;
     bool                m_enabled  = false;
+    bool                m_viewModeHidden = false;   // Renderer hides fog in Wireframe view
 
     // Sun / shadow.
     DirectX::XMFLOAT3      m_sunDir       { 0, -1, 0 };
@@ -258,10 +331,13 @@ private:
     uint32_t                m_voxelGridDim      = 0;
 
     // Volumetric-only lights — separate UPLOAD buffer (max kMaxVolLights).
+    // Triple-buffered ring so the CPU-side memcpy can't race a frame N GPU
+    // read while frame N+1 starts writing. 3 == GraphicsDX12::FrameCount.
     static constexpr uint32_t kMaxVolLights = 16;
-    RHI::GPUBuffer         m_volLightsBuf;
-    void*                  m_volLightsBufMapped = nullptr;
-    uint64_t               m_lightsSrv          = 0;  // SRV of m_volLightsBuf
+    static constexpr uint32_t kFrameCount   = 3;
+    RHI::GPUBuffer         m_volLightsBuf[kFrameCount];
+    void*                  m_volLightsBufMapped[kFrameCount] = {};
+    uint64_t               m_lightsSrv[kFrameCount]          = {}; // SRV of m_volLightsBuf[i]
     uint32_t               m_spotLightCount     = 0;
 
     // Per-frame: which 3D SRV the apply PS samples (scattering vs history[w]).

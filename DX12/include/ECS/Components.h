@@ -4,6 +4,7 @@
 // Integrated with this project's ECS: no wi:: dependency, uses DirectXMath + std
 
 #include "ECS/ECS.h"
+#include "ECS/GuidComponent.h"
 #include "Graphics/ShadingModel.h"
 
 #include <array>
@@ -621,17 +622,85 @@ struct CameraData
     float aspectRatioOverride = 0.f; // 0 = use window aspect ratio
 };
 
-// CameraComponent — game-layer FPS camera; owned by the camera entity.
-// CameraSystem reads/writes this each frame via Update().
-// Defaults reproduce the original scene view (eye=(4,3,5), look-at origin).
+// CameraComponent — lens / view-projection parameters for the camera entity.
+//
+// The camera's POSE (position + orientation) lives on LocalTransform /
+// GlobalTransform like any other entity; its FPS-controller state lives on
+// CameraControllerComponent. This struct holds only what the projection
+// matrix needs.
 struct CameraComponent
 {
-    DirectX::XMFLOAT3 position         = { 4.f, 3.f, 5.f };
-    float             yaw              = -2.47f;  // radians, rotation around world-Y
-    float             pitch            =  0.44f;  // radians, rotation around cam-X
-    float             fov              = DirectX::XM_PI / 3.f;
-    float             nearZ            = 0.1f;
-    float             farZ             = 200.f;
-    float             mouseSensitivity = 0.003f;
-    float             moveSpeed        = 10.0f;
+    float fov   = DirectX::XM_PI / 3.f;  // vertical FOV in radians
+    float nearZ = 0.1f;
+    float farZ  = 200.f;
+};
+
+// ActiveCameraTag — single-instance marker for "the camera the renderer uses
+// this frame". App::RefreshMainCamera prefers the tagged entity; absent a
+// tag, it falls back to the first entity with a CameraComponent.
+//
+// Switching:
+//   * Lua:  Camera.SetActive(entityId) / Camera.GetActive()
+//           (src/ECS/LuaPlayerBindings.cpp registers these on the Camera table)
+//   * C++:  call SetActiveCamera helpers via Lua or strip/add the tag directly.
+//
+// The tag holds no data — adding it to an entity says "this camera wins".
+// SetActive strips the tag from any previous holder so at most one entity
+// carries it at a time.
+struct ActiveCameraTag : ComponentBase {};
+
+// CameraControllerComponent — FPS-style controller state for the camera entity.
+//
+// CameraSystem reads/writes yaw+pitch here each frame and drives the entity's
+// LocalTransform from them (translation via WASD, rotation via mouse delta).
+// yaw/pitch are kept as the controller's authoritative Euler state so pitch
+// clamping is singularity-free; the equivalent quaternion is mirrored onto
+// LocalTransform.rotation.
+struct CameraControllerComponent
+{
+    // Camera mode. Free is the default — original fly-cam behaviour (mouse
+    // rotates, WASD strafes). The follow modes are for gameplay cameras
+    // attached to a player or NPC: the camera derives its world position
+    // from `followTarget` each frame and only consumes mouse input for
+    // yaw/pitch. WASD is intentionally ignored in follow modes — the player
+    // controller owns horizontal motion.
+    enum class Mode : std::uint8_t
+    {
+        Free        = 0,   // mouse-driven yaw/pitch + WASD position
+        ThirdPerson = 1,   // orbit followTarget at thirdPersonDistance
+        FirstPerson = 2,   // glue camera to followTarget + headOffset
+    };
+
+    float yaw              = -2.47f;  // radians, rotation around world-Y
+    float pitch            =  0.44f;  // radians, rotation around cam-X (clamped ±~89°)
+    float mouseSensitivity = 0.003f;
+    float moveSpeed        = 10.0f;
+
+    // ---- Follow-mode parameters (ignored when mode == Free) -------------
+    Mode          mode = Mode::Free;
+    // Save-stable follow target reference (was raw Entity ID — see
+    // DesignMd/entity_persistence_architecture.md for the GUID migration).
+    AttachmentRef followTarget;
+    // Distance from focus point to camera in ThirdPerson. The camera sits
+    // *behind* the target along (-forward) by this many metres.
+    float   thirdPersonDistance = 4.0f;
+    // First-person eye position offset from the target's pivot. Default
+    // ~1.65 m matches an average human eye height for a feet-pivoted mesh.
+    DirectX::XMFLOAT3 headOffset = { 0.f, 1.65f, 0.f };
+    // Third-person focus offset from the target's pivot — typically chest
+    // height plus a small lateral shoulder bias so the character isn't
+    // dead-centred on the screen.
+    DirectX::XMFLOAT3 shoulderOffset = { 0.30f, 1.60f, 0.f };
+
+    // Third-person spring-arm collision. When enabled and a PhysicsSystem
+    // is supplied to ResolveFollowing, the camera sweeps a sphere from the
+    // focus point toward its desired position; on hit the distance is
+    // clamped so the camera doesn't poke through walls. Set
+    // `cameraCollisionEnabled = false` to disable (useful for cinematics
+    // that need a fixed camera regardless of geometry).
+    bool  cameraCollisionEnabled = true;
+    // Sphere-cast probe radius (metres). Larger = camera backs off earlier
+    // before clipping the wall. Match this to a typical near-plane buffer
+    // (~10-30 cm) so the near-clip never enters the wall.
+    float cameraProbeRadius     = 0.20f;
 };

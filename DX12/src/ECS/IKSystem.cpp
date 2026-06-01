@@ -12,12 +12,20 @@ using namespace DirectX;
 // ---------------------------------------------------------------------------
 
 // Build a TRS matrix from a LocalPose (row-major, row-vector convention).
-static XMMATRIX LocalPoseToMat(const AnimationSystem::LocalPose& p)
+// Promoted to IKSystem public static so FootIKTargetSystem can reuse the
+// exact same composition order — diverging would silently produce a
+// different world pose than IKSystem itself reads on the same frame.
+XMMATRIX IKSystem::LocalPoseToMatrix(const AnimationSystem::LocalPose& p)
 {
     XMMATRIX S = XMMatrixScaling(p.scl.x, p.scl.y, p.scl.z);
     XMMATRIX R = XMMatrixRotationQuaternion(XMLoadFloat4(&p.rot));
     XMMATRIX T = XMMatrixTranslation(p.pos.x, p.pos.y, p.pos.z);
     return S * R * T;
+}
+// Backwards-compat shim for the rest of this TU.
+static XMMATRIX LocalPoseToMat(const AnimationSystem::LocalPose& p)
+{
+    return IKSystem::LocalPoseToMatrix(p);
 }
 
 static float Clampf(float v, float lo, float hi) { return std::min(std::max(v, lo), hi); }
@@ -197,6 +205,7 @@ void IKSystem::Update(World& world, const std::unordered_set<Entity>* activeSet)
 
     // Iterate SkeletonComponent pool directly.
     auto* pSkel = world.GetPool<SkeletonComponent>();
+    auto* pAnim = world.GetPool<AnimationComponent>();
     const size_t skelN = pSkel ? pSkel->Data().size() : 0;
     const auto&  skelEnts = pSkel ? pSkel->Entities() : std::vector<Entity>{};
     for (size_t si = 0; si < skelN; ++si)
@@ -206,6 +215,12 @@ void IKSystem::Update(World& world, const std::unordered_set<Entity>* activeSet)
 
         auto* skel = &pSkel->Data()[si];
         if (skel->assetIndex == kInvalidAnimHandle) continue;
+
+        // Skip IK on un-animated skeletons: rest-pose LocalPose now exists
+        // (so morphs can deform) but the IK target bones sit at their bind
+        // positions, which the solver would otherwise yank chain links toward.
+        auto* anim = pAnim ? pAnim->Get(e) : nullptr;
+        if (!anim || anim->primaryClip == kInvalidAnimHandle) continue;
 
         AnimationSystem::LocalPose* poses = m_animSys.GetMutableLocalPose(e);
         if (!poses) continue;
@@ -239,10 +254,10 @@ void IKSystem::Update(World& world, const std::unordered_set<Entity>* activeSet)
 // ===========================================================================
 // IKSystem::ComputeWorldTransform
 // ===========================================================================
-XMMATRIX IKSystem::ComputeWorldTransform(
+XMMATRIX IKSystem::ComputeBoneWorldTransform(
     uint32_t                          boneIndex,
     const AnimationSystem::LocalPose* poses,
-    const SkeletonAsset&              skel) const
+    const SkeletonAsset&              skel)
 {
     // Max practical bone depth is ~30 for PMX models.
     // 64 × 4 bytes = 256 bytes (fits in L1 cache, vs 4KB before).
@@ -257,7 +272,7 @@ XMMATRIX IKSystem::ComputeWorldTransform(
 
     XMMATRIX world = XMMatrixIdentity();
     for (uint32_t i = depth; i > 0; --i)
-        world = LocalPoseToMat(poses[chain[i - 1]]) * world;
+        world = LocalPoseToMatrix(poses[chain[i - 1]]) * world;
 
     return world;
 }

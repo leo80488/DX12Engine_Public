@@ -19,6 +19,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #include <array>
 #include <cmath>
@@ -95,86 +96,32 @@ public:
      *  source selection. Returns 0 if neither source is ready. */
     uint64_t ResolveSkyboxSrvHandle(uint64_t staticFallback) const;
 
-    /** Update the sun direction / radiance used by the atmosphere shader.
-     *  `dir` points FROM ground TOWARDS the sun (unit), `color` is linear RGB.
-     *  When the time-of-day controller is enabled, this call is overridden
-     *  by the time-based sun direction — set the time instead. */
+    /** Active light direction / colour — the body driving direct lighting
+     *  (sun by day, moon by night). LightCB convention: `dir` points
+     *  TOWARDS the body. Pushed each frame by Renderer from the SunLightTag
+     *  entity (or via TODOutput when TOD is active). */
     void SetSunDir(const DirectX::XMFLOAT3& dir, const DirectX::XMFLOAT3& color)
     {
         m_sunDir = dir;
         m_sunColor = color;
     }
-
-    // ---- Time-of-day controller -----------------------------------------------
-    /** Enable the built-in day/night cycle. When on, the sun direction is
-     *  computed from timeOfDay and overrides the scene's directional light. */
-    void SetTimeOfDayEnabled(bool on) { m_timeOfDayEnabled = on; }
-    bool IsTimeOfDayEnabled() const   { return m_timeOfDayEnabled; }
-
-    /** 0 = midnight, 0.25 = sunrise, 0.5 = noon, 0.75 = sunset. Wraps modulo 1. */
-    void SetTimeOfDay(float t)        { m_timeOfDay = t - std::floor(t); }
-    float GetTimeOfDay() const        { return m_timeOfDay; }
-
-    /** Time advance rate in "day units" per real second. 1.0 = 1 full day
-     *  per second (very fast, useful for demoing); set 1/60.0 for 1-minute days;
-     *  0 pauses. */
-    void SetTimeSpeed(float unitsPerSec) { m_timeSpeed = unitsPerSec; }
-    float GetTimeSpeed() const           { return m_timeSpeed; }
-
-    /** Geographic latitude in radians — controls how high the sun climbs.
-     *  0 = equator (sun passes zenith), ±π/2 = poles. Default mid-latitude. */
-    void SetLatitude(float rad)          { m_latitudeRad = rad; }
-    float GetLatitude() const            { return m_latitudeRad; }
-
-    /** Master sun intensity multiplier. Scales m_sunColor BEFORE it's uploaded
-     *  to the atmosphere / SH / specular / LightCB consumers. Use this as the
-     *  single knob to dim/brighten the whole sky + IBL + direct lighting when
-     *  the scene feels too bright or too dark. Default 1.0. */
-    void SetSunIntensityScale(float s) { m_sunIntensityScale = s; }
-    float GetSunIntensityScale() const { return m_sunIntensityScale; }
-
-    /** Global IBL strength. Scales diffuse + specular IBL contribution in
-     *  Lighting.ps.  Was previously read from SkyboxComponent per-scene;
-     *  now a single global knob (overrides any SkyboxComponent value). */
-    void SetIBLStrength(float s)   { m_iblStrength = s; }
-    float GetIBLStrength() const   { return m_iblStrength; }
-
-    /** Flat ambient base colour (written into LightCB::ambient). The lighting
-     *  shader multiplies this by albedo and adds unconditionally as a small
-     *  "fill" term independent of IBL strength. Tune down to black when you
-     *  want IBL to be the only indirect contribution. */
-    void SetAmbientColor(const DirectX::XMFLOAT3& c) { m_ambientColor = c; }
-    const DirectX::XMFLOAT3& GetAmbientColor() const { return m_ambientColor; }
-
-    /** Advance the time-of-day by `deltaSeconds` if enabled. Computes the
-     *  resulting sun direction/color and updates internal state. Call once
-     *  per frame from Renderer. Returns true if sun dir changed. */
-    bool TickTimeOfDay(float deltaSeconds);
-
-    /** Current computed sun direction (unit, towards sun). Valid after Tick.
-     *  When the moon is the active body (sun below horizon), this returns the
-     *  MOON direction (= -solarDir) so all downstream lighting / shadow code
-     *  automatically follows the moon without any special-casing. */
     const DirectX::XMFLOAT3& GetSunDir()   const { return m_sunDir; }
     const DirectX::XMFLOAT3& GetSunColor() const { return m_sunColor; }
 
-    /** True when the night-time path is active (sun is below horizon and the
-     *  moon has taken over as the directional light source). SkyboxPass uses
-     *  this to switch the analytic disk to a textured moon. */
-    bool  IsMoonActive() const { return m_isMoon; }
+    /** Geometric sun direction / colour — true sun position even when below
+     *  horizon, with colour zero below horizon. Consumed by the atmosphere /
+     *  aerial-perspective shaders so Rayleigh scattering goes dark at night
+     *  instead of computing a faint blue dome from the moon's direction. */
+    void SetAtmosphereSun(const DirectX::XMFLOAT3& dir, const DirectX::XMFLOAT3& color)
+    {
+        m_atmosphereSunDir   = dir;
+        m_atmosphereSunColor = color;
+    }
 
-    /** Moon disk direction + colour + visibility. These are tracked separately
-     *  from the "active body" pair so the skybox can keep drawing the moon
-     *  while it descends below horizon (and start drawing it before moonrise
-     *  flips the active body), without the active-body lighting switch having
-     *  to overlap across the horizon. */
-    const DirectX::XMFLOAT3& GetMoonDir()   const { return m_moonDir; }
-    const DirectX::XMFLOAT3& GetMoonColor() const { return m_moonColor; }
-    bool                     IsMoonDiskVisible() const { return m_moonDiskVisible; }
-
-    /** Tunable moon brightness multiplier (relative to sun's basePeak). */
-    void  SetMoonIntensityScale(float s) { m_moonIntensityScale = s; }
-    float GetMoonIntensityScale() const  { return m_moonIntensityScale; }
+    /** Global IBL strength. Master scale on indirect lighting (both diffuse
+     *  and specular IBL contributions in Lighting.ps). 0 = no IBL at all. */
+    void SetIBLStrength(float s)   { m_iblStrength = s; }
+    float GetIBLStrength() const   { return m_iblStrength; }
 
     /** SRV of the procedural sky cubemap (for SkyboxPass to sample as backdrop).
      *  Returns 0 if atmosphere has never run. */
@@ -238,8 +185,37 @@ private:
     ShaderLibrary      m_shaderLib;
     RHI::PipelineState m_pso;
 
-    RHI::GPUBuffer     m_cb;           // UPLOAD — SHConstants
-    void*              m_cbMapped = nullptr;
+    // CB pool strides / slot counts — kept here so the multi-slot pool structs
+    // below can size themselves at compile time. Definitions live in
+    // SkyIBLPass.cpp; redeclared here as static constexpr for sizing only.
+    static constexpr uint32_t kPrefilterCBStride = 256;
+    static constexpr uint32_t kPrefilterCBSlots  = kSpecularMips * 6;
+    static constexpr uint32_t kLutCBStride       = 512;
+    static constexpr uint32_t kLutCBSlots        = 5;
+
+    // Multi-slot CB pool wrappers — see BloomPass.h for the established pattern.
+    // Each pool is one buffer holding N × stride bytes; per-dispatch writes
+    // target a unique slot so CPU writes never overwrite data the GPU is still
+    // reading from a previous in-flight frame's binding.
+    struct alignas(256) PrefilterCBPool { uint8_t bytes[kPrefilterCBStride * kPrefilterCBSlots]; };
+    struct alignas(256) AtmoLutCBPool   { uint8_t bytes[kLutCBStride       * kLutCBSlots];      };
+
+    struct alignas(16) SHConstants
+    {
+        uint32_t sampleCount;
+        uint32_t _pad[3];
+    };
+    FrameCB<SHConstants> m_cb;          // UPLOAD — SHConstants
+
+    struct alignas(16) AtmosphereConstants
+    {
+        float    sunDir[3];    float    _pad0;
+        float    sunColor[3];  uint32_t faceSize;
+        float    cameraAltitudeKm;
+        float    _pad1;
+        float    _pad2;
+        float    _pad3;
+    };
 
     RHI::GPUBuffer     m_shBuffer;     // UAV + SRV — 9 float4 coefficients
     uint64_t           m_shUavHandle = 0;
@@ -251,8 +227,8 @@ private:
 
     // ---- Specular pre-filter (Phase 2) ---------------------------------------
     RHI::PipelineState m_prefilterPSO;
-    RHI::GPUBuffer     m_prefilterCB;       // UPLOAD — N×256 for N mips
-    void*              m_prefilterCBMapped = nullptr;
+    // UPLOAD — kSpecularMips × 6 × 256 bytes, one slot per (face, mip) pair.
+    FrameCB<PrefilterCBPool> m_prefilterCB;
 
     // Single UAV-capable cubemap (128×128×6, 7 mips, R16G16B16A16_FLOAT).
     // Per-mip array UAVs + TextureCube SRV are auto-created by the RHI when
@@ -280,33 +256,22 @@ private:
     bool                                   m_atmosphereEnabled = false;
     SkyboxSource                           m_skyboxSource      = SkyboxSource::Atmosphere;
     RHI::PipelineState                     m_atmospherePSO;
-    RHI::GPUBuffer                         m_atmosphereCB;
-    void*                                  m_atmosphereCBMapped = nullptr;
+    FrameCB<AtmosphereConstants>           m_atmosphereCB;       // UPLOAD — AtmosphereConstants
 
     RHI::Texture       m_atmosphereTex;
     RHI::ResourceState m_atmosphereState = RHI::ResourceState::UNORDERED_ACCESS;
     uint64_t           m_atmosphereSrvHandle = 0;
 
     // "Active body" — the direction + colour the rest of the engine treats as
-    // the directional light. This is the SUN by day and the MOON by night.
+    // the directional light (SUN by day, MOON by night). Pushed by Renderer
+    // from the SunLightTag entity (or TODOutput when TOD is active).
     DirectX::XMFLOAT3                      m_sunDir   { 0.0f, 1.0f, 0.0f };
     DirectX::XMFLOAT3                      m_sunColor { 10.0f, 10.0f, 10.0f };
-    // "Geometric sun" — the true sun direction even when below horizon, with
-    // colour forced to zero below horizon. The atmosphere / aerial-perspective
-    // updates use this so the sky stays dark at night instead of computing
-    // Rayleigh scattering from the moon (which would produce a faint blue
-    // daylight dome — incorrect, since real moonlight is too dim to scatter).
+    // "Geometric sun" — true sun direction even when below horizon, with
+    // colour forced to zero below horizon. Atmosphere / aerial-perspective
+    // sample this so the sky stays dark at night. Pushed via SetAtmosphereSun.
     DirectX::XMFLOAT3                      m_atmosphereSunDir   { 0, 1, 0 };
     DirectX::XMFLOAT3                      m_atmosphereSunColor { 0, 0, 0 };
-    bool                                   m_isMoon            = false;
-    float                                  m_moonIntensityScale = 0.015f; // ~1.5% of sun
-    // Skybox-only moon state — always tracks the moon's position (= -sunDir)
-    // regardless of which body drives the lighting, and stays visible for a
-    // few degrees below horizon so the disk fades out smoothly instead of
-    // popping off at exactly 0°.
-    DirectX::XMFLOAT3                      m_moonDir           { 0, -1, 0 };
-    DirectX::XMFLOAT3                      m_moonColor         { 0.55f, 0.70f, 1.0f };
-    bool                                   m_moonDiskVisible   = false;
 
     // ---- Hillaire LUTs -------------------------------------------------------
     RHI::PipelineState                     m_transmittancePSO;
@@ -322,28 +287,17 @@ private:
     RHI::Texture       m_skyViewTex;
     RHI::ResourceState m_skyViewState = RHI::ResourceState::UNORDERED_ACCESS;
 
-    // Shared CB pool for per-dispatch constants (4 × 256B slots).
-    RHI::GPUBuffer                         m_atmoLutCB;
-    void*                                  m_atmoLutCBMapped = nullptr;
+    // Shared CB pool for per-dispatch atmosphere LUT constants
+    // (5 × 512B slots: Transmittance / MultiScatter / SkyView / [unused Atmo] / Aerial).
+    FrameCB<AtmoLutCBPool> m_atmoLutCB;
 
     bool                                   m_staticLutsBaked = false;
 
-    // Time-of-day state.
-    bool  m_timeOfDayEnabled = false;
-    float m_timeOfDay        = 0.35f;         // just past sunrise by default
-    float m_timeSpeed        = 0.0f;          // paused by default
-    float m_latitudeRad      = 0.6f;          // ~34° N, mid-latitude
-    float m_sunIntensityScale = 1.0f;         // master sun / sky brightness
     // Global IBL multiplier. Default 0.1 — IBL at full strength on a default
     // sky was overwhelming the direct-light contribution; 0.1 gives a subtle
     // ambient fill without flattening the directional shading. Editor slider
     // (or per-scene .ippc) raises if a scene needs full IBL.
     float m_iblStrength       = 0.1f;
-    // Flat ambient base — baseline indirect contribution before IBL/probes.
-    // Default 0 so unlit faces stay genuinely dark and IBL/probe diffuse is
-    // the only indirect source. Editor slider can dial back up if a scene
-    // needs a fill term (typically a faint sky-tint, ~0.05-0.1 luma).
-    DirectX::XMFLOAT3 m_ambientColor { 0.0f, 0.0f, 0.0f };
 
     // ---- Aerial Perspective -------------------------------------------------
     RHI::PipelineState m_aerialPSO;

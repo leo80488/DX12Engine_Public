@@ -39,6 +39,7 @@ public:
         RHI::GPUBuffer indexBuffer;
         uint32_t meshDescSlot = RHI::kInvalidBufferIndex;
         uint32_t indexCount   = 0;
+        uint32_t vertexCount  = 0; // retained for RebindDescriptor after OnWorldClear
     };
 
     // Initialise the descriptor heap. Must be called once at startup.
@@ -53,7 +54,15 @@ public:
 
     // Upload a ProceduralMesh::MeshData and register its buffers + MeshDescriptor.
     // On success fills @p out.meshDescSlot and @p out.indexCount.
-    bool UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out);
+    //
+    // @p persistent controls which slot range the bindless registrations use:
+    //   true  → MeshDescriptorHeap::RegisterPersistent* (engine-lifetime;
+    //           slot survives world reloads). Use for Init-time uploads
+    //           (primitives, billboard, anything cached forever).
+    //   false → world-scoped; slot invalidated on next OnWorldClear. Use for
+    //           gameplay-time procedural geometry that's expected to die
+    //           with the world.
+    bool UploadMesh(const ProceduralMesh::MeshData& data, GPUMesh& out, bool persistent = false);
 
     // Register one mesh inside a MeshLibrary. Library shared VB/IB register once
     // into the bindless table; each unique (lib, meshId) gets its own

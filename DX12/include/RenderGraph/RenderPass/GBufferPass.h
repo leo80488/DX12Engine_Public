@@ -51,6 +51,12 @@ public:
     }
     void ClearIndirectDraw() { m_indirectArgBuffer = nullptr; m_indirectGroups.clear(); }
 
+    // Global view-mode: when true, geometry rasterizes as FILL_MODE_WIREFRAME.
+    // BuildPSODesc bakes it into the PSO key (PSOCache hashes rs.fill_mode), so
+    // solid (false) reuses the existing PSOs and wireframe gets its own variant.
+    // Driven per-frame by Renderer from ViewMode::Wireframe.
+    void SetWireframe(bool w) { m_wireframe = w; }
+
     // Expose the owned ShaderLibrary so upstream code (Renderer::BuildRenderScene)
     // can RegisterDynamic material-provided custom PSes into the same registry
     // that PSOCache consults when it resolves psID → bytecode.
@@ -108,4 +114,7 @@ private:
     // ExecuteIndirect path (set per-frame by Renderer).
     const RHI::GPUBuffer*           m_indirectArgBuffer = nullptr;
     std::vector<::IndirectGroup>    m_indirectGroups;
+
+    // Global view-mode wireframe toggle (see SetWireframe).
+    bool                            m_wireframe = false;
 };

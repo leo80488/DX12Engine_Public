@@ -18,6 +18,7 @@
 // flags        : bit0 = baked (cubemap content valid), bit1 = needsRebake.
 
 #include <cstdint>
+#include <string>
 #include <DirectXMath.h>
 
 struct ReflectionProbeComponent
@@ -49,6 +50,22 @@ struct ReflectionProbeComponent
     bool     realtime           = false;
     uint32_t tickIntervalFrames = 60;
     uint64_t lastBakedFrame     = 0;
+
+    // ---- Baked-cubemap persistence ----------------------------------------
+    // Disk path of the exported cubemap .itex for this (non-realtime) probe.
+    // .itex is the engine's native texture container (same format Texture-
+    // Importer writes / TextureLoader reads). SaveScene → Renderer::Export-
+    // BakedProbeCubemaps fills this in and writes the .itex; the component
+    // serializer persists the string. On the next LoadScene, Renderer::Build-
+    // Scene_UploadProbes loads the file straight into the probe's cubemap-
+    // array slice instead of enqueueing a fresh (expensive 6-face + prefilter)
+    // bake. Empty = no cached bake on disk. Realtime probes never use this —
+    // they re-bake on an interval anyway.
+    std::string bakedCubemapPath;
+    // Runtime guard: set true after the first disk-load attempt (success OR
+    // failure) so a missing/corrupt file isn't retried — and re-stalled — every
+    // frame. Not serialized; default-false after a load means "try once".
+    bool        cacheLoadAttempted = false;
 
     constexpr bool IsBaked() const       { return (flags & BAKED) != 0; }
     constexpr bool NeedsRebake() const   { return (flags & NEEDS_REBAKE) != 0; }

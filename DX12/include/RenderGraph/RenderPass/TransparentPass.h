@@ -59,6 +59,11 @@ public:
         m_reflectionProbeBufferHandle = bufferHandle;
     }
 
+    // Global view-mode: FILL_MODE_WIREFRAME when true (baked into the PSO key).
+    // Driven per-frame by Renderer from ViewMode::Wireframe. The forward shader
+    // (Transparent.ps) handles the Unlit/Wireframe color itself.
+    void SetWireframe(bool w) { m_wireframeMode = w; }
+
 private:
     // Build PSO descriptor for a given permutation (selects blend mode + cull).
     // `customPSID > 0` substitutes the default Transparent_PS for a dynamic
@@ -96,4 +101,7 @@ private:
     // The handles point at persistent resources owned by ReflectionProbeManager.
     uint64_t m_reflectionProbeArrayHandle  = 0;
     uint64_t m_reflectionProbeBufferHandle = 0;
+
+    // Global view-mode wireframe toggle (see SetWireframe).
+    bool     m_wireframeMode = false;
 };

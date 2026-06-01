@@ -26,7 +26,7 @@ void TracerSystem::Init(IGraphicsDevice& gfx)
         m_poolUav = gfx.GetBufferUAVGpuHandle(m_pool);
     }
 
-    // ---- Spawn upload buffer (UPLOAD heap, SR-bound StructuredBuffer) -----
+    // ---- Spawn upload buffer (UPLOAD, SR StructuredBuffer) — triple-buffered
     {
         RHI::GPUBufferDesc d{};
         d.size       = static_cast<uint64_t>(kMaxSpawnsPerFrame) * sizeof(TracerSpawnGPU);
@@ -34,26 +34,21 @@ void TracerSystem::Init(IGraphicsDevice& gfx)
         d.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         d.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
         d.stride     = sizeof(TracerSpawnGPU);
-        if (gfx.CreateBuffer(d, m_spawnBuffer))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_spawnMapped = gfx.MapBuffer(m_spawnBuffer);
-            m_spawnSrv    = gfx.GetBufferSRVGpuHandle(m_spawnBuffer);
+            if (gfx.CreateBuffer(d, m_spawnBuffer[i]))
+            {
+                m_spawnMapped[i] = gfx.MapBuffer(m_spawnBuffer[i]);
+                m_spawnSrv[i]    = gfx.GetBufferSRVGpuHandle(m_spawnBuffer[i]);
+            }
+            if (!m_spawnMapped[i])
+                LOG_ERROR("TracerSystem: spawn buffer[%u] map failed", i);
         }
-        if (!m_spawnMapped)
-            LOG_ERROR("TracerSystem: spawn buffer map failed");
     }
 
-    // ---- System CB (UPLOAD heap, root CBV) --------------------------------
-    {
-        RHI::GPUBufferDesc d{};
-        d.size       = 256;
-        d.usage      = RHI::Usage::UPLOAD;
-        d.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(d, m_systemCB))
-            m_systemCBMapped = gfx.MapBuffer(m_systemCB);
-        if (!m_systemCBMapped)
-            LOG_ERROR("TracerSystem: system CB map failed");
-    }
+    // ---- System CB (UPLOAD heap, root CBV) — triple-buffered --------------
+    if (!m_systemCB.Create(gfx, "TracerSystem.SystemCB"))
+        LOG_ERROR("TracerSystem: system CB create failed");
 
     m_pendingSpawns.reserve(kMaxSpawnsPerFrame);
 
@@ -64,12 +59,25 @@ void TracerSystem::Init(IGraphicsDevice& gfx)
 
 void TracerSystem::Shutdown(IGraphicsDevice& gfx)
 {
-    if (m_systemCBMapped)  { gfx.UnmapBuffer(m_systemCB);   m_systemCBMapped = nullptr; }
-    if (m_spawnMapped)     { gfx.UnmapBuffer(m_spawnBuffer); m_spawnMapped   = nullptr; }
-    if (m_systemCB.IsValid())   gfx.DestroyBuffer(m_systemCB);
-    if (m_spawnBuffer.IsValid())gfx.DestroyBuffer(m_spawnBuffer);
+    m_systemCB.Destroy(gfx);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (m_spawnMapped[i])  { gfx.UnmapBuffer(m_spawnBuffer[i]); m_spawnMapped[i] = nullptr; }
+        if (m_spawnBuffer[i].IsValid()) gfx.DestroyBuffer(m_spawnBuffer[i]);
+        m_spawnSrv[i] = 0;
+    }
     if (m_pool.IsValid())       gfx.DestroyBuffer(m_pool);
     m_gfx = nullptr;
+}
+
+const RHI::GPUBuffer& TracerSystem::GetSpawnBuffer(IGraphicsDevice& gfx) const
+{
+    return m_spawnBuffer[gfx.GetFrameIndex()];
+}
+
+uint64_t TracerSystem::GetSpawnSRV(IGraphicsDevice& gfx) const
+{
+    return m_spawnSrv[gfx.GetFrameIndex()];
 }
 
 void TracerSystem::Spawn(const DirectX::XMFLOAT3& start,
@@ -96,6 +104,8 @@ void TracerSystem::Spawn(const DirectX::XMFLOAT3& start,
 void TracerSystem::BeginFrame(float dt, uint32_t /*frameIndex*/, float globalTimeSeconds)
 {
     m_lastGlobalTime = globalTimeSeconds;
+    if (!m_gfx) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
 
     // Clamp spawn count to upload-buffer capacity.
     const uint32_t spawnCount = std::min(static_cast<uint32_t>(m_pendingSpawns.size()),
@@ -103,16 +113,16 @@ void TracerSystem::BeginFrame(float dt, uint32_t /*frameIndex*/, float globalTim
 
     // Patch spawnTime now we know the actual frame time (Spawn is called
     // mid-frame and may have stale lastGlobalTime).
-    if (spawnCount > 0 && m_spawnMapped)
+    if (spawnCount > 0 && frameSlot < kFrameCount && m_spawnMapped[frameSlot])
     {
         for (uint32_t i = 0; i < spawnCount; ++i)
             m_pendingSpawns[i].spawnTime = globalTimeSeconds;
-        std::memcpy(m_spawnMapped, m_pendingSpawns.data(),
+        std::memcpy(m_spawnMapped[frameSlot], m_pendingSpawns.data(),
                     spawnCount * sizeof(TracerSpawnGPU));
     }
 
     // System CB.
-    if (m_systemCBMapped)
+    if (auto* slot = m_systemCB.Current(*m_gfx))
     {
         TracerSystemParams cb{};
         cb.deltaTime    = dt;
@@ -120,7 +130,7 @@ void TracerSystem::BeginFrame(float dt, uint32_t /*frameIndex*/, float globalTim
         cb.spawnCount   = spawnCount;
         cb.time         = globalTimeSeconds;
         cb.writeCursor  = m_writeCursor;
-        std::memcpy(m_systemCBMapped, &cb, sizeof(cb));
+        *slot = cb;
     }
 
     m_spawnCountThisFrame = spawnCount;

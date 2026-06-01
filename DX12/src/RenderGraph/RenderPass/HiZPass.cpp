@@ -39,12 +39,7 @@ void HiZPass::Init(IGraphicsDevice& gfx)
     }
 
     // CB
-    RHI::GPUBufferDesc bd{};
-    bd.size       = 256; // padded to 256-byte alignment
-    bd.usage      = RHI::Usage::UPLOAD;
-    bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(bd, m_cb))
-        m_cbMapped = gfx.MapBuffer(m_cb);
+    m_cb.Create(gfx, "HiZ.CB");
 
     LOG_SUCCESS("HiZPass: initialized");
 }
@@ -111,12 +106,12 @@ void HiZPass::Execute(RHI::CommandList cl, uint64_t depthSrvHandle)
 
         gfx.BindComputePipelineState(m_pso, cl);
 
-        if (m_cbMapped)
+        if (auto* slot = m_cb.Current(gfx))
         {
             HiZCB cb{ w, h, w, h };
-            std::memcpy(m_cbMapped, &cb, sizeof(cb));
+            *slot = cb;
         }
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+        gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
         gfx.SetComputeDescriptorTable(kSRV0, depthSrvHandle, cl);
         gfx.SetComputeDescriptorTable(kUAV0,
             gfx.GetTextureMipUAVGpuHandle(m_hiZTexture, 0), cl);
@@ -139,12 +134,12 @@ void HiZPass::Execute(RHI::CommandList cl, uint64_t depthSrvHandle)
         // Reduce shader reads srcWidth/srcHeight from CB (= this mip's size)
         // and writes to DTid coordinates bounded by that. CB layout is shared
         // with HiZGenerate_CS; dstW/dstH fields are ignored by Reduce.
-        if (m_cbMapped)
+        if (auto* slot = m_cb.Current(gfx))
         {
             HiZCB cb{ dstW, dstH, dstW, dstH };
-            std::memcpy(m_cbMapped, &cb, sizeof(cb));
+            *slot = cb;
         }
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+        gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
 
         // u0 = source (prev mip, read-only UAV), u1 = dest (this mip).
         gfx.SetComputeDescriptorTable(kUAV0,

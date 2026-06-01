@@ -1,29 +1,38 @@
 #include "Graphics/Renderer.h"
+
+// engine graphics / backend
 #include "Graphics/GraphicsDX12.h"
+#include "Graphics/ShadowSystem.h"
+#include "Graphics/ParticleSystem.h"
+#include "Graphics/TracerSystem.h"
+#include "Graphics/BeamSystem.h"
+#include "Graphics/AfterimageSystem.h"
+#include "Graphics/TrailSystem.h"
+#include "Graphics/SSR/SSRSubsystem.h"
+#include "Graphics/IVideoDecoder.h"
+#include "Graphics/ReflectionProbeTypes.h"
+#include "Graphics/GPUInstanceData.h"
+#include "Graphics/IndirectDrawCommand.h"
+
+// render passes
 #include "RenderGraph/RenderPass/DDGIPass.h"
 #include "RenderGraph/RenderPass/DDGIProbeDebugPass.h"
-#include "ECS/BillboardComponent.h"
 #include "RenderGraph/RenderPass/GBufferPass.h"
 #include "RenderGraph/RenderPass/TerrainPass.h"
-#include "ECS/TerrainComponent.h"
 #include "RenderGraph/RenderPass/LightingPass.h"
 #include "RenderGraph/RenderPass/PickingPass.h"
 #include "RenderGraph/RenderPass/SkyboxPass.h"
 #include "RenderGraph/RenderPass/TransparentPass.h"
 #include "RenderGraph/RenderPass/ShadowPass.h"
-#include "Graphics/ShadowSystem.h"
 #include "RenderGraph/RenderPass/AutoExposurePass.h"
 #include "RenderGraph/RenderPass/BloomPass.h"
 #include "RenderGraph/RenderPass/LensFlarePass.h"
 #include "RenderGraph/RenderPass/ToneMapPass.h"
 #include "RenderGraph/RenderPass/TAAPass.h"
+#include "RenderGraph/RenderPass/FXAAPass.h"
 #include "RenderGraph/RenderPass/XeGTAOPass.h"
 #include "RenderGraph/RenderPass/CASPass.h"
 #include "RenderGraph/RenderPass/GlassShatterPass.h"
-#include "PostProcess/PostProcessStack.h"
-#include "PostProcess/BuiltinPostProcessEffects.h"
-#include "PostProcess/VolumeSystem.h"
-#include "PostProcess/EntityVolumeSource.h"
 #include "RenderGraph/RenderPass/SkyIBLPass.h"
 #include "RenderGraph/RenderPass/VolumetricFogPass.h"
 #include "RenderGraph/RenderPass/SceneVoxelPass.h"
@@ -34,16 +43,10 @@
 #include "RenderGraph/RenderPass/ReflectionProbeCapturePass.h"
 #include "RenderGraph/RenderPass/SpotShadowPass.h"
 #include "RenderGraph/RenderPass/ParticlePasses.h"
-#include "Graphics/ParticleSystem.h"
-#include "Graphics/TracerSystem.h"
 #include "RenderGraph/RenderPass/TracerPasses.h"
-#include "Graphics/BeamSystem.h"
 #include "RenderGraph/RenderPass/BeamSimPass.h"
-#include "ECS/BeamComponent.h"
-#include "ECS/ParticleComponent.h"
+#include "RenderGraph/RenderPass/AfterimageCapturePass.h"
 #include "RenderGraph/RenderPass/TrailPasses.h"
-#include "Graphics/TrailSystem.h"
-#include "ECS/TrailComponent.h"
 #include "RenderGraph/RenderPass/CullingPass.h"
 #include "RenderGraph/RenderPass/HiZPass.h"
 #include "RenderGraph/RenderPass/SSRPass.h"
@@ -52,366 +55,67 @@
 #include "RenderGraph/RenderPass/DebugWirePass.h"
 #include "RenderGraph/RenderPass/UIPass.h"
 #include "RenderGraph/RenderPass/WorldUIBillboardPass.h"
-#include "ECS/SkyboxComponent.h"
-#include "ECS/ReflectionProbeComponent.h"
-#include "Graphics/ReflectionProbeTypes.h"
-#include "Graphics/GraphicsDX12.h"
-#include "Graphics/GPUInstanceData.h"
-#include <unordered_set>
-#include "Graphics/IndirectDrawCommand.h"
-#include "Resource/ProceduralMesh.h"
-#include "Resource/MaterialSystem.h"
+#include "RenderGraph/RenderPass/CloudPass.h"
+#include "RenderGraph/RenderPass/VideoPass.h"
+#include "RenderGraph/RenderPass/VideoQuadPass.h"
+
+// post-process
+#include "PostProcess/PostProcessStack.h"
+#include "PostProcess/BuiltinPostProcessEffects.h"
+#include "PostProcess/VolumeSystem.h"
+#include "PostProcess/EntityVolumeSource.h"
+
+// ECS components + systems
 #include "ECS/ECS.h"
 #include "ECS/Components.h"
+#include "ECS/BillboardComponent.h"
+#include "ECS/TerrainComponent.h"
+#include "ECS/BeamComponent.h"
+#include "ECS/ParticleComponent.h"
+#include "ECS/VFXSpawnRequests.h"   // unified VFX Lane-B mailboxes (Tracer/Decal/Afterimage/Mesh)
+#include "ECS/TrailComponent.h"
+#include "ECS/SkyboxComponent.h"
+#include "ECS/AtmosphereComponent.h"
+#include "ECS/CloudComponent.h"
+#include "ECS/TODComponents.h"
+#include "ECS/TODSystems.h"
+#include "ECS/VideoComponent.h"
+#include "ECS/ReflectionProbeComponent.h"
 #include "ECS/HierarchyComponents.h"
 #include "ECS/MaterialReflectionSync.h"
+
+// resource system
+#include "Resource/MaterialSerializer.h"  // Resource::LoadMaterial (mesh VFX material)
+#include "Resource/ProceduralMesh.h"
+#include "Resource/MaterialSystem.h"
+
+// engine systems
 #include "System/Log.h"
 #include "System/TaskSystem.h"
 #include "System/EventBus.h"
+
+// STL / DirectXMath
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
-
+#include <unordered_set>
 #include <DirectXMath.h>
 #include <algorithm>
 #include <cstring>
 #include <execution>
-
+#include <filesystem>
 #include <cmath>
 
 using namespace DirectX;
 
-// CPU-side cbuffer mirrors. Layouts MUST stay in sync with the matching HLSL.
-namespace
-{
-    // viewProj is JITTERED for SV_POSITION; curViewProjNoJitter feeds velocity.
-    struct alignas(16) PerViewCB
-    {
-        float viewProj[16];            // current, jittered (rasterization)
-        float prevViewProj[16];        // previous frame, unjittered (velocity)
-        float curViewProjNoJitter[16]; // current, unjittered (velocity numerator)
-    };
-    static constexpr uint64_t kPerViewCBSize = (sizeof(PerViewCB) + 255u) & ~255ull;
-
-    // Mirror of light_cb.hlsli — do NOT reorder fields without touching both.
-    struct alignas(16) LightCB
-    {
-        float    lightDir[3];    float pad0;
-        float    lightColor[3];  float pad1;
-        float    ambient[3];     float pad2;
-        float    cameraPos[3];   float pad3;
-        float    invViewProj[16];
-        uint32_t iblRadianceMips;
-        float    iblStrength;
-        uint32_t iblUseSH;                   // 0=irradiance cube, 1=gSkySH
-        float    aerialMaxDistKm;            // 0 = AP disabled
-        // CSM: cascades 0..2 standard, cascade 3 ultra-far for terrain self-shadow.
-        float    shadowMatrix[4][16];        // 256B — per-cascade light VP, transposed
-        float    cascadeSplits[4];
-        float    cascadeTexelWorldSize[4];
-        float    shadowBias;
-        float    shadowStrength;             // 0 disabled, 1 full
-        float    shadowMapTexelSize;
-        float    shadowBlendRange;
-        uint32_t shadowFrameIndex;           // PCF dither rotation
-        float    shadowNormalOffset;
-        float    _shadowPad0;
-        float    _shadowPad1;
-        float    cameraForward[3];           // unit camera forward
-        float    _shadowPad2;
-        float    viewMatrix[16];             // clustered lighting (world→view)
-        float    clusterNearZ;
-        float    clusterFarZ;
-        uint32_t clusterLightCount;
-        float    nprMinBrightness;
-        uint32_t reflectionProbeCount;       // gReflectionProbes valid count; 0 = sky cube fallback
-        float    reflectionPad[3];
-        uint32_t ddgiVolumeCount;            // 0..4; 0 = SkyIBL diffuse fallback
-        uint32_t ddgiEnabled;
-        float    ddgiDiffuseScale;
-        float    skyIBLDiffuseScale;
-        float    ddgiAONearFieldStrength;    // see light_cb.hlsli — DDGI-path AO attenuation
-        float    _ddgiPad0;
-        float    _ddgiPad1;
-        float    _ddgiPad2;
-    };
-    static constexpr uint64_t kLightCBSize = (sizeof(LightCB) + 255u) & ~255ull;
-
-    struct alignas(16) ShadowPerViewCB { float shadowViewProj[16]; };
-    static constexpr uint64_t kShadowCBSize = (sizeof(ShadowPerViewCB) + 255u) & ~255ull;
-
-    // Mirror of Terrain.{ms,ps,as}.hlsl cbuffer TerrainCB; each block is 16B aligned.
-    struct alignas(16) TerrainParamsCB
-    {
-        // Block 0: world tile placement
-        float    worldOriginX, worldOriginY;
-        float    worldSize;
-        float    heightScale;
-        // Block 1: heightmap UV remap
-        float    heightmapUVOffsetX, heightmapUVOffsetY;
-        float    heightmapUVScaleX,  heightmapUVScaleY;
-        // Block 2: heightmap meta + splatmap flag + center Y
-        float    heightmapTexel;
-        uint32_t hasHeightmap;       // 0 ⇒ flat
-        uint32_t hasSplatmap;        // 0 ⇒ slope debug colour
-        float    worldCenterY;
-        // Blocks 3..7: per-layer bindless slots + tiling (-1 ⇒ disabled)
-        int32_t  layerBindlessIdx[4];
-        float    layerTilingScale[4];
-        int32_t  layerNormalIdx[4];
-        int32_t  layerARMIdx[4];
-        int32_t  layerDispIdx[4];
-        // Block 8: multi-tile + AS cull flag
-        uint32_t tilesPerSide;
-        uint32_t enableFrustumCull;
-        float    _pad8a, _pad8b;
-        // Blocks 9..14: per-layer auto-blend params (height + slope ranges, PS only)
-        float    layerMinHeight   [4];
-        float    layerMaxHeight   [4];
-        float    layerFadeHeight  [4];
-        float    layerMinSlopeDeg [4];
-        float    layerMaxSlopeDeg [4];
-        float    layerFadeSlopeDeg[4];
-        // Blocks 15..20: 6 world-space frustum planes (a*x + b*y + c*z + d ≥ 0).
-        // AS-only; ShadowPass overwrites per-cascade for shadow culling.
-        float    frustumPlanes[6][4];
-    };
-    static_assert(sizeof(TerrainParamsCB) == 336, "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + this struct");
-    static constexpr uint64_t kTerrainCBSize = (sizeof(TerrainParamsCB) + 255u) & ~255ull;
-
-    // Lazy linear-color cache refresh — 14 powf calls only when sRGB colors changed.
-    static void RefreshLinearCache(const MaterialComponent& mc)
-    {
-        auto srgbToLinear = [](float c) { return std::powf(std::max(c, 0.f), 2.2f); };
-        mc._linearBaseColor     = { srgbToLinear(mc.baseColor.x),
-                                    srgbToLinear(mc.baseColor.y),
-                                    srgbToLinear(mc.baseColor.z),
-                                    mc.baseColor.w };
-        mc._linearSpecularColor = { srgbToLinear(mc.specularColor.x),
-                                    srgbToLinear(mc.specularColor.y),
-                                    srgbToLinear(mc.specularColor.z),
-                                    mc.specularColor.w };
-        mc._linearEmissiveColor = { srgbToLinear(mc.emissiveColor.x),
-                                    srgbToLinear(mc.emissiveColor.y),
-                                    srgbToLinear(mc.emissiveColor.z),
-                                    mc.emissiveColor.w };
-        mc._linearNprDiffuseRamp = { srgbToLinear(mc.nprDiffuseRampColor.x),
-                                     srgbToLinear(mc.nprDiffuseRampColor.y),
-                                     srgbToLinear(mc.nprDiffuseRampColor.z) };
-        mc._linearNprShadowRamp  = { srgbToLinear(mc.nprShadowRampColor.x),
-                                     srgbToLinear(mc.nprShadowRampColor.y),
-                                     srgbToLinear(mc.nprShadowRampColor.z) };
-        const_cast<MaterialComponent&>(mc)._flags &= ~MaterialComponent::GPU_LINEAR_CACHE_DIRTY;
-    }
-
-    // Write a MaterialComponent into one slot of the per-frame material buffer.
-    // Walks customParams/customTextures in reflection order — must match shader-side indexing.
-    static void WriteMatSlot(Resource::MaterialGPUData* buf, uint32_t slot,
-                             const MaterialComponent* mc,
-                             const ShaderReflect::Reflection* customRefl = nullptr)
-    {
-        if (!buf) return;
-        Resource::MaterialGPUData& dst = buf[slot];
-        if (mc)
-        {
-            if (mc->_flags & MaterialComponent::GPU_LINEAR_CACHE_DIRTY)
-                RefreshLinearCache(*mc);
-
-            // ---- PBR scalars ----
-            dst.roughnessMin   = mc->roughnessMin;
-            dst.roughnessMax   = mc->roughnessMax;
-            dst.metalnessMin   = mc->metalnessMin;
-            dst.metalnessMax   = mc->metalnessMax;
-            dst.reflectance    = mc->reflectance;
-            dst.normalStrength = mc->normalMapStrength;
-            dst.saturation     = mc->saturation;
-            dst.alphaRef       = mc->alphaRef;
-
-            // ---- PBR colors (linear cache — no powf on the hot path) ----
-            dst.baseColor[0]      = mc->_linearBaseColor.x;
-            dst.baseColor[1]      = mc->_linearBaseColor.y;
-            dst.baseColor[2]      = mc->_linearBaseColor.z;
-            dst.baseColor[3]      = mc->_linearBaseColor.w;
-            dst.specularColor[0]  = mc->_linearSpecularColor.x;
-            dst.specularColor[1]  = mc->_linearSpecularColor.y;
-            dst.specularColor[2]  = mc->_linearSpecularColor.z;
-            dst.specularColor[3]  = mc->_linearSpecularColor.w;
-            dst.emissiveColor[0]  = mc->_linearEmissiveColor.x;
-            dst.emissiveColor[1]  = mc->_linearEmissiveColor.y;
-            dst.emissiveColor[2]  = mc->_linearEmissiveColor.z;
-            dst.emissiveColor[3]  = mc->_linearEmissiveColor.w;
-
-            // nprMinBrightness doubles as the "is-NPR" flag (encoded into normal.w by GBuffer).
-            const bool isNPR = (mc->shaderType == MaterialComponent::SHADERTYPE_NPR_RAMP ||
-                                mc->shaderType == MaterialComponent::SHADERTYPE_NPR_COLOR);
-            dst.shaderType         = static_cast<uint32_t>(mc->shaderType);
-            dst.nprMinBrightness   = isNPR ? mc->nprMinBrightness : 0.0f;
-            dst.nprShadowThreshold = mc->nprShadowThreshold;
-            dst.nprShadowSmooth    = mc->nprShadowSmooth;
-
-            dst.nprRimPower         = mc->nprRimPower;
-            dst.nprRimStrength      = mc->nprRimStrength;
-            dst.nprRampBlend        = mc->nprRampBlend;
-            dst.nprBrightnessClamp  = mc->nprBrightnessClamp;
-
-            dst.nprDiffuseRampColor[0] = mc->_linearNprDiffuseRamp.x;
-            dst.nprDiffuseRampColor[1] = mc->_linearNprDiffuseRamp.y;
-            dst.nprDiffuseRampColor[2] = mc->_linearNprDiffuseRamp.z;
-            dst.nprMaxBrightness       = mc->nprMaxBrightness;
-
-            dst.nprShadowRampColor[0] = mc->_linearNprShadowRamp.x;
-            dst.nprShadowRampColor[1] = mc->_linearNprShadowRamp.y;
-            dst.nprShadowRampColor[2] = mc->_linearNprShadowRamp.z;
-            dst._padNprShadow         = 0.0f;
-
-            dst.nprMidWeight  = mc->nprMidWeight;
-            dst.nprVeinWeight = mc->nprVeinWeight;
-            dst.nprSSSWeight  = mc->nprSSSWeight;
-            dst._padNprSss    = 0.0f;
-
-            dst.paramCount = 14;  // legacy "count of populated engine slots"
-
-            for (int s = 0; s < MaterialComponent::TEXTURESLOT_COUNT && s < Resource::kMaxTextureSlots; ++s)
-                dst.textureHandleIds[s] = mc->textures[s].bindlessIndex;
-            dst.textureCount = MaterialComponent::TEXTURESLOT_COUNT;
-
-            // Per-material GPU flag bitmask read inside pixel shaders.
-            dst.materialFlags = 0u;
-            if (mc->_flags & MaterialComponent::EXCLUDE_FROM_SSAO)
-                dst.materialFlags |= (1u << 0);   // MAT_FLAG_EXCLUDE_FROM_SSAO
-            if (mc->_flags & MaterialComponent::DISABLE_RECEIVE_SHADOW)
-                dst.materialFlags |= (1u << 1);   // MAT_FLAG_DISABLE_RECEIVE_SHADOW
-
-            // Custom-shader params/textures — reflection-order, skipping reserved cbuffers/structs/arrays.
-            std::memset(dst.customParams,     0, sizeof(dst.customParams));
-            for (int i = 0; i < Resource::kMaxCustomTextures; ++i) dst.customTextureIds[i] = -1;
-            dst.customParamCount    = 0;
-            dst.customTextureCount  = 0;
-            // Shading model is authoritative even when custom PS isn't resolved yet.
-            dst.customShadingModel  = mc->useCustomShader
-                ? static_cast<uint32_t>(mc->customShadingModel)
-                : 0u;
-
-            if (customRefl && mc->useCustomShader)
-            {
-                uint32_t pi = 0;
-                for (const auto& cb : customRefl->cbuffers)
-                {
-                    if (MaterialReflectionSync::IsReservedCBuffer(cb.name.c_str())) continue;
-                    for (const auto& v : cb.vars)
-                    {
-                        if (pi >= Resource::kMaxCustomParams) break;
-                        if (v.type == ShaderReflect::VarType::Struct)    continue;
-                        if (v.type == ShaderReflect::VarType::Float4x4)  continue;
-                        if (v.elements > 0)                              continue;
-
-                        auto it = mc->customParams.find(v.name);
-                        if (it != mc->customParams.end())
-                        {
-                            const auto& val = it->second;
-                            dst.customParams[pi][0] = val[0];
-                            dst.customParams[pi][1] = val[1];
-                            dst.customParams[pi][2] = val[2];
-                            dst.customParams[pi][3] = val[3];
-                        }
-                        ++pi;
-                    }
-                    if (pi >= Resource::kMaxCustomParams) break;
-                }
-                dst.customParamCount = pi;
-
-                uint32_t ti = 0;
-                for (const auto& b : customRefl->bindings)
-                {
-                    if (ti >= Resource::kMaxCustomTextures) break;
-                    if (b.type != ShaderReflect::ResourceType::Texture) continue;
-                    // Skip engine-bound names so user-visible custom slot indexing stays contiguous.
-                    if (MaterialReflectionSync::IsReservedTexture(b.name.c_str())) continue;
-
-                    auto it = mc->customTextures.find(b.name);
-                    if (it != mc->customTextures.end())
-                        dst.customTextureIds[ti] = it->second.bindlessIndex;
-                    ++ti;
-                }
-                dst.customTextureCount = ti;
-            }
-        }
-        else
-        {
-            dst = {};
-            dst.roughnessMin = 0.0f;  dst.roughnessMax = 0.5f;
-            dst.metalnessMin = 0.0f;  dst.metalnessMax = 0.0f;
-            dst.reflectance  = 0.5f;  // F0 = 0.16 * 0.5² = 0.04
-            dst.baseColor[0] = dst.baseColor[1] =
-            dst.baseColor[2] = dst.baseColor[3] = 1.0f;  // white
-            dst.paramCount   = 9;
-        }
-    }
-
-    // Hash of every render-affecting MaterialComponent field — keys batch slot reuse.
-    // Missing a field here causes silent shared-slot bugs (edits invisible on duplicate materials).
-    static uint32_t HashMatParams(const MaterialComponent* mc)
-    {
-        if (!mc) return 0;
-        uint32_t h = 0;
-        auto mix = [&](uint32_t u) {
-            h ^= u + 0x9e3779b9u + (h << 6) + (h >> 2);
-        };
-        auto mixF = [&](float f) {
-            uint32_t u; std::memcpy(&u, &f, 4); mix(u);
-        };
-
-        mixF(mc->roughnessMin);  mixF(mc->roughnessMax);
-        mixF(mc->metalnessMin);  mixF(mc->metalnessMax);
-        mixF(mc->reflectance);   mixF(mc->normalMapStrength);
-        mixF(mc->saturation);    mixF(mc->alphaRef);
-
-        mixF(mc->baseColor.x);     mixF(mc->baseColor.y);
-        mixF(mc->baseColor.z);     mixF(mc->baseColor.w);
-        mixF(mc->specularColor.x); mixF(mc->specularColor.y);
-        mixF(mc->specularColor.z); mixF(mc->specularColor.w);
-        mixF(mc->emissiveColor.x); mixF(mc->emissiveColor.y);
-        mixF(mc->emissiveColor.z); mixF(mc->emissiveColor.w);
-
-        mix(static_cast<uint32_t>(mc->shaderType));
-        mix(mc->_flags);
-
-        // NPR scalars
-        mixF(mc->nprMinBrightness);   mixF(mc->nprShadowThreshold);
-        mixF(mc->nprShadowSmooth);    mixF(mc->nprRimPower);
-        mixF(mc->nprRimStrength);     mixF(mc->nprRampBlend);
-        mixF(mc->nprBrightnessClamp); mixF(mc->nprMaxBrightness);
-        mixF(mc->nprMidWeight);       mixF(mc->nprVeinWeight);
-        mixF(mc->nprSSSWeight);
-
-        // NPR colors
-        mixF(mc->nprDiffuseRampColor.x); mixF(mc->nprDiffuseRampColor.y);
-        mixF(mc->nprDiffuseRampColor.z);
-        mixF(mc->nprShadowRampColor.x);  mixF(mc->nprShadowRampColor.y);
-        mixF(mc->nprShadowRampColor.z);
-
-        // Custom-shader path identity (covers ShaderLab-edited materials)
-        mix(mc->useCustomShader ? 1u : 0u);
-        mix(static_cast<uint32_t>(mc->customShaderID));
-        mix(static_cast<uint32_t>(mc->customShadingModel));
-        // customParams/customTextures: hash size + per-element bits so inspector edits invalidate.
-        mix(static_cast<uint32_t>(mc->customParams.size()));
-        for (const auto& [name, val] : mc->customParams)
-        {
-            mixF(val[0]); mixF(val[1]); mixF(val[2]); mixF(val[3]);
-        }
-        mix(static_cast<uint32_t>(mc->customTextures.size()));
-        for (const auto& [name, tex] : mc->customTextures)
-            mix(static_cast<uint32_t>(tex.bindlessIndex));
-
-        // All eight texture bindless indices — partial set lets emissive/ramp/AO swaps re-batch wrongly.
-        for (int i = 0; i < MaterialComponent::TEXTURESLOT_COUNT; ++i)
-            mix(static_cast<uint32_t>(mc->textures[i].bindlessIndex));
-
-        return h;
-    }
-
-} // namespace
+// CPU-side cbuffer mirrors live in Renderer.h (RendererDetail namespace) so the
+// triple-buffered FrameCB<T> members can be instantiated in the class layout.
+// Layouts there MUST stay in sync with the matching HLSL.
+using PerViewCB       = RendererDetail::PerViewCB;
+using LightCB         = RendererDetail::LightCB;
+using TerrainParamsCB = RendererDetail::TerrainParamsCB;
+static_assert(sizeof(TerrainParamsCB) == 336,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
 
 // ---------------------------------------------------------------------------
 Renderer::Renderer(IGraphicsDevice& gfx) : m_gfx(gfx) {}
@@ -428,11 +132,24 @@ Renderer::~Renderer()
         for (auto& w : m_renderWorkers)
             w.Shutdown();
 
-    if (m_perObjectCBMapped)    m_gfx.UnmapBuffer(m_perObjectCB);
-    if (m_lightCBMapped)        m_gfx.UnmapBuffer(m_lightCB);
-    if (m_instanceBufferMapped) m_gfx.UnmapBuffer(m_instanceBuffer);
-    if (m_materialBufferMapped) m_gfx.UnmapBuffer(m_materialBuffer);
-    if (m_terrainCBMapped)      m_gfx.UnmapBuffer(m_terrainCB);
+    // Triple-buffered CBs — FrameCB::Destroy unmaps + releases each slot.
+    m_perObjectCB.Destroy(m_gfx);
+    m_lightCB    .Destroy(m_gfx);
+    m_terrainCB  .Destroy(m_gfx);
+
+    // Triple-buffered non-CB upload buffers.
+    for (uint32_t i = 0; i < kFrameSlots; ++i)
+    {
+        if (m_instanceBufferMapped[i])  m_gfx.UnmapBuffer(m_instanceBuffer[i]);
+        if (m_spotShadowVPMapped[i])    m_gfx.UnmapBuffer(m_spotShadowVPBuffer[i]);
+        if (m_indirectArgMapped[i])     m_gfx.UnmapBuffer(m_indirectArgUpload[i]);
+        if (m_drawCountMapped[i])       m_gfx.UnmapBuffer(m_drawCountUpload[i]);
+        if (m_materialBufferMapped[i])  m_gfx.UnmapBuffer(m_materialBuffer[i]);
+    }
+
+    // Release reflection-probe ring (cubemap-array texture is freed by the
+    // RHI on Renderer teardown; ProbeManager only owns the StructuredBuffer).
+    m_probeMgr.Shutdown(m_gfx);
 
     // Release all cached material texture handles.
     if (m_texSys)
@@ -492,7 +209,11 @@ void Renderer::Compile()
     m_depthHandle    = m_graph.CreateTexture("GBuffer_Depth",
         { RHI::Format::D24_UNORM_S8_UINT,  0, 0, true,  false, L"GBuffer_Depth"     });
     m_velocityHandle = m_graph.CreateTexture("GBuffer3_Velocity",
-        { RHI::Format::R16G16_FLOAT,        0, 0, false, false, L"GBuffer3_Velocity" });
+        // isSRV=true: velocity is read as an SRV by TAA / XeGTAO / SSR (outside
+        // the graph, via direct SRV handles), so it needs SHADER_RESOURCE + an
+        // SRV. Without this velocitySrv is 0 and those passes never get real
+        // motion vectors (and the velocity slot is left unbound → GBV).
+        { RHI::Format::R16G16_FLOAT,        0, 0, false, false, L"GBuffer3_Velocity", /*isSRV*/true });
     m_emissiveHandle = m_graph.CreateTexture("GBuffer4_Emissive",
         { RHI::Format::R16G16B16A16_FLOAT,  0, 0, false, false, L"GBuffer4_Emissive" });
 
@@ -520,11 +241,10 @@ void Renderer::Compile()
 
         // ShadowPass renders depth-only terrain into each CSM cascade; standalone pass
         // needs the TerrainParams CB handed to it directly (not via graph binding).
+        // The actual buffer pointer is rebound per-frame in Render() because the
+        // TerrainCB is now triple-buffered (one slot per in-flight frame).
         if (m_shadowPass)
-        {
             m_shadowPass->SetTerrainPass(m_terrainPass);
-            m_shadowPass->SetTerrainParamsCB(&m_terrainCB);
-        }
     }
     {
         // Compute-only env-cube → SH projection. Must precede LightingPass (PS samples SH buffer).
@@ -549,15 +269,32 @@ void Renderer::Compile()
         auto pass = std::make_unique<LightingPass>(
             m_albedoHandle, m_normalHandle, m_surfaceHandle, m_depthHandle, m_emissiveHandle);
         m_lightingPass = pass.get();
-        // Reflection probe SRVs are persistent — one-shot wire after m_probeMgr.Init().
+        // Probe array SRV (TextureCubeArray) is persistent — wire once. The
+        // probe StructuredBuffer SRV rotates each frame and is rebound below
+        // in Render() to the current ring slot.
         m_lightingPass->SetReflectionProbes(
-            m_probeMgr.GetArraySrv(), m_probeMgr.GetBufferSrv());
+            m_probeMgr.GetArraySrv(), 0);
         // Cluster probe grid/index handles wired post-ClusterPass::Init (end of Compile).
         m_graph.AddPass(std::move(pass));
     }
     {
         auto pass = std::make_unique<SkyboxPass>(m_depthHandle);
         m_skyboxPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // Volumetric clouds: composite OVER skybox, BEFORE volumetric fog
+        // (so fog can attenuate cloud god-rays / aerial perspective later).
+        auto pass = std::make_unique<CloudPass>(m_depthHandle);
+        m_cloudPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // Video overlay: composites decoded NV12 frames over HDR scene
+        // color. Runs after clouds so cinematics can dim the rendered
+        // world by setting VideoComponent alpha < 1.
+        auto pass = std::make_unique<VideoPass>();
+        m_videoPass = pass.get();
         m_graph.AddPass(std::move(pass));
     }
     {
@@ -577,8 +314,19 @@ void Renderer::Compile()
         auto pass = std::make_unique<TransparentPass>(m_depthHandle);
         m_transparentPass = pass.get();
         // Forward transparent iterates ALL probes per pixel — no cluster grid binding.
+        // Probe StructuredBuffer SRV is per-frame; rebound in Render() below.
         m_transparentPass->SetReflectionProbes(
-            m_probeMgr.GetArraySrv(), m_probeMgr.GetBufferSrv());
+            m_probeMgr.GetArraySrv(), 0);
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // World-space video quads: depth test on, depth write off — same
+        // depth-ordering convention as transparent / particle passes.
+        // Drawn after TransparentPass so it composites over translucent
+        // surfaces (a video panel BEHIND a glass pane reads through correctly
+        // via depth test, IN FRONT obscures the glass).
+        auto pass = std::make_unique<VideoQuadPass>(m_depthHandle);
+        m_videoQuadPass = pass.get();
         m_graph.AddPass(std::move(pass));
     }
     {
@@ -619,6 +367,12 @@ void Renderer::Compile()
     // ---- Post-processing compute passes (run outside graph, sequentially) ---
     m_taaPass = std::make_unique<TAAPass>();
     m_taaPass->Init(m_gfx);
+
+    m_fxaaPass = std::make_unique<FXAAPass>();
+    m_fxaaPass->Init(m_gfx);
+
+    // Apply default AA mode (sets per-pass enabled flags).
+    SetAAMode(m_aaMode);
 
     m_autoExposurePass = std::make_unique<AutoExposurePass>();
     m_autoExposurePass->Init(m_gfx);
@@ -709,6 +463,8 @@ void Renderer::OnEntityDestroyed(Entity e)
         cps->OnEntityDestroyed(e);
     if (m_particleSystem)
         m_particleSystem->OnEntityDestroyed(m_gfx, e);
+    if (m_afterimageSystem)
+        m_afterimageSystem->OnEntityDestroyed(e);
 
     // Beam slot release: listener fires BEFORE pool teardown, so the BeamComponent is still readable.
     if (m_beamSystem && m_subscribedWorld)
@@ -733,10 +489,67 @@ void Renderer::OnWorldClear()
     SubscribeToWorld(nullptr);
 
     m_skin.OnWorldClear();
+    if (m_afterimageSystem) m_afterimageSystem->OnWorldClear();
     m_meshMgr.OnWorldClear();  // clears per-library caches + bumps generation
+    // (Skinned vertex ring's bindless slots survive automatically — they were
+    //  registered via MeshDescriptorHeap::RegisterPersistentBuffer at Init.)
     // DDGI BLAS cache keyed on MeshLibRef → stale after teardown; drop to force rebuild.
-    m_ddgiSceneAS.OnWorldClear();
+    // Passes the DX12 backend so the BLAS result buffers — which the current
+    // frame's already-recorded DDGI command list still references — get
+    // deferred-released instead of freed inline.
+    m_ddgiSceneAS.OnWorldClear(static_cast<GraphicsDX12&>(m_gfx));
+
+    // World::Clear() does NOT fire per-entity destroy listeners (see ECS.h
+    // comment) — so OnEntityDestroyed's Release path is bypassed on world
+    // reload. We still need to drop refs to balance refcounts, but releasing
+    // INLINE breaks the path-hash cache hit case (doc §8.1 Load-then-Release):
+    //   inline Release → refcount=0 → FreeSlot → wipes path mapping
+    //   next world's Acquire same path → fresh slot → full GPU re-upload.
+    // Instead, stash handles in a deferred-release queue. The next BeginFrame
+    // runs SyncMaterialTextures BEFORE FlushPendingMatTexReleases, so
+    // same-path Acquires bump refcount 1→2; the deferred Release then drops
+    // back to 1 and the slot survives. Shared textures across reloads keep
+    // their GPU upload (Bistro: ~800 textures stay warm on reload).
+    if (m_texSys)
+    {
+        for (auto& [_e, entries] : m_matTexCache)
+            for (auto& entry : entries)
+                if (entry.handle != Resource::kInvalidTextureHandle)
+                    m_pendingMatTexReleaseAfterNextSync.push_back(entry.handle);
+        for (auto& [_e, byName] : m_customMatTexCache)
+            for (auto& [_n, entry] : byName)
+                if (entry.handle != Resource::kInvalidTextureHandle)
+                    m_pendingMatTexReleaseAfterNextSync.push_back(entry.handle);
+    }
     m_matTexCache.clear();
+    m_customMatTexCache.clear();
+
+    // MeshLibrary leak fix: Load() does NOT dedupe by path, so loading a
+    // different world allocates fresh VB+IB GPU buffers per .meshlib while
+    // the old world's buffers stay resident.  Release with one *world's*
+    // lag — release the libs queued at the PREVIOUS OnWorldClear, not the
+    // ones queued just now.
+    //
+    // Why lag and not inline (even with WaitIdleAndReleaseDeferred before
+    // OnWorldClear): a full multi-queue sync STILL produced a delayed TDR
+    // ~5 s after reload.  Suspected: MeshDescriptorHeap's bindless SRV
+    // table keeps stale descriptors pointing at the just-freed memory
+    // until a future frame's RegisterBuffer overwrites them; even though
+    // no live MeshDescriptor references those slots, *something* (DXR
+    // BLAS prefetch?) is still reaching them.  Lagging one world is a
+    // bigger margin than any in-flight pipeline can outlive.
+    if (m_meshLib)
+        for (Resource::Handle h : m_meshLibsPendingRelease)
+            m_meshLib->Release(h, m_gfx);
+    m_meshLibsPendingRelease = std::move(m_worldMeshLibs);
+    m_worldMeshLibs.clear();
+
+    // Prune DDGI BLAS entries whose meshlib slot just transitioned to
+    // refCount==0 above. Without this, A→B→A cycles leak ~200 MB / cycle
+    // because m_blasCache's ComPtr keeps the BLAS resource resident even
+    // after the source VB+IB went away (project_loadworld_phase12).
+    m_ddgiSceneAS.PruneStaleBLAS(m_meshLib, static_cast<GraphicsDX12&>(m_gfx));
+
     // Release decal-material textures so TextureSystem refcounts balance across reloads.
     if (m_texSys)
         m_decalMaterialLibrary.Shutdown(*m_texSys, m_gfx);
@@ -777,272 +590,91 @@ void Renderer::BeginFrame(World& world, FrameIndex frame, float dt , uint32_t vp
 
     // SSR resize: EnsureTexture invalidates descriptors on resize; refresh LightingPass SRV
     // before graph.Execute so the new binding is live when LightingPass records.
-    if (m_ssrPass && m_lightingPass)
+    if (m_ssrSubsystem && m_lightingPass)
     {
-        m_ssrPass->EnsureTexture(renderW, renderH);
-        if (m_ssrResolvePass && m_ssrTemporalPass && m_ssrUpsamplePass)
-        {
-            m_ssrResolvePass->EnsureTextures(renderW, renderH);
-            m_ssrTemporalPass->EnsureTextures(renderW, renderH);
-            m_ssrUpsamplePass->EnsureTexture(renderW, renderH);
-            // Lighting reads upsample output (1-frame latent). Disabled → pass 0 so confidence drains.
-            if (m_ssrEnabled)
-                m_lightingPass->SetSSRResult(m_ssrUpsamplePass->GetColorSrv());
-            else
-                m_lightingPass->SetSSRResult(0);
-        }
-        else
-        {
-            m_lightingPass->SetSSRResult(m_ssrEnabled ? m_ssrPass->GetResultSrv() : 0);
-        }
+        uint64_t srv = m_ssrSubsystem->OnResize(renderW, renderH);
+        // Disabled → pass 0 so the (1 - ssrConf) IBL dampening drains to no-op.
+        m_lightingPass->SetSSRResult(m_ssrEnabled ? srv : 0);
     }
 
-    // CPU animation systems write SkinningOutputComponent byte offsets for BuildSkinJobs.
-    if (m_skin.IsInitialised())
+    // (MeshDescriptorHeap::BeginFrame and the entire animation chain now
+    //  run in TickAnimationChain during the Animation phase BEFORE we get
+    //  here. By the time BeginFrame fires, the heap is on a fresh slot and
+    //  SkinningOutputComponent offsets / ring writes are in place for
+    //  Render's SkinningPass.)
+
+    // (Animation chain now runs in the Animation phase before BeginFrame —
+    //  see Renderer::TickAnimationChain. By the time we get here,
+    //  SkinningOutputComponent offsets and the PoseRingBuffer / VertexRing
+    //  writes are already in place for this frame's SkinningPass.)
+
+    // ---- Unified VFX "Lane B" mailbox drain --------------------------------
+    // VFXSpawnSystem (BoneAttachment phase) deposited spawn requests for the
+    // Renderer-owned VFX backends it can't reach from the pure-ECS layer
+    // (Tracer/Afterimage GPU pools, Decal material library, runtime Mesh load).
+    // Drain them here — BEFORE the afterimage/tracer BeginFrame passes consume
+    // their own pending-spawn queues — so the effects land this same frame.
     {
-        // Animation culling uses PREVIOUS frame visibility — 1-frame stale pose for new-in-frustum.
-        const std::unordered_set<Entity>* animActivePtr = nullptr;
-        if (m_skin.IsAnimCullingEnabled())
-        {
-            m_skin.GetAnimVisibleSet().clear();
+        // Tracer: imperative GPU ring (Spawn enqueues; tracer BeginFrame drains).
+        if (m_tracerSystem)
+            world.ForEach<PendingTracerSpawns>([&](Entity, PendingTracerSpawns& mb){
+                for (auto& r : mb.reqs)
+                    m_tracerSystem->Spawn(r.start, r.end, r.color, r.width, r.lifetime, r.noiseTexBindless);
+                mb.reqs.clear();
+            });
 
-            int totalSkeletons = 0;
-            int noAabbCount    = 0;
-            int frustumPass    = 0;
-            int shadowPass     = 0;
-            int culledCount    = 0;
-
-            // Skeleton roots usually lack WorldAabb — merge Children AABBs (root as fallback).
-            // Iterate SkeletonComponent pool dense array (avoids 22k hash lookups on Bistro).
-            auto* pSkel      = world.GetPool<SkeletonComponent>();
-            auto* pWorldAabb = world.GetPool<WorldAabb>();
-            auto* pChildren  = world.GetPool<Children>();
-            const size_t skelN = pSkel ? pSkel->Data().size() : 0;
-            const auto&  skelEnts = pSkel ? pSkel->Entities() : std::vector<Entity>{};
-            const auto&  skelData = pSkel ? pSkel->Data()     : std::vector<SkeletonComponent>{};
-            for (size_t si = 0; si < skelN; ++si)
-            {
-                const Entity e = skelEnts[si];
-                const SkeletonComponent* skel = &skelData[si];
-                if (skel->assetIndex == kInvalidAnimHandle) continue;
-
-                ++totalSkeletons;
-
-                // Build merged AABB from skeleton root + its children.
-                using namespace DirectX;
-                XMVECTOR vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
-                XMVECTOR vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
-                bool hasAabb = false;
-
-                auto mergeAabb = [&](const WorldAabb* wa) {
-                    if (!wa) return;
-                    vmin = XMVectorMin(vmin, XMVectorSet(wa->min.x, wa->min.y, wa->min.z, 0));
-                    vmax = XMVectorMax(vmax, XMVectorSet(wa->max.x, wa->max.y, wa->max.z, 0));
-                    hasAabb = true;
-                };
-
-                // Check root entity's own AABB
-                if (pWorldAabb) mergeAabb(pWorldAabb->Get(e));
-
-                // Merge children AABBs (mesh sub-entities)
-                const Children* ch = pChildren ? pChildren->Get(e) : nullptr;
-                if (ch)
-                {
-                    for (Entity child : ch->entities)
-                        if (pWorldAabb) mergeAabb(pWorldAabb->Get(child));
-                }
-
-                if (!hasAabb) { m_skin.GetAnimVisibleSet().insert(e); ++noAabbCount; continue; }
-
-                XMFLOAT3 lo, hi;
-                XMStoreFloat3(&lo, vmin);
-                XMStoreFloat3(&hi, vmax);
-
-                BoundingBox bb;
-                bb.Center  = { (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f };
-                bb.Extents = { (hi.x - lo.x) * 0.5f, (hi.y - lo.y) * 0.5f, (hi.z - lo.z) * 0.5f };
-
-                // Camera frustum test — using BoundingFrustum::Intersects (fast 6-plane path
-                // suspected of startup-flicker via ExtractFrustumPlanes).
-                if (m_view.boundingFrustum.Intersects(bb))
-                {
-                    m_skin.GetAnimVisibleSet().insert(e);
-                    ++frustumPass;
-                    continue;
-                }
-
-                // Test shadow frustums — shadow casters need animation too.
-                if (m_shadowFrustum.IsValid())
-                {
-                    bool inShadow = false;
-                    for (int sc = 0; sc < ShadowFrustumCompute::kCascadeCount; ++sc)
-                        if (ShadowFrustumCompute::AabbVs6Planes(bb, m_shadowFrustum.GetPlanes(sc).planes)) { inShadow = true; break; }
-                    if (inShadow) { m_skin.GetAnimVisibleSet().insert(e); ++shadowPass; continue; }
-                }
-
-                ++culledCount;
-            }
-            animActivePtr = &m_skin.GetAnimVisibleSet();
-        }
-
-        m_skin.GetPoseRingBuffer().BeginFrame(frame);
-        // Rotate ring BEFORE any custom-material packing happens this frame.
-        m_customMatCbvRing.BeginFrame(frame);
-        m_customMatSrvRing.BeginFrame(frame);
-        m_skin.GetVertexRing().BeginFrame(frame);
-        m_skin.GetAnimationSystem()->Update(world, dt, animActivePtr);
-        m_skin.GetIKSystem()->Update(world, animActivePtr);
-        m_skin.GetAnimationSystem()->ApplyPostIKGrants(world);
-        m_skin.GetChainPhysicsSystem()->Update(world, dt, animActivePtr);
-        m_skin.GetLocalToWorldSystem()->Update(world, m_skin.GetPoseRingBuffer(), animActivePtr);
-        m_skin.GetSocketSystem()->Update(world);
-        // Flat-binding followers update post-Socket to see fresh bone transforms.
-        m_skin.GetFollowSystem()->Update(world);
-
-        // Decal lifetimes tick after transform/follow so expired entities are gone before upload.
-        m_decalLifetimeSystem.Update(world, dt);
-
-        // Drain queued events; subscribers see consistent post-simulation state. Reentrancy deferred.
-        EventBus::Get().DispatchAll();
-
-        // ---- Skeleton-level bone AABB merge (parallel per-skeleton) ----------------
-        {
-            constexpr int kMaxAABBChildren = 64;
-            struct AABBJob {
-                const XMFLOAT4X4*      matrices;
-                const SkeletonAsset*   asset;
-                uint32_t               boneCount;
-                const GlobalTransform* gt;
-                WorldAabb*             rootAabb;
-                WorldAabb* childAabbs[64];
-                int        childCount;
-            };
-            std::vector<AABBJob> aabbJobs;
-
-            // Iterate SkeletonComponent pool directly — avoids hash lookups; cache pool pointers.
-            auto* pSkel2      = world.GetPool<SkeletonComponent>();
-            auto* pGlobalXf2  = world.GetPool<GlobalTransform>();
-            auto* pWorldAabb2 = world.GetPool<WorldAabb>();
-            auto* pChildren2  = world.GetPool<Children>();
-            const size_t skelN2 = pSkel2 ? pSkel2->Data().size() : 0;
-            const auto&  skelEnts2 = pSkel2 ? pSkel2->Entities() : std::vector<Entity>{};
-            const auto&  skelData2 = pSkel2 ? pSkel2->Data()     : std::vector<SkeletonComponent>{};
-            const uint32_t poseWriteHead = m_skin.GetPoseRingBuffer().GetWriteHead();
-            aabbJobs.reserve(skelN2);
-            for (size_t si = 0; si < skelN2; ++si)
-            {
-                const Entity e = skelEnts2[si];
-                const SkeletonComponent* skel = &skelData2[si];
-                if (skel->boneCount == 0) continue;
-                if (skel->poseByteOffset == ~0u) continue;
-                const uint32_t boneEndBytes = skel->poseByteOffset + skel->boneCount * 64;
-                if (boneEndBytes > poseWriteHead * 64) continue;
-
-                const XMFLOAT4X4* matrices = m_skin.GetPoseRingBuffer().ReadMapped(skel->poseByteOffset);
-                if (!matrices) continue;
-
-                AABBJob job;
-                job.matrices  = matrices;
-                job.boneCount = skel->boneCount;
-                job.asset     = (skel->assetIndex != kInvalidSkeletonIndex)
-                    ? &m_skin.GetSkeletonRegistry().Get(skel->assetIndex) : nullptr;
-                job.gt        = pGlobalXf2  ? pGlobalXf2->Get(e)  : nullptr;
-                job.rootAabb  = pWorldAabb2 ? pWorldAabb2->Get(e) : nullptr;
-                job.childCount = 0;
-
-                const Children* ch = pChildren2 ? pChildren2->Get(e) : nullptr;
-                if (ch)
-                {
-                    for (Entity child : ch->entities)
-                    {
-                        if (job.childCount >= kMaxAABBChildren) break;
-                        WorldAabb* cwa = pWorldAabb2 ? pWorldAabb2->Get(child) : nullptr;
-                        if (cwa) job.childAabbs[job.childCount++] = cwa;
-                    }
-                }
-                aabbJobs.push_back(job);
-            }
-
-            auto processAABB = [](const AABBJob& j)
-            {
-                XMVECTOR vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
-                XMVECTOR vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
-
-                if (j.asset && j.asset->hasBoneAABBs)
-                {
-                    for (uint32_t b = 0; b < j.boneCount; ++b)
-                    {
-                        const auto& ra = j.asset->boneRestAABBs[b];
-                        if (ra.localMin.x > ra.localMax.x) continue;
-                        const XMMATRIX boneMat = XMLoadFloat4x4(&j.matrices[b]);
-                        const float lx[2] = { ra.localMin.x, ra.localMax.x };
-                        const float ly[2] = { ra.localMin.y, ra.localMax.y };
-                        const float lz[2] = { ra.localMin.z, ra.localMax.z };
-                        for (int iz = 0; iz < 2; ++iz)
-                        for (int iy = 0; iy < 2; ++iy)
-                        for (int ix = 0; ix < 2; ++ix)
-                        {
-                            XMVECTOR w = XMVector3TransformCoord(
-                                XMVectorSet(lx[ix], ly[iy], lz[iz], 1.f), boneMat);
-                            vmin = XMVectorMin(vmin, w);
-                            vmax = XMVectorMax(vmax, w);
+        // Afterimage: one Spawn per skinned sub-mesh belonging to the spawner
+        // character (resolved via SkeletonRef; legacy single-entity skins match
+        // by identity). The target handle guards against a recycled spawner.
+        if (m_afterimageSystem)
+            world.ForEach<PendingAfterimageSpawns>([&](Entity, PendingAfterimageSpawns& mb){
+                for (auto& r : mb.reqs) {
+                    if (!world.IsHandleValid(r.target)) continue;
+                    const Entity root = r.target.entity;
+                    if (auto* pSkin = world.GetPool<MeshSkinnedComponent>()) {
+                        const auto& ents = pSkin->Entities();
+                        for (size_t i = 0; i < ents.size(); ++i) {
+                            const Entity me = ents[i];
+                            Entity owner = me;
+                            if (auto* ref = world.GetComponent<SkeletonRef>(me)) owner = ref->entity;
+                            if (owner == root)
+                                m_afterimageSystem->Spawn(me, r.lifetime, r.color);
                         }
                     }
                 }
-                else
-                {
-                    for (uint32_t b = 0; b < j.boneCount; ++b)
-                    {
-                        XMVECTOR bp = XMVectorSet(
-                            j.matrices[b]._41, j.matrices[b]._42, j.matrices[b]._43, 0);
-                        vmin = XMVectorMin(vmin, bp);
-                        vmax = XMVectorMax(vmax, bp);
-                    }
+                mb.reqs.clear();
+            });
+
+        // Decal: collect-then-spawn — SpawnAtSurface creates entities, so we
+        // drain the mailbox into a local list first to keep the pool view stable.
+        {
+            std::vector<PendingDecalSpawns::Req> decals;
+            world.ForEach<PendingDecalSpawns>([&](Entity, PendingDecalSpawns& mb){
+                for (auto& r : mb.reqs) decals.push_back(std::move(r));
+                mb.reqs.clear();
+            });
+            for (auto& r : decals) {
+                auto mat = m_decalMaterialLibrary.Find(r.materialName);
+                if (!mat) {
+                    LOG_WARNING("VFX decal: material '%s' not found in DecalMaterialLibrary",
+                                r.materialName.c_str());
+                    continue;
                 }
-
-                const float kPad = 0.05f;
-                vmin = XMVectorSubtract(vmin, XMVectorReplicate(kPad));
-                vmax = XMVectorAdd     (vmax, XMVectorReplicate(kPad));
-
-                if (j.gt)
-                {
-                    const XMMATRIX worldMat = XMLoadFloat4x4(&j.gt->matrix);
-                    XMFLOAT3 lo, hi; XMStoreFloat3(&lo, vmin); XMStoreFloat3(&hi, vmax);
-                    const float cx[2]={lo.x,hi.x}, cy[2]={lo.y,hi.y}, cz[2]={lo.z,hi.z};
-                    vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
-                    vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
-                    for (int iz=0;iz<2;++iz) for (int iy=0;iy<2;++iy) for (int ix=0;ix<2;++ix)
-                    {
-                        XMVECTOR w = XMVector3TransformCoord(
-                            XMVectorSet(cx[ix],cy[iy],cz[iz],1.f), worldMat);
-                        vmin = XMVectorMin(vmin, w);
-                        vmax = XMVectorMax(vmax, w);
-                    }
-                }
-
-                XMFLOAT3 rmin, rmax;
-                XMStoreFloat3(&rmin, vmin);
-                XMStoreFloat3(&rmax, vmax);
-
-                if (j.rootAabb) { j.rootAabb->min = rmin; j.rootAabb->max = rmax; }
-                for (int c = 0; c < j.childCount; ++c)
-                { j.childAabbs[c]->min = rmin; j.childAabbs[c]->max = rmax; }
-            };
-
-            if (aabbJobs.size() > 1)
-            {
-                TaskSystem::Get().ParallelFor(0, static_cast<uint32_t>(aabbJobs.size()),
-                    [&](uint32_t i) { processAABB(aabbJobs[i]); });
-            }
-            else if (!aabbJobs.empty())
-            {
-                processAABB(aabbJobs[0]);
+                m_decalSpawner.SpawnAtSurface(world, mat, r.position, r.normal,
+                                              r.size, r.depth, r.lifetime, r.fadeOutDuration, r.rollZ);
             }
         }
 
-        m_skin.GetSkinMatrixSystem()->Update(world, m_skin.GetPoseRingBuffer(), m_skin.GetVertexRing());
-        m_skin.BuildSkinJobs(world, m_meshMgr);
+        // Mesh VFX: resolve path → GPU mesh + patch the pre-created entity.
+        DrainMeshVFXSpawns(world);
     }
+
+    // Resolve pending afterimage spawns + update slot lifetimes. Must run after
+    // BuildSkinJobs so SkinningOutputComponent offsets are the freshly-allocated
+    // ones for this frame's ring slot.
+    if (m_afterimageSystem)
+        m_afterimageSystem->BeginFrame(world, m_meshMgr.GetDescriptorHeap(),
+                                       m_skin.GetVertexRing(), dt);
 
     m_shadowFrustum.Compute(world, m_camera, vpW, vpH);
     BuildRenderScene(world);
@@ -1114,6 +746,303 @@ void Renderer::BeginFrame(World& world, FrameIndex frame, float dt , uint32_t vp
 }
 
 // ---------------------------------------------------------------------------
+// TickAnimationChain — extracted from BeginFrame in the Phase-based-scheduler
+// refactor so the entire animation chain (character state → AnimationSystem
+// sample → IK → ChainPhysics → LocalToWorld → Socket/Follow → bone AABB
+// merge → SkinMatrix → BuildSkinJobs) can live in the scheduler's Animation
+// phase. Called from RendererAnimationChainSystem each frame BEFORE
+// BeginFrame so SkinningOutputComponent offsets and ring-buffer writes are
+// already in place when SkinningPass runs in Render(). No-op if the Skinning
+// subsystem isn't initialised.
+//
+// Note: animation visibility culling (m_view.boundingFrustum /
+// m_shadowFrustum) uses PREVIOUS frame's frustums — same behaviour as
+// pre-refactor when this block ran inside BeginFrame before UploadFrameData
+// recomputed them. Documented at the original comment site.
+void Renderer::TickAnimationChain(World& world, FrameIndex frame, float dt)
+{
+    // Rotate the MeshDescriptor triple-buffer to a fresh GPU slot FIRST —
+    // must run BEFORE BuildSkinJobs / AfterimageSystem::BeginFrame because
+    // both call UpdateMesh(ThisFrame) which writes into the active slot.
+    // Memcpys the CPU master into the new slot so any transient patches
+    // lingering from 3 frames ago are wiped. Unconditional — non-skinning
+    // meshes also live in this heap and need a valid current slot bound
+    // in Render(), so this MUST run even when m_skin isn't initialised.
+    //
+    // Slot source MUST be m_gfx.GetFrameIndex() (== swap-chain backbuffer
+    // index), NOT the App's monotonic ctx.frame: GraphicsDX12 fences
+    // m_frameFenceValues[GetFrameIndex()], so the slot we rotate to and
+    // memcpy into must be the same one App's WaitForNextFrameSlot() call
+    // (just above the Animation phase in App::Run) just drained. The two
+    // can drift apart after swap-chain recreation (resize / Alt+Enter).
+    m_meshMgr.GetDescriptorHeap().BeginFrame(m_gfx.GetFrameIndex());
+
+    if (!m_skin.IsInitialised()) return;
+
+    // Animation culling uses PREVIOUS frame visibility — 1-frame stale pose for new-in-frustum.
+    const std::unordered_set<Entity>* animActivePtr = nullptr;
+    if (m_skin.IsAnimCullingEnabled())
+    {
+        m_skin.GetAnimVisibleSet().clear();
+
+        int totalSkeletons = 0;
+        int noAabbCount    = 0;
+        int frustumPass    = 0;
+        int shadowPass     = 0;
+        int culledCount    = 0;
+
+        // Skeleton roots usually lack WorldAabb — merge Children AABBs (root as fallback).
+        // Iterate SkeletonComponent pool dense array (avoids 22k hash lookups on Bistro).
+        auto* pSkel      = world.GetPool<SkeletonComponent>();
+        auto* pWorldAabb = world.GetPool<WorldAabb>();
+        auto* pChildren  = world.GetPool<Children>();
+        const size_t skelN = pSkel ? pSkel->Data().size() : 0;
+        const auto&  skelEnts = pSkel ? pSkel->Entities() : std::vector<Entity>{};
+        const auto&  skelData = pSkel ? pSkel->Data()     : std::vector<SkeletonComponent>{};
+        for (size_t si = 0; si < skelN; ++si)
+        {
+            const Entity e = skelEnts[si];
+            const SkeletonComponent* skel = &skelData[si];
+            if (skel->assetIndex == kInvalidAnimHandle) continue;
+
+            ++totalSkeletons;
+
+            // Build merged AABB from skeleton root + its children.
+            using namespace DirectX;
+            XMVECTOR vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
+            XMVECTOR vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
+            bool hasAabb = false;
+
+            auto mergeAabb = [&](const WorldAabb* wa) {
+                if (!wa) return;
+                vmin = XMVectorMin(vmin, XMVectorSet(wa->min.x, wa->min.y, wa->min.z, 0));
+                vmax = XMVectorMax(vmax, XMVectorSet(wa->max.x, wa->max.y, wa->max.z, 0));
+                hasAabb = true;
+            };
+
+            // Check root entity's own AABB
+            if (pWorldAabb) mergeAabb(pWorldAabb->Get(e));
+
+            // Merge children AABBs (mesh sub-entities)
+            const Children* ch = pChildren ? pChildren->Get(e) : nullptr;
+            if (ch)
+            {
+                for (Entity child : ch->entities)
+                    if (pWorldAabb) mergeAabb(pWorldAabb->Get(child));
+            }
+
+            if (!hasAabb) { m_skin.GetAnimVisibleSet().insert(e); ++noAabbCount; continue; }
+
+            XMFLOAT3 lo, hi;
+            XMStoreFloat3(&lo, vmin);
+            XMStoreFloat3(&hi, vmax);
+
+            BoundingBox bb;
+            bb.Center  = { (lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f, (lo.z + hi.z) * 0.5f };
+            bb.Extents = { (hi.x - lo.x) * 0.5f, (hi.y - lo.y) * 0.5f, (hi.z - lo.z) * 0.5f };
+
+            // Camera frustum test — using BoundingFrustum::Intersects (fast 6-plane path
+            // suspected of startup-flicker via ExtractFrustumPlanes).
+            if (m_view.boundingFrustum.Intersects(bb))
+            {
+                m_skin.GetAnimVisibleSet().insert(e);
+                ++frustumPass;
+                continue;
+            }
+
+            // Test shadow frustums — shadow casters need animation too.
+            if (m_shadowFrustum.IsValid())
+            {
+                bool inShadow = false;
+                for (int sc = 0; sc < ShadowFrustumCompute::kCascadeCount; ++sc)
+                    if (ShadowFrustumCompute::AabbVs6Planes(bb, m_shadowFrustum.GetPlanes(sc).planes)) { inShadow = true; break; }
+                if (inShadow) { m_skin.GetAnimVisibleSet().insert(e); ++shadowPass; continue; }
+            }
+
+            ++culledCount;
+        }
+        animActivePtr = &m_skin.GetAnimVisibleSet();
+    }
+
+    // All per-frame upload rings rotate on m_gfx.GetFrameIndex() — see the
+    // MeshDescriptorHeap comment above for why ctx.frame is not the right
+    // source (swap-chain backbuffer index is what App's WaitForNextFrameSlot
+    // drained the slot fence on).
+    const uint32_t frameSlot = m_gfx.GetFrameIndex();
+    m_skin.GetPoseRingBuffer().BeginFrame(frameSlot);
+    // Rotate ring BEFORE any custom-material packing happens this frame.
+    m_customMatCbvRing.BeginFrame(frameSlot);
+    m_customMatSrvRing.BeginFrame(frameSlot);
+    m_skin.GetVertexRing().BeginFrame(frameSlot);
+    // Character state machine — advances Lua-defined state transitions
+    // (primary/secondary cross-fade + clip lazy-bind) before
+    // AnimationSystem samples, so the sampler picks up freshly-flipped
+    // clips on the same frame the BT / Logic script switched states.
+    if (auto* csys = m_skin.GetCharacterStateSystem())
+        csys->Update(world, dt, m_skin.GetClipLibrary());
+    m_skin.GetAnimationSystem()->Update(world, dt, animActivePtr);
+    // FootIK target solver — raycasts the physics world straight down
+    // from each foot effector and rewrites the IK control bone's pose
+    // BEFORE the CCD solver runs, so PMX characters' feet snap to
+    // terrain rather than the clip's flat-ground baseline. No-op if
+    // physics isn't wired or no entity carries FootIKComponent.
+    m_skin.GetFootIKSystem()->Update(world,
+                                     m_skin.GetPhysicsSystem(),
+                                     animActivePtr);
+    m_skin.GetIKSystem()->Update(world, animActivePtr);
+    m_skin.GetAnimationSystem()->ApplyPostIKGrants(world);
+    m_skin.GetChainPhysicsSystem()->Update(world, dt, animActivePtr);
+    m_skin.GetLocalToWorldSystem()->Update(world, m_skin.GetPoseRingBuffer(), animActivePtr);
+    m_skin.GetSocketSystem()->Update(world);
+    // Flat-binding followers update post-Socket to see fresh bone transforms.
+    m_skin.GetFollowSystem()->Update(world);
+
+    // Decal lifetimes tick after transform/follow so expired entities are gone before upload.
+    m_decalLifetimeSystem.Update(world, dt);
+
+    // Drain queued events; subscribers see consistent post-simulation state. Reentrancy deferred.
+    EventBus::Get().DispatchAll();
+
+    // ---- Skeleton-level bone AABB merge (parallel per-skeleton) ----------------
+    {
+        constexpr int kMaxAABBChildren = 64;
+        struct AABBJob {
+            const XMFLOAT4X4*      matrices;
+            const SkeletonAsset*   asset;
+            uint32_t               boneCount;
+            const GlobalTransform* gt;
+            WorldAabb*             rootAabb;
+            WorldAabb* childAabbs[64];
+            int        childCount;
+        };
+        std::vector<AABBJob> aabbJobs;
+
+        // Iterate SkeletonComponent pool directly — avoids hash lookups; cache pool pointers.
+        auto* pSkel2      = world.GetPool<SkeletonComponent>();
+        auto* pGlobalXf2  = world.GetPool<GlobalTransform>();
+        auto* pWorldAabb2 = world.GetPool<WorldAabb>();
+        auto* pChildren2  = world.GetPool<Children>();
+        const size_t skelN2 = pSkel2 ? pSkel2->Data().size() : 0;
+        const auto&  skelEnts2 = pSkel2 ? pSkel2->Entities() : std::vector<Entity>{};
+        const auto&  skelData2 = pSkel2 ? pSkel2->Data()     : std::vector<SkeletonComponent>{};
+        const uint32_t poseWriteHead = m_skin.GetPoseRingBuffer().GetWriteHead();
+        aabbJobs.reserve(skelN2);
+        for (size_t si = 0; si < skelN2; ++si)
+        {
+            const Entity e = skelEnts2[si];
+            const SkeletonComponent* skel = &skelData2[si];
+            if (skel->boneCount == 0) continue;
+            if (skel->poseByteOffset == ~0u) continue;
+            const uint32_t boneEndBytes = skel->poseByteOffset + skel->boneCount * 64;
+            if (boneEndBytes > poseWriteHead * 64) continue;
+
+            const XMFLOAT4X4* matrices = m_skin.GetPoseRingBuffer().ReadMapped(skel->poseByteOffset);
+            if (!matrices) continue;
+
+            AABBJob job;
+            job.matrices  = matrices;
+            job.boneCount = skel->boneCount;
+            job.asset     = (skel->assetIndex != kInvalidSkeletonIndex)
+                ? &m_skin.GetSkeletonRegistry().Get(skel->assetIndex) : nullptr;
+            job.gt        = pGlobalXf2  ? pGlobalXf2->Get(e)  : nullptr;
+            job.rootAabb  = pWorldAabb2 ? pWorldAabb2->Get(e) : nullptr;
+            job.childCount = 0;
+
+            const Children* ch = pChildren2 ? pChildren2->Get(e) : nullptr;
+            if (ch)
+            {
+                for (Entity child : ch->entities)
+                {
+                    if (job.childCount >= kMaxAABBChildren) break;
+                    WorldAabb* cwa = pWorldAabb2 ? pWorldAabb2->Get(child) : nullptr;
+                    if (cwa) job.childAabbs[job.childCount++] = cwa;
+                }
+            }
+            aabbJobs.push_back(job);
+        }
+
+        auto processAABB = [](const AABBJob& j)
+        {
+            XMVECTOR vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
+            XMVECTOR vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
+
+            if (j.asset && j.asset->hasBoneAABBs)
+            {
+                for (uint32_t b = 0; b < j.boneCount; ++b)
+                {
+                    const auto& ra = j.asset->boneRestAABBs[b];
+                    if (ra.localMin.x > ra.localMax.x) continue;
+                    const XMMATRIX boneMat = XMLoadFloat4x4(&j.matrices[b]);
+                    const float lx[2] = { ra.localMin.x, ra.localMax.x };
+                    const float ly[2] = { ra.localMin.y, ra.localMax.y };
+                    const float lz[2] = { ra.localMin.z, ra.localMax.z };
+                    for (int iz = 0; iz < 2; ++iz)
+                    for (int iy = 0; iy < 2; ++iy)
+                    for (int ix = 0; ix < 2; ++ix)
+                    {
+                        XMVECTOR w = XMVector3TransformCoord(
+                            XMVectorSet(lx[ix], ly[iy], lz[iz], 1.f), boneMat);
+                        vmin = XMVectorMin(vmin, w);
+                        vmax = XMVectorMax(vmax, w);
+                    }
+                }
+            }
+            else
+            {
+                for (uint32_t b = 0; b < j.boneCount; ++b)
+                {
+                    XMVECTOR bp = XMVectorSet(
+                        j.matrices[b]._41, j.matrices[b]._42, j.matrices[b]._43, 0);
+                    vmin = XMVectorMin(vmin, bp);
+                    vmax = XMVectorMax(vmax, bp);
+                }
+            }
+
+            const float kPad = 0.05f;
+            vmin = XMVectorSubtract(vmin, XMVectorReplicate(kPad));
+            vmax = XMVectorAdd     (vmax, XMVectorReplicate(kPad));
+
+            if (j.gt)
+            {
+                const XMMATRIX worldMat = XMLoadFloat4x4(&j.gt->matrix);
+                XMFLOAT3 lo, hi; XMStoreFloat3(&lo, vmin); XMStoreFloat3(&hi, vmax);
+                const float cx[2]={lo.x,hi.x}, cy[2]={lo.y,hi.y}, cz[2]={lo.z,hi.z};
+                vmin = XMVectorSet( FLT_MAX,  FLT_MAX,  FLT_MAX, 0);
+                vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0);
+                for (int iz=0;iz<2;++iz) for (int iy=0;iy<2;++iy) for (int ix=0;ix<2;++ix)
+                {
+                    XMVECTOR w = XMVector3TransformCoord(
+                        XMVectorSet(cx[ix],cy[iy],cz[iz],1.f), worldMat);
+                    vmin = XMVectorMin(vmin, w);
+                    vmax = XMVectorMax(vmax, w);
+                }
+            }
+
+            XMFLOAT3 rmin, rmax;
+            XMStoreFloat3(&rmin, vmin);
+            XMStoreFloat3(&rmax, vmax);
+
+            if (j.rootAabb) { j.rootAabb->min = rmin; j.rootAabb->max = rmax; }
+            for (int c = 0; c < j.childCount; ++c)
+            { j.childAabbs[c]->min = rmin; j.childAabbs[c]->max = rmax; }
+        };
+
+        if (aabbJobs.size() > 1)
+        {
+            TaskSystem::Get().ParallelFor(0, static_cast<uint32_t>(aabbJobs.size()),
+                [&](uint32_t i) { processAABB(aabbJobs[i]); });
+        }
+        else if (!aabbJobs.empty())
+        {
+            processAABB(aabbJobs[0]);
+        }
+    }
+
+    m_skin.GetSkinMatrixSystem()->Update(world, m_skin.GetPoseRingBuffer(), m_skin.GetVertexRing());
+    m_skin.BuildSkinJobs(world, m_meshMgr);
+}
+
+// ---------------------------------------------------------------------------
 DrawList Renderer::GetDrawList(DrawFilter f) const
 {
     const auto* begin = m_drawPackets.data();
@@ -1139,6 +1068,40 @@ void Renderer::EnsureWorkers()
 }
 
 // ---------------------------------------------------------------------------
+// AA mode selector — drives per-pass enabled flags. Jitter follows TAA's
+// IsEnabled() in BuildRenderScene, so toggling TAA off here also disables
+// projection jitter (FXAA-only mode renders without jitter as expected).
+void Renderer::SetAAMode(AAMode m)
+{
+    m_aaMode = m;
+    UpdateAAEnabled();
+}
+
+// ---------------------------------------------------------------------------
+// Global view mode (Lit/Unlit/Wireframe). The per-frame plumbing — LightCB
+// .viewMode, FILL_MODE_WIREFRAME on the geometry passes, and background-pass
+// suppression — is applied in Render_BindFrameResources from m_viewMode. Here
+// we only need to refresh the AA enable, since Wireframe force-disables it.
+void Renderer::SetViewMode(ViewMode m)
+{
+    m_viewMode = m;
+    UpdateAAEnabled();
+}
+
+// ---------------------------------------------------------------------------
+// Single source of truth for TAA/FXAA enable: derived from m_aaMode but
+// forced OFF in Wireframe view (thin lines ghost/smear under temporal AA, and
+// disabling TAA also drops projection jitter — desired for a stable wireframe).
+void Renderer::UpdateAAEnabled()
+{
+    const bool wire   = (m_viewMode == ViewMode::Wireframe);
+    const bool taaOn  = !wire && ((m_aaMode == AAMode::TAA)  || (m_aaMode == AAMode::FXAA_TAA));
+    const bool fxaaOn = !wire && ((m_aaMode == AAMode::FXAA) || (m_aaMode == AAMode::FXAA_TAA));
+    if (m_taaPass)  m_taaPass->SetEnabled(taaOn);
+    if (m_fxaaPass) m_fxaaPass->SetEnabled(fxaaOn);
+}
+
+// ---------------------------------------------------------------------------
 void Renderer::ReloadShaders()
 {
     // Standalone passes first — these aren't visited by m_graph.ReloadShaders.
@@ -1148,31 +1111,51 @@ void Renderer::ReloadShaders()
     if (m_ddgiPass)   m_ddgiPass->ReloadShaders(m_gfx);
     if (m_uiPass)         m_uiPass->ReloadShaders();
     if (m_worldUIPass)    m_worldUIPass->ReloadShaders();
-
-    // PP/SSR/culling passes don't have ReloadShaders overrides yet — base no-op is harmless.
+    // SSR sub-passes live behind the subsystem; this re-fetches all 7
+    // compute shaders + rebuilds PSOs + resets temporal history.
+    if (m_ssrSubsystem) m_ssrSubsystem->ReloadShaders(m_gfx);
 
     m_graph.ReloadShaders(m_gfx);
 }
 
 // ---------------------------------------------------------------------------
-RHI::CommandList Renderer::Render()
+void Renderer::Render_BindFrameResources(uint32_t frameSlot)
 {
-    EnsureWorkers();
-
-    // ---- Frame bindings (read-only for all workers this frame) -------------
-    m_graph.BindConstantBuffer("PerView",     m_perObjectCB);
-    m_graph.BindConstantBuffer("LightCB",     m_lightCB);
+    m_graph.BindConstantBuffer("PerView",     m_perObjectCB.CurrentBuffer(m_gfx));
+    m_graph.BindConstantBuffer("LightCB",     m_lightCB.CurrentBuffer(m_gfx));
     if (m_terrainCB.IsValid())
-        m_graph.BindConstantBuffer("TerrainParams", m_terrainCB);
+        m_graph.BindConstantBuffer("TerrainParams", m_terrainCB.CurrentBuffer(m_gfx));
     if (m_skyboxPass)
-        m_graph.BindConstantBuffer("SkyCB", m_skyboxPass->GetSkyCB());
+        m_graph.BindConstantBuffer("SkyCB", m_skyboxPass->GetSkyCB(m_gfx));
     if (m_volFogPass)
-        m_graph.BindConstantBuffer("VolApplyCB", m_volFogPass->GetApplyCB());
-    m_graph.BindBuffer("InstanceBuffer",      m_instanceBuffer);
+        m_graph.BindConstantBuffer("VolApplyCB", m_volFogPass->GetApplyCB(m_gfx));
+    m_graph.BindBuffer("InstanceBuffer",      m_instanceBuffer[frameSlot]);
     m_graph.BindBuffer("MeshDescriptors",     m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer());
-    m_graph.BindBuffer("MaterialBuffer",      m_materialBuffer);
-    m_graph.SetBindlessTableHandle(m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr);
+    m_graph.BindBuffer("MaterialBuffer",      m_materialBuffer[frameSlot]);
+
+    // Wire the (per-frame) terrain CB into ShadowPass — that's a standalone pass
+    // outside the graph so it needs the raw buffer pointer rebound each frame.
+    if (m_shadowPass && m_terrainCB.IsValid())
+        m_shadowPass->SetTerrainParamsCB(&m_terrainCB.CurrentBuffer(m_gfx));
+    m_graph.SetBindlessTableHandle(m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle());
     m_graph.SetDrawList(&m_drawPackets);
+
+    // ---- Global view-mode application (Lit / Unlit / Wireframe) -------------
+    // Color for the deferred geometry (opaque + terrain) is handled in
+    // Lighting.ps via LightCB.viewMode; transparent handles it in its forward
+    // shader. Here we only drive the CPU-side state Wireframe needs: flip the
+    // geometry passes to FILL_MODE_WIREFRAME and hide the background-filling
+    // passes so the wire reads as flat lines on a dark background. Set every
+    // frame so leaving Wireframe restores prior state with no transition logic.
+    {
+        const bool wire = (m_viewMode == ViewMode::Wireframe);
+        if (m_gbufferPass)     m_gbufferPass->SetWireframe(wire);
+        if (m_terrainPass)     m_terrainPass->SetWireframe(wire);
+        if (m_transparentPass) m_transparentPass->SetWireframe(wire);
+        if (m_skyboxPass)      m_skyboxPass->SetViewModeHidden(wire);
+        if (m_cloudPass)       m_cloudPass->SetViewModeHidden(wire);
+        if (m_volFogPass)      m_volFogPass->SetViewModeHidden(wire);
+    }
 
     if (m_shadowPass && m_lightingPass)
         m_lightingPass->SetShadowMap(m_shadowPass->GetShadowArrayGpuHandle());
@@ -1185,22 +1168,24 @@ RHI::CommandList Renderer::Render()
             m_clusterPass->GetLightGridSRVHandle());
 
     // Spot shadow atlas + per-slice VP buffer; consumed by both Lighting and VolumetricFog.
+    // VP buffer is triple-buffered — feed the current frame's SRV handle.
     if (m_spotShadowPass && m_lightingPass)
         m_lightingPass->SetSpotShadowAtlas(
             m_spotShadowPass->GetAtlasSrvHandle(),
-            m_spotShadowVPSrv);
+            m_spotShadowVPSrv[frameSlot]);
     if (m_spotShadowPass && m_volFogPass)
         m_volFogPass->SetSpotShadowAtlas(
             m_spotShadowPass->GetAtlasSrvHandle(),
-            m_spotShadowVPSrv);
+            m_spotShadowVPSrv[frameSlot]);
 
     // Bind NPR ramp texture to LightingPass (cached in BuildRenderScene).
     if (m_lightingPass)
         m_lightingPass->SetRampTexture(m_nprRampTexHandle);
 
     // Bind MaterialBuffer SRV so the Lighting pass can read per-material NPR params.
-    if (m_lightingPass && m_materialBuffer.IsValid())
-        m_lightingPass->SetMaterialBuffer(m_gfx.GetBufferSRVGpuHandle(m_materialBuffer));
+    // SRV handle resolved per frame from the current slot of the triple-buffered ring.
+    if (m_lightingPass && m_materialBuffer[frameSlot].IsValid())
+        m_lightingPass->SetMaterialBuffer(m_gfx.GetBufferSRVGpuHandle(m_materialBuffer[frameSlot]));
 
     // Bind previous frame's XeGTAO SSAO texture to LightingPass (one-frame latency).
     if (m_lightingPass && m_xegtaoPass && m_ssaoEnabled)
@@ -1209,9 +1194,9 @@ RHI::CommandList Renderer::Render()
         m_lightingPass->SetSSAOHandle(0);
 
     // Feed per-frame state to the volumetric fog pass.
-    if (m_volFogPass && m_lightCBMapped)
+    if (m_volFogPass && m_lightCB.Current(m_gfx))
     {
-        auto* lb = static_cast<LightCB*>(m_lightCBMapped);
+        auto* lb = m_lightCB.Current(m_gfx);
 
         // Matrices uploaded TRANSPOSED for HLSL row-vector mul(pos, matrix). Pair invViewProj
         // with un-jittered VP — voxel-derived worldPos must be jitter-stable for reprojection.
@@ -1239,6 +1224,11 @@ RHI::CommandList Renderer::Render()
 
         DirectX::XMFLOAT3 camFwd { lb->cameraForward[0], lb->cameraForward[1], lb->cameraForward[2] };
         m_volFogPass->SetCameraForward(camFwd);
+        // Forward the camera-stack hard-cut signal to every temporal-history
+        // pass. When the LiveCamera reports !historyValid (HardCutTo, first
+        // frame, cinematic shot boundary), all of them invalidate together.
+        m_volFogPass->SetExternalHistoryValid(m_camera.historyValid);
+        if (m_xegtaoPass) m_xegtaoPass->SetExternalHistoryValid(m_camera.historyValid);
 
         if (m_shadowPass)
         {
@@ -1286,9 +1276,9 @@ RHI::CommandList Renderer::Render()
 
             // Shader bindings: InstanceBuffer + MeshDescriptors SRVs + bindless g_Buffers[] table.
             m_sceneVoxelPass->SetSceneBindings(
-                m_gfx.GetBufferSRVGpuHandle(m_instanceBuffer),
+                m_gfx.GetBufferSRVGpuHandle(m_instanceBuffer[frameSlot]),
                 m_gfx.GetBufferSRVGpuHandle(m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer()),
-                m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr);
+                m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle());
 
             // Per-mesh dispatches from opaque packets only; CPU-side WorldAabb cull keeps cost
             // bounded to the grid neighbourhood (avoids scene-wide dispatch jitter).
@@ -1333,24 +1323,25 @@ RHI::CommandList Renderer::Render()
                 0, DirectX::XMFLOAT3{0,0,0}, DirectX::XMFLOAT3{0,0,0}, 0);
         }
     }
+}
 
-    // Pre-capture SRV handles on main thread before workers kick (graph won't recompile mid-frame).
-    const bool needPostCapture = m_taaPass || m_xegtaoPass;
-    const RHI::Texture* taaDepthTex    = needPostCapture ? m_graph.GetPhysicalTexture(m_depthHandle)    : nullptr;
-    const RHI::Texture* taaSurfaceTex  = m_taaPass       ? m_graph.GetPhysicalTexture(m_surfaceHandle)  : nullptr;
-    const RHI::Texture* taaVelocityTex = m_taaPass       ? m_graph.GetPhysicalTexture(m_velocityHandle) : nullptr;
-    const RHI::Texture* normalTex      = m_xegtaoPass    ? m_graph.GetPhysicalTexture(m_normalHandle)   : nullptr;
-    const uint64_t      depthSrv       = taaDepthTex    ? m_gfx.GetTextureSRVGpuHandle(*taaDepthTex)    : 0;
-    const uint64_t      surfaceSrv     = taaSurfaceTex  ? m_gfx.GetTextureSRVGpuHandle(*taaSurfaceTex)  : 0;
-    const uint64_t      velocitySrv    = taaVelocityTex ? m_gfx.GetTextureSRVGpuHandle(*taaVelocityTex) : 0;
-    const uint64_t      normalSrv      = normalTex      ? m_gfx.GetTextureSRVGpuHandle(*normalTex)      : 0;
-
+// ---------------------------------------------------------------------------
+void Renderer::Render_ComputePrepass()
+{
     // ---- Phase 0: Skinning CS — writes SkinnedVertexRing UAVs; trailing UAV barrier for GBuffer.
+    //              Afterimage capture runs on the same CL, right after SkinningPass,
+    //              so it sees the freshly-skinned vertices and emits its own UAV barrier
+    //              on the snapshot pool before any later pass reads from it.
     if (m_skin.GetSkinningPass() && m_skin.IsInitialised() && !m_skin.GetSkinJobs().empty())
     {
         RHI::CommandList skinCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
         skinCL.gfx = &m_gfx;
         m_skin.GetSkinningPass()->Execute(skinCL);
+        if (m_afterimageCapturePass && m_afterimageSystem &&
+            !m_afterimageSystem->GetCaptureJobs().empty())
+        {
+            m_afterimageCapturePass->Execute(skinCL);
+        }
         // skinCL is submitted by EndFrame in allocation order (before GBuffer CLs)
     }
 
@@ -1360,7 +1351,7 @@ RHI::CommandList Renderer::Render()
         // Feed mesh-shape sampling; no-op for non-mesh emitters.
         m_particleSimPass->SetMeshDescriptorBinding(
             &m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer(),
-            m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr);
+            m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle());
 
         RHI::CommandList pCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
         pCL.gfx = &m_gfx;
@@ -1417,6 +1408,37 @@ RHI::CommandList Renderer::Render()
             m_camera.nearZ,
             m_camera.farZ);
     }
+}
+
+// ---------------------------------------------------------------------------
+RHI::CommandList Renderer::Render()
+{
+    EnsureWorkers();
+
+    // ---- Frame bindings (read-only for all workers this frame) -------------
+    const uint32_t frameSlot = m_gfx.GetFrameIndex();
+    Render_BindFrameResources(frameSlot);
+
+    // Pre-capture SRV handles on main thread before workers kick (graph won't recompile mid-frame).
+    const bool needPostCapture = m_taaPass || m_xegtaoPass;
+    const RHI::Texture* taaDepthTex    = needPostCapture ? m_graph.GetPhysicalTexture(m_depthHandle)    : nullptr;
+    const RHI::Texture* taaSurfaceTex  = m_taaPass       ? m_graph.GetPhysicalTexture(m_surfaceHandle)  : nullptr;
+    // Velocity feeds BOTH TAA and XeGTAO temporal reprojection — capture it
+    // whenever either is active (not TAA-only) so XeGTAO gets real motion
+    // vectors even when TAA is disabled.
+    const RHI::Texture* taaVelocityTex = needPostCapture  ? m_graph.GetPhysicalTexture(m_velocityHandle) : nullptr;
+    const RHI::Texture* normalTex      = m_xegtaoPass    ? m_graph.GetPhysicalTexture(m_normalHandle)   : nullptr;
+    const uint64_t      depthSrv       = taaDepthTex    ? m_gfx.GetTextureSRVGpuHandle(*taaDepthTex)    : 0;
+    const uint64_t      surfaceSrv     = taaSurfaceTex  ? m_gfx.GetTextureSRVGpuHandle(*taaSurfaceTex)  : 0;
+    const uint64_t      velocitySrv    = taaVelocityTex ? m_gfx.GetTextureSRVGpuHandle(*taaVelocityTex) : 0;
+    const uint64_t      normalSrv      = normalTex      ? m_gfx.GetTextureSRVGpuHandle(*normalTex)      : 0;
+    // Stencil-plane view of the depth buffer — TAA uses it to identify
+    // pixels tagged by OutlinePass and weaken their history blend weight.
+    // Zero when the depth format isn't D24_S8 — TAA disables the feature.
+    const uint64_t      stencilSrv     = taaDepthTex    ? m_gfx.GetTextureStencilSRVGpuHandle(*taaDepthTex) : 0;
+
+    // ---- Compute prepass: skinning / particle / trail / tracer / beam CS. ----
+    Render_ComputePrepass();
 
     // ---- Phase 1: Open shadow CL and build its per-frame context -----------
     RHI::CommandList shadowCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
@@ -1425,11 +1447,11 @@ RHI::CommandList Renderer::Render()
     RG::RenderContext shadowCtx;
     shadowCtx.SetDimensions(m_gfx.GetRenderWidth(), m_gfx.GetRenderHeight());
     shadowCtx.SetDrawList(&m_drawPackets);
-    shadowCtx.SetBuffer("InstanceBuffer",  m_instanceBuffer);
+    shadowCtx.SetBuffer("InstanceBuffer",  m_instanceBuffer[frameSlot]);
     shadowCtx.SetBuffer("MeshDescriptors", m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer());
     // Material buffer + bindless texture table required by Shadow.ps ALPHA_TEST path.
-    shadowCtx.SetBuffer("MaterialBuffer",  m_materialBuffer);
-    shadowCtx.SetBindlessTableHandle(m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr);
+    shadowCtx.SetBuffer("MaterialBuffer",  m_materialBuffer[frameSlot]);
+    shadowCtx.SetBindlessTableHandle(m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle());
     shadowCL.ctx = &shadowCtx;
 
     // ---- Phase 2a: Kick Worker 0 (shadow) ----------------------------------
@@ -1444,9 +1466,13 @@ RHI::CommandList Renderer::Render()
     });
 
     // ---- Phase 2a.5: Cluster lighting CS — must run when lights exist OR when DecalPass needs AABBs.
+    // Hoisted out of the if-scope so the DDGI compute-queue CL can declare
+    // a cross-queue dependency on it (DDGI's trace CS reads the cluster
+    // GPULight buffer that ClusterPass produces).
+    RHI::CommandList clusterCL{};
     if (m_clusterPass)
     {
-        RHI::CommandList clusterCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
+        clusterCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
         clusterCL.gfx = &m_gfx;
         uint32_t rc = m_gfx.BeginGPUTimestamp(clusterCL, "ClusterPass");
         m_clusterPass->Execute(clusterCL);
@@ -1462,7 +1488,7 @@ RHI::CommandList Renderer::Render()
     if (m_gbufferPass)
     {
         if (m_useIndirectDraw && m_indirectArgBuffer.IsValid() && !m_indirectGroups.empty())
-            m_gbufferPass->SetIndirectDraw(&m_indirectArgUpload, m_indirectGroups);
+            m_gbufferPass->SetIndirectDraw(&m_indirectArgUpload[frameSlot], m_indirectGroups);
         else
             m_gbufferPass->ClearIndirectDraw();
     }
@@ -1472,6 +1498,7 @@ RHI::CommandList Renderer::Render()
     {
         RHI::CommandList cullCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
         cullCL.gfx = &m_gfx;
+        uint32_t cullRegion = m_gfx.BeginGPUTimestamp(cullCL, "GpuCulling");
 
         // Set frustum planes from current view
         float frustumData[6][4];
@@ -1487,17 +1514,18 @@ RHI::CommandList Renderer::Render()
         m_cullingPass->SetInstanceCount(m_indirectDrawCount);
 
         // Clear draw count to 0 (write 0 to upload staging, copy to default)
-        if (m_drawCountMapped)
+        if (m_drawCountMapped[frameSlot])
         {
-            *static_cast<uint32_t*>(m_drawCountMapped) = 0;
-            m_gfx.CopyBuffer(m_drawCountUpload, m_drawCountBuffer, sizeof(uint32_t), cullCL);
+            *static_cast<uint32_t*>(m_drawCountMapped[frameSlot]) = 0;
+            m_gfx.CopyBuffer(m_drawCountUpload[frameSlot], m_drawCountBuffer, sizeof(uint32_t), cullCL);
         }
 
         m_cullingPass->Execute(cullCL,
-            m_instanceBuffer,
+            m_instanceBuffer[frameSlot],
             m_meshMgr.GetDescriptorHeap().GetMeshAABBBuffer(),
             m_indirectArgBuffer,
             m_drawCountBuffer);
+        m_gfx.EndGPUTimestamp(cullCL, cullRegion);
     }
 
     // ---- Phase 2b.5: DDGI (TLAS + trace + relight) — dependency of color graph; atlases SRV-ready.
@@ -1507,12 +1535,49 @@ RHI::CommandList Renderer::Render()
     //const bool ddgiLogTick = (++s_ddgiLogCounter % 60u) == 0;
     const bool ddgiLogTick = false;
 
+    uint32_t ddgiRegion = ~0u;
+    RHI::CommandList demoteCL{};
     if (m_ddgiReady && m_ddgiPass && m_ddgiMgr.GetActiveVolumeCount() > 0 && m_lastWorld)
     {
         auto& dx12 = static_cast<GraphicsDX12&>(m_gfx);
-        ddgiCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
+
+        // Tiny graphics-queue CL that demotes DDGI atlases + SH/probeData
+        // buffers from PIXEL|NON_PIXEL_SHADER_RESOURCE (set by the previous
+        // frame's promoteCL, or by CreateBuffer's initial transition on
+        // frame 1) → NON_PIXEL_SHADER_RESOURCE only, which is the only SR
+        // state a compute CL can transition to/from. Without this step the
+        // first compute-queue DDGI barrier with StateBefore=NPSR-only would
+        // trip the D3D12 debug layer (recorded state contains PSR=0x80,
+        // which is invalid on compute). ddgiCL waits on demoteCL via fence.
+        demoteCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
+        if (demoteCL.IsValid())
+        {
+            demoteCL.gfx = &m_gfx;
+            uint32_t dr = m_gfx.BeginGPUTimestamp(demoteCL, "DDGI.Demote");
+            m_ddgiMgr.DemoteForComputeQueue(m_gfx, demoteCL);
+            m_gfx.EndGPUTimestamp(demoteCL, dr);
+        }
+
+        // DDGI on the COMPUTE queue — probe update is purely compute work
+        // (CS dispatches + DXR DispatchRays / RayQuery), so it can run in
+        // parallel with the graphics-queue Shadow + GBuffer + SkyIBL +
+        // Decal sequence. LightingPass picks up the SH probe buffer + depth
+        // atlas via SRV; the cross-queue handoff is done via:
+        //   0. demote→DDGI fence (demote graphics CL puts buffers in NPSR-only)
+        //   1. cluster→DDGI fence (DDGI's trace reads ClusterPass's lights buf)
+        //   2. DDGI→promote fence (promote graphics CL flips atlases NPSR→NPSR|PSR)
+        //   3. promote→LightingPass fence (RenderGraph::SetExternalWait)
+        ddgiCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::COMPUTE);
         if (ddgiCL.IsValid())
         {
+            if (demoteCL.IsValid())
+                m_gfx.AddCommandListDependency(ddgiCL, demoteCL);
+            // Cluster GPULight buffer is produced on the graphics queue by
+            // ClusterPass. DDGI's trace CS samples it at root slot 11 — wait
+            // for that write to land before the trace dispatches.
+            if (clusterCL.IsValid())
+                m_gfx.AddCommandListDependency(ddgiCL, clusterCL);
+            ddgiRegion = m_gfx.BeginGPUTimestamp(ddgiCL, "DDGI");
             ID3D12GraphicsCommandList*  base = dx12.GetNativeCommandList(ddgiCL);
             Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd4;
             if (base && SUCCEEDED(base->QueryInterface(IID_PPV_ARGS(&cmd4))))
@@ -1537,13 +1602,13 @@ RHI::CommandList Renderer::Render()
 
                     // GPU VA of g_DDGIInstances buffer (closest-hit reads albedo + bindless slots).
                     D3D12_GPU_VIRTUAL_ADDRESS matVA = 0;
-                    if (const RHI::GPUBuffer* mb = m_ddgiSceneAS.GetInstanceBuffer())
+                    if (const RHI::GPUBuffer* mb = m_ddgiSceneAS.GetInstanceBuffer(dx12))
                         if (ID3D12Resource* mr = dx12.GetBufferResource(*mb))
                             matVA = mr->GetGPUVirtualAddress();
 
                     // Same bindless table as rasterizer; closest-hit reads vb/ibBindless for face normals.
                     const uint64_t bindlessTable =
-                        m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr;
+                        m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle();
 
                     // DDGIPass manages atlas SRV↔UAV internally; we leave it SRV for downstream.
                     const uint64_t lightsSrv = m_clusterPass
@@ -1554,23 +1619,54 @@ RHI::CommandList Renderer::Render()
 
                         m_ddgiPass->Execute(m_gfx, ddgiCL, m_ddgiMgr, s,
                                             tlasVA, m_skyRadianceSrvForDDGI, matVA,
-                                            bindlessTable, lightsSrv);
+                                            bindlessTable, lightsSrv,
+                                            /*onComputeQueue=*/true);
 
+                        // Leave atlases in SRV state on the compute queue.
+                        // The promoteCL below (graphics queue) flips them
+                        // NPSR-only → NPSR|PSR so LightingPass's PS read sees
+                        // them in the full SR mask.
                         m_ddgiMgr.TransitionVolumeAtlases(m_gfx, ddgiCL, s,
-                            DDGI::DDGIVolumeManager::AtlasState::SRV);
+                            DDGI::DDGIVolumeManager::AtlasState::SRV,
+                            /*onComputeQueue=*/true);
                     }
                 }
             }
+            m_gfx.EndGPUTimestamp(ddgiCL, ddgiRegion);
+        }
+    }
+
+    // ---- Phase 2b.6: DDGI atlas promote (graphics queue).
+    // DDGI ran on the COMPUTE queue, which leaves the SH probe buffer + depth
+    // atlas in NON_PIXEL_SHADER_RESOURCE (the only SR state legal on compute).
+    // LightingPass's PS read needs the full PIXEL|NON_PIXEL mask, which can
+    // only be issued on a graphics CL. promoteCL waits on the DDGI fence
+    // (cross-queue) and emits the per-volume state transitions; LightingPass
+    // then waits on promoteCL via SetExternalWait below.
+    RHI::CommandList promoteCL{};
+    if (ddgiCL.IsValid())
+    {
+        promoteCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
+        if (promoteCL.IsValid())
+        {
+            promoteCL.gfx = &m_gfx;
+            m_gfx.AddCommandListDependency(promoteCL, ddgiCL);
+            uint32_t pr = m_gfx.BeginGPUTimestamp(promoteCL, "DDGI.Promote");
+            m_ddgiMgr.PromoteAtlasesForGraphicsQueue(m_gfx, promoteCL);
+            m_gfx.EndGPUTimestamp(promoteCL, pr);
+
+            // LightingPass is the first graph pass that reads the DDGI SH
+            // buffer (its PS samples g_DDGIProbeSH at t29). Surgical wait —
+            // GBuffer / Terrain / SkyIBL / SpotShadow / Decal run in parallel
+            // with the compute-queue DDGI work.
+            m_graph.SetExternalWait("LightingPass", promoteCL);
         }
     }
 
     // ---- Phase 2b: Main-thread color passes (concurrent with Worker 0).
     RHI::CommandList colorLastCL = m_graph.Execute(m_gfx, m_clearColor);
 
-    // DDGI atlas dep — same-queue submission order suffices; invalid CL skips cleanly.
-    if (ddgiCL.IsValid() && colorLastCL.IsValid())
-        m_gfx.AddCommandListDependency(colorLastCL, ddgiCL);
-    else if (ddgiLogTick)
+    if (!ddgiCL.IsValid() && ddgiLogTick)
     {
         // Identify which gate tripped; throttled to ~1 Hz by ddgiLogTick.
         if (!m_ddgiReady)
@@ -1603,6 +1699,7 @@ RHI::CommandList Renderer::Render()
 
             RHI::CommandList hizCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
             hizCL.gfx = &m_gfx;
+            uint32_t hizRegion = m_gfx.BeginGPUTimestamp(hizCL, "HiZ");
 
             // Transition depth using graph-tracked state (not hardcoded).
             RHI::ResourceState depthState = m_graph.GetTextureState(m_depthHandle);
@@ -1621,285 +1718,34 @@ RHI::CommandList Renderer::Render()
                     RHI::ResourceState::DEPTHSTENCIL), hizCL);
             m_graph.SetTextureState(m_depthHandle, RHI::ResourceState::DEPTHSTENCIL);
 
+            m_gfx.EndGPUTimestamp(hizCL, hizRegion);
+
             if (colorLastCL.IsValid())
                 m_gfx.AddCommandListDependency(hizCL, colorLastCL);
         }
     }
 
-    // ---- Phase 4.6: Hi-Z SSR chain (depth pyramid → trace → snapshot → resolve → temporal → upsample).
-    // See SSR_HiZ_Architecture_Prompt.md. Output feeds LightingPass (1-frame latent) + composite.
-    if (m_ssrEnabled && m_ssrPass && m_ssrResolvePass && m_ssrDepthHierPass)
+    // ---- Phase 4.6 + 4.7: Hi-Z SSR chain.
+    // Trace / resolve / temporal / upsample / composite are all driven by
+    // SSRSubsystem. Renderer is responsible only for handing it the GBuffer
+    // handles + jittered camera state; barrier dance + per-pass barriers live
+    // inside the subsystem.
+    if (m_ssrEnabled && m_ssrSubsystem && m_viewMode != ViewMode::Wireframe)
     {
-        const RHI::Texture* depthTex    = m_graph.GetPhysicalTexture(m_depthHandle);
-        const RHI::Texture* normalTex   = m_graph.GetPhysicalTexture(m_normalHandle);
-        const RHI::Texture* surfaceTex  = m_graph.GetPhysicalTexture(m_surfaceHandle);
-        const RHI::Texture* velocityTex = m_graph.GetPhysicalTexture(m_velocityHandle);
-        if (depthTex && normalTex && surfaceTex)
-        {
-            const uint32_t rw = m_gfx.GetRenderWidth();
-            const uint32_t rh = m_gfx.GetRenderHeight();
-
-            m_ssrPass->EnsureTexture(rw, rh);
-            m_ssrDepthHierPass->EnsureTexture(rw, rh);
-            m_ssrResolvePass->EnsureTextures(rw, rh);
-
-            // Jittered viewProj — matches depth rasterization + LightingPass reconstruct.
-            SSRPass::Camera cam{};
-            cam.viewProj = m_view.viewProjMatrix;
-            {
-                using namespace DirectX;
-                XMMATRIX vp = XMLoadFloat4x4(&cam.viewProj);
-                XMStoreFloat4x4(&cam.invViewProj, XMMatrixInverse(nullptr, vp));
-            }
-            cam.cameraPos = m_camera.position;
-            cam.nearZ     = m_camera.nearZ;
-            cam.farZ      = m_camera.farZ;
-            m_ssrPass->SetCamera(cam);
-            m_ssrPass->SetFrameIndex(m_ssrFrameIndex++);
-            {
-                // Pyramid mip count = 1 + floor(log2(max(w,h))).
-                uint32_t mip = 1, dim = (rw > rh) ? rw : rh;
-                while (dim > 1) { dim >>= 1; mip++; }
-                m_ssrPass->SetHiZMipCount(mip);
-            }
-            // Trace tunables live in SSRPass class members; editor SSR Debug window owns them at runtime.
-
-            SSRResolvePass::Camera rcam{};
-            rcam.invViewProj = cam.invViewProj;
-            rcam.cameraPos   = cam.cameraPos;
-            rcam.nearZ       = cam.nearZ;
-            rcam.farZ        = cam.farZ;
-            m_ssrResolvePass->SetCamera(rcam);
-            m_ssrResolvePass->SetFrameIndex(m_ssrFrameIndex);
-            // FireflyCap owned by SSRResolvePass class member + editor (see SSRPass comment above).
-
-            SSRTemporalPass::Camera tcam{};
-            // Both ends JITTERED — depth was rasterized at jittered NDC, so
-            // inverse-VP must be jittered to recover the surface world pos;
-            // history was rendered at PREV jittered NDC, so the projection
-            // must use prev *jittered* VP to land sampling on the correct
-            // history pixel grid. Mixing in non-jittered prev VP (the
-            // earlier bug) lit history at ~1 px offset every frame, which
-            // the EMA dragged into a multi-pixel ghost trail and a static-
-            // frame "reflection misalignment".
-            tcam.invViewProj  = cam.invViewProj;
-            tcam.prevViewProj = m_taaJitter.GetPrevViewProjJittered();
-            tcam.nearZ        = cam.nearZ;
-            tcam.farZ         = cam.farZ;
-            m_ssrTemporalPass->SetCamera(tcam);
-
-            SSRUpsamplePass::Camera ucam{};
-            ucam.invViewProj = cam.invViewProj;
-            ucam.nearZ       = cam.nearZ;
-            ucam.farZ        = cam.farZ;
-            m_ssrUpsamplePass->SetCamera(ucam);
-
-            if (m_sceneColorPyramidPass)
-                m_sceneColorPyramidPass->EnsureTexture(rw, rh);
-            m_ssrTemporalPass->EnsureTextures(rw, rh);
-            m_ssrUpsamplePass->EnsureTexture(rw, rh);
-
-            RHI::CommandList ssrCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
-            ssrCL.gfx = &m_gfx;
-            if (colorLastCL.IsValid())
-                m_gfx.AddCommandListDependency(ssrCL, colorLastCL);
-
-            const RHI::ResourceState depthState0    = m_graph.GetTextureState(m_depthHandle);
-            const RHI::ResourceState normalState0   = m_graph.GetTextureState(m_normalHandle);
-            const RHI::ResourceState surfaceState0  = m_graph.GetTextureState(m_surfaceHandle);
-            const RHI::ResourceState velocityState0 = velocityTex
-                ? m_graph.GetTextureState(m_velocityHandle)
-                : RHI::ResourceState::SHADER_RESOURCE;
-
-            auto toSR = [&](const RHI::Texture* t, RHI::ResourceState from) {
-                if (!t) return;
-                if (from != RHI::ResourceState::SHADER_RESOURCE)
-                    m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                        t, from, RHI::ResourceState::SHADER_RESOURCE), ssrCL);
-            };
-            toSR(depthTex,    depthState0);
-            toSR(normalTex,   normalState0);
-            toSR(surfaceTex,  surfaceState0);
-            toSR(velocityTex, velocityState0);
-
-            // --- 1. Depth pyramid (lives in UAV across its internal chain) ---
-            m_ssrDepthHierPass->Execute(ssrCL,
-                m_gfx.GetTextureSRVGpuHandle(*depthTex));
-            const RHI::Texture* hierTex = m_ssrDepthHierPass->GetTexture();
-            m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                hierTex, RHI::ResourceState::UNORDERED_ACCESS,
-                RHI::ResourceState::SHADER_RESOURCE), ssrCL);
-
-            // --- 2. HDR snapshot + scene-color pyramid (BEFORE trace; trace samples pyramid).
-            const RHI::Texture* snapTex = m_ssrResolvePass->GetSnapshotTexture();
-            m_gfx.SetHdrTextureState(RHI::ResourceState::COPY_SRC, ssrCL);
-            m_ssrResolvePass->PreSnapshotCopy(ssrCL);
-            m_gfx.CopyHdrSceneTo(*snapTex, ssrCL);
-            m_ssrResolvePass->PostSnapshotCopy(ssrCL);
-
-            // Scene-color pyramid: mip 0 = snapshot; mips 1..N Karis-firefly 2×2 reduce.
-            // Trace samples cone-footprint mip (roughness × ray len); mirrors stay on mip 0.
-            uint64_t pyramidSrv = m_ssrResolvePass->GetSnapshotSrv();   // fallback
-            if (m_sceneColorPyramidPass)
-            {
-                m_sceneColorPyramidPass->Execute(ssrCL,
-                    m_ssrResolvePass->GetSnapshotTexture());
-                const RHI::Texture* pyrTex = m_sceneColorPyramidPass->GetTexture();
-                m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                    pyrTex, RHI::ResourceState::UNORDERED_ACCESS,
-                    RHI::ResourceState::SHADER_RESOURCE), ssrCL);
-                pyramidSrv = m_sceneColorPyramidPass->GetSrvHandle();
-            }
-
-            // --- 3. Trace: write hit colour + rayDirPDF + rayLength -------
-            m_ssrPass->Execute(ssrCL,
-                m_gfx.GetTextureSRVGpuHandle(*normalTex),
-                m_gfx.GetTextureSRVGpuHandle(*surfaceTex),
-                m_gfx.GetTextureSRVGpuHandle(*depthTex),
-                m_ssrDepthHierPass->GetSrvHandle(),
-                pyramidSrv,
-                velocityTex ? m_gfx.GetTextureSRVGpuHandle(*velocityTex) : 0);
-
-            // All three trace outputs UAV → SR for resolve to read.
-            auto uavToSR = [&](const RHI::Texture* t) {
-                m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                    t, RHI::ResourceState::UNORDERED_ACCESS,
-                    RHI::ResourceState::SHADER_RESOURCE), ssrCL);
-            };
-            uavToSR(m_ssrPass->GetResultTexture());
-            uavToSR(m_ssrPass->GetRayDirPDFTexture());
-            uavToSR(m_ssrPass->GetRayLengthTexture());
-            m_ssrPass->SetAllOutputsState(RHI::ResourceState::SHADER_RESOURCE);
-
-            // --- 4. Resolve (spatial BRDF reweight only) ------------------
-            m_ssrResolvePass->Execute(ssrCL, rw, rh,
-                m_gfx.GetTextureSRVGpuHandle(*normalTex),
-                m_gfx.GetTextureSRVGpuHandle(*surfaceTex),
-                m_gfx.GetTextureSRVGpuHandle(*depthTex),
-                m_ssrPass->GetResultSrv(),
-                m_ssrPass->GetRayDirPDFSrv(),
-                m_ssrPass->GetRayLengthSrv());
-
-            // --- 5. Temporal (dual-reprojection history blend) ------------
-            m_ssrTemporalPass->Execute(ssrCL, rw, rh,
-                m_ssrResolvePass->GetColorSrv(),
-                m_ssrResolvePass->GetVarianceSrv(),
-                m_ssrResolvePass->GetReprojDepthSrv(),
-                velocityTex ? m_gfx.GetTextureSRVGpuHandle(*velocityTex) : 0,
-                m_gfx.GetTextureSRVGpuHandle(*depthTex));
-
-            // --- 6. Upsample (variance-driven bilateral blur) -------------
-            m_ssrUpsamplePass->Execute(ssrCL, rw, rh,
-                m_ssrTemporalPass->GetColorSrv(),
-                m_ssrTemporalPass->GetVarianceSrv(),
-                m_gfx.GetTextureSRVGpuHandle(*depthTex),
-                m_gfx.GetTextureSRVGpuHandle(*normalTex),
-                m_gfx.GetTextureSRVGpuHandle(*surfaceTex));
-
-            // Return scene-color pyramid to UAV for next frame's mip0 write.
-            if (m_sceneColorPyramidPass)
-            {
-                const RHI::Texture* pyrTex = m_sceneColorPyramidPass->GetTexture();
-                m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                    pyrTex, RHI::ResourceState::SHADER_RESOURCE,
-                    RHI::ResourceState::UNORDERED_ACCESS), ssrCL);
-            }
-
-            // Return the depth pyramid to UAV for next frame's mip0 dispatch.
-            m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                hierTex, RHI::ResourceState::SHADER_RESOURCE,
-                RHI::ResourceState::UNORDERED_ACCESS), ssrCL);
-
-            // HDR → RT so Phase 4.7 composite can flip it to UAV.
-            m_gfx.SetHdrTextureState(RHI::ResourceState::RENDERTARGET, ssrCL);
-
-            // Restore graph-tracked states so downstream passes see what they expect.
-            auto fromSR = [&](const RHI::Texture* t, RHI::ResourceState to) {
-                if (!t) return;
-                if (to != RHI::ResourceState::SHADER_RESOURCE)
-                    m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                        t, RHI::ResourceState::SHADER_RESOURCE, to), ssrCL);
-            };
-            fromSR(depthTex,    depthState0);
-            fromSR(normalTex,   normalState0);
-            fromSR(surfaceTex,  surfaceState0);
-            fromSR(velocityTex, velocityState0);
-        }
-    }
-
-    // ---- Phase 4.7: SSR composite -----------------------------------------
-    // Resolved SSR + Fresnel × envBRDF → HDR additive; pairs with Lighting (1-ssrConf) dampening.
-    if (m_ssrEnabled && m_ssrUpsamplePass && m_ssrCompositePass)
-    {
-        const RHI::Texture* albedoTex  = m_graph.GetPhysicalTexture(m_albedoHandle);
-        const RHI::Texture* normalTex  = m_graph.GetPhysicalTexture(m_normalHandle);
-        const RHI::Texture* surfaceTex = m_graph.GetPhysicalTexture(m_surfaceHandle);
-        const RHI::Texture* depthTex   = m_graph.GetPhysicalTexture(m_depthHandle);
-        const RHI::Texture* ssrTex     = m_ssrUpsamplePass->GetColorTexture();
-        const uint64_t      hdrUav     = m_gfx.GetHdrSceneUavGpuHandle();
-        if (albedoTex && normalTex && surfaceTex && depthTex && ssrTex && hdrUav)
-        {
-            SSRCompositePass::Camera cam{};
-            cam.cameraPos = m_camera.position;
-            {
-                using namespace DirectX;
-                XMMATRIX vp = XMLoadFloat4x4(&m_view.viewProjMatrix);
-                XMStoreFloat4x4(&cam.invViewProj, XMMatrixInverse(nullptr, vp));
-            }
-            m_ssrCompositePass->SetCamera(cam);
-
-            RHI::CommandList compCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
-            compCL.gfx = &m_gfx;
-            if (colorLastCL.IsValid())
-                m_gfx.AddCommandListDependency(compCL, colorLastCL);
-
-            const RHI::ResourceState albedoState0  = m_graph.GetTextureState(m_albedoHandle);
-            const RHI::ResourceState normalState0  = m_graph.GetTextureState(m_normalHandle);
-            const RHI::ResourceState surfaceState0 = m_graph.GetTextureState(m_surfaceHandle);
-            const RHI::ResourceState depthState0   = m_graph.GetTextureState(m_depthHandle);
-            auto toSR = [&](const RHI::Texture* t, RHI::ResourceState from) {
-                if (from != RHI::ResourceState::SHADER_RESOURCE)
-                    m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                        t, from, RHI::ResourceState::SHADER_RESOURCE), compCL);
-            };
-            toSR(albedoTex,  albedoState0);
-            toSR(normalTex,  normalState0);
-            toSR(surfaceTex, surfaceState0);
-            toSR(depthTex,   depthState0);
-
-            m_gfx.SetHdrTextureState(RHI::ResourceState::UNORDERED_ACCESS, compCL);
-
-            // Debug SRVs for composite modes 3/4/5 (raw trace / confidence / world-L). Already in SR.
-            const uint64_t rawTraceSrv = m_ssrPass ? m_ssrPass->GetResultSrv()    : 0;
-            const uint64_t rayDirSrv   = m_ssrPass ? m_ssrPass->GetRayDirPDFSrv() : 0;
-
-            // Keep composite's roughness-mask mode in sync with trace's cutoff.
-            if (m_ssrPass && m_ssrCompositePass)
-                m_ssrCompositePass->SetRoughnessCutoff(m_ssrPass->GetRoughnessCutoff());
-
-            m_ssrCompositePass->Execute(compCL,
-                m_gfx.GetRenderWidth(), m_gfx.GetRenderHeight(),
-                m_gfx.GetTextureSRVGpuHandle(*albedoTex),
-                m_gfx.GetTextureSRVGpuHandle(*normalTex),
-                m_gfx.GetTextureSRVGpuHandle(*surfaceTex),
-                m_gfx.GetTextureSRVGpuHandle(*depthTex),
-                m_gfx.GetTextureSRVGpuHandle(*ssrTex),
-                hdrUav,
-                m_brdfLutSrv,
-                rawTraceSrv, rayDirSrv, /*rayLen*/0, /*variance*/0);
-
-            m_gfx.SetHdrTextureState(RHI::ResourceState::SHADER_RESOURCE, compCL);
-
-            auto fromSR = [&](const RHI::Texture* t, RHI::ResourceState to) {
-                if (to != RHI::ResourceState::SHADER_RESOURCE)
-                    m_gfx.PushBarrier(RHI::GPUBarrier::Image(
-                        t, RHI::ResourceState::SHADER_RESOURCE, to), compCL);
-            };
-            fromSR(albedoTex,  albedoState0);
-            fromSR(normalTex,  normalState0);
-            fromSR(surfaceTex, surfaceState0);
-            fromSR(depthTex,   depthState0);
-        }
+        SSRSubsystem::FrameContext ctx{};
+        ctx.graph                = &m_graph;
+        ctx.albedoHandle         = m_albedoHandle;
+        ctx.normalHandle         = m_normalHandle;
+        ctx.surfaceHandle        = m_surfaceHandle;
+        ctx.depthHandle          = m_depthHandle;
+        ctx.velocityHandle       = m_velocityHandle;
+        ctx.viewProj             = m_view.viewProjMatrix;
+        ctx.prevViewProjJittered = m_taaJitter.GetPrevViewProjJittered();
+        ctx.cameraPos            = m_camera.position;
+        ctx.nearZ                = m_camera.nearZ;
+        ctx.farZ                 = m_camera.farZ;
+        ctx.brdfLutSrv           = m_brdfLutSrv;
+        m_ssrSubsystem->Render(m_gfx, ctx, colorLastCL);
     }
 
     // ---- Phase 4.8: Debug wireframe — MUST run after SSR composite or it gets stomped.
@@ -1909,8 +1755,10 @@ RHI::CommandList Renderer::Render()
         wireCL.gfx = &m_gfx;
         m_gfx.AddCommandListDependency(wireCL, colorLastCL);
 
+        uint32_t wireRegion = m_gfx.BeginGPUTimestamp(wireCL, "DebugWire");
         const RHI::Texture* depthTex = m_graph.GetPhysicalTexture(m_depthHandle);
-        m_debugWirePass->Execute(wireCL, depthTex, m_perObjectCB);
+        m_debugWirePass->Execute(wireCL, depthTex, m_perObjectCB.CurrentBuffer(m_gfx));
+        m_gfx.EndGPUTimestamp(wireCL, wireRegion);
 
         colorLastCL = wireCL;
     }
@@ -1924,9 +1772,11 @@ RHI::CommandList Renderer::Render()
         dbgCL.gfx = &m_gfx;
         m_gfx.AddCommandListDependency(dbgCL, colorLastCL);
 
+        uint32_t dbgRegion = m_gfx.BeginGPUTimestamp(dbgCL, "DDGIProbeDebug");
         const RHI::Texture* depthTex = m_graph.GetPhysicalTexture(m_depthHandle);
         m_ddgiProbeDebugPass->Execute(m_gfx, dbgCL, depthTex,
-                                      m_perObjectCB, m_ddgiMgr, *m_lastWorld);
+                                      m_perObjectCB.CurrentBuffer(m_gfx), m_ddgiMgr, *m_lastWorld);
+        m_gfx.EndGPUTimestamp(dbgCL, dbgRegion);
 
         colorLastCL = dbgCL;
     }
@@ -1967,14 +1817,29 @@ RHI::CommandList Renderer::Render()
                 m_graph.SetTextureState(m_normalHandle, RHI::ResourceState::SHADER_RESOURCE_COMPUTE);
             }
         }
-
+        // Transition velocity for TAA / XeGTAO compute reads. Velocity now
+        // carries an SRV (GBuffer3_Velocity isSRV), but the graph leaves it in
+        // RENDERTARGET after GBufferPass (and SSR's fromSR restores it there),
+        // so it must be made compute-readable here — mirrors the normal buffer.
+        if (taaVelocityTex && (m_taaPass || m_xegtaoPass))
+        {
+            RHI::ResourceState curVelState = m_graph.GetTextureState(m_velocityHandle);
+            if (curVelState != RHI::ResourceState::SHADER_RESOURCE_COMPUTE)
+            {
+                m_gfx.PushBarrier(RHI::GPUBarrier::Image(
+                    taaVelocityTex,
+                    curVelState,
+                    RHI::ResourceState::SHADER_RESOURCE_COMPUTE), preComputeCL);
+                m_graph.SetTextureState(m_velocityHandle, RHI::ResourceState::SHADER_RESOURCE_COMPUTE);
+            }
+        }
         // computeCL (COMPUTE): TAA → AutoExposure → Bloom → ToneMap; cross-queue fenced.
         RHI::CommandList computeCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::COMPUTE);
         computeCL.gfx = &m_gfx;
         m_gfx.AddCommandListDependency(computeCL, preComputeCL);
 
         // Worker 2 records the compute dispatches while main thread can do other work.
-        m_renderWorkers[2].Kick([this, computeCL, depthSrv, surfaceSrv, velocitySrv, normalSrv]() mutable
+        m_renderWorkers[2].Kick([this, computeCL, depthSrv, surfaceSrv, velocitySrv, normalSrv, stencilSrv]() mutable
         {
             if (m_taaPass)
             {
@@ -1986,12 +1851,15 @@ RHI::CommandList Renderer::Render()
                 m_taaPass->SetDepthSrvHandle(depthSrv);
                 m_taaPass->SetGBufferSrvHandle(surfaceSrv);
                 m_taaPass->SetVelocitySrvHandle(velocitySrv);
+                m_taaPass->SetOutlineStencilSrvHandle(stencilSrv);
                 m_taaPass->SetViewportSize(m_vpWidth, m_vpHeight);
                 m_taaPass->SetFrameData(m_taaJitter.GetInvViewProj(), prevVP,
-                                        m_taaPass->tauHistory,
+                                        m_taaPass->historyWeight,
                                         /*hasHistory=*/true, m_deltaTime);
                 m_taaPass->SetJitter(m_taaJitter.GetJitterX(), m_taaJitter.GetJitterY());
+                uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "TAA");
                 m_taaPass->Execute(computeCL);
+                m_gfx.EndGPUTimestamp(computeCL, r);
                 m_taaJitter.AdvanceToNextFrame();
             }
 
@@ -2007,13 +1875,32 @@ RHI::CommandList Renderer::Render()
                 static uint32_t s_gtaoFrame = 0;
                 m_xegtaoPass->SetProjectionMatrix(
                     m_view.projMatrixNoJitter, m_view.viewMatrix, s_gtaoFrame++);
+                uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "XeGTAO");
                 m_xegtaoPass->Execute(computeCL);
+                m_gfx.EndGPUTimestamp(computeCL, r);
             }
 
-            // Route to TAA's resolved buffer only if TAA actually ran; raw HDR otherwise.
-            const uint64_t resolvedSrv = (m_taaPass && m_taaPass->IsEnabled())
-                ? m_taaPass->GetResolvedSrvHandle()
-                : m_gfx.GetHdrSceneSrvGpuHandle();
+            // FXAA pass: spatial AA. Reads either TAA's resolved buffer (if TAA also
+            // active → FXAA+TAA mode) or the raw HDR scene (FXAA-only mode). Output
+            // becomes the resolvedSrv for downstream Bloom / AutoExposure / ToneMap.
+            if (m_fxaaPass && m_fxaaPass->IsEnabled())
+            {
+                const uint64_t fxaaInputSrv = (m_taaPass && m_taaPass->IsEnabled())
+                    ? m_taaPass->GetResolvedSrvHandle()
+                    : m_gfx.GetHdrSceneSrvGpuHandle();
+                m_fxaaPass->SetInputSrvHandle(fxaaInputSrv);
+                m_fxaaPass->SetViewportSize(m_vpWidth, m_vpHeight);
+                uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "FXAA");
+                m_fxaaPass->Execute(computeCL);
+                m_gfx.EndGPUTimestamp(computeCL, r);
+            }
+
+            // Route resolvedSrv to FXAA > TAA > raw HDR (priority order).
+            uint64_t resolvedSrv = m_gfx.GetHdrSceneSrvGpuHandle();
+            if (m_taaPass && m_taaPass->IsEnabled())
+                resolvedSrv = m_taaPass->GetResolvedSrvHandle();
+            if (m_fxaaPass && m_fxaaPass->IsEnabled())
+                resolvedSrv = m_fxaaPass->GetResolvedSrvHandle();
 
             // ---- Lens flare per-frame setup (CPU project sun → screen UV) ----
             // Reads LightCB.lightDir (= -sunDirWS) and lightColor written earlier
@@ -2026,9 +1913,9 @@ RHI::CommandList Renderer::Render()
                 using namespace DirectX;
                 XMFLOAT3 sunDirWS{ 0.f, 1.f, 0.f };
                 XMFLOAT3 sunColor{ 1.f, 1.f, 1.f };
-                if (m_lightCBMapped)
+                if (m_lightCB.Current(m_gfx))
                 {
-                    auto* lb = static_cast<LightCB*>(m_lightCBMapped);
+                    auto* lb = m_lightCB.Current(m_gfx);
                     sunDirWS = { -lb->lightDir[0], -lb->lightDir[1], -lb->lightDir[2] };
                     sunColor = {  lb->lightColor[0], lb->lightColor[1], lb->lightColor[2] };
                 }
@@ -2062,17 +1949,18 @@ RHI::CommandList Renderer::Render()
                 }
 
                 // Disable when the sun is below the horizon. Two paths:
-                //   - TOD active and SkyIBLPass switched the active body to the
-                //     moon → LightCB.lightDir already tracks the moon, so the
-                //     dir.y check below would *not* fire (moonDir.y > 0 at
-                //     night). Use IsMoonActive() to catch this case.
-                //   - TOD off / no SkyIBLPass → directional light is whatever
-                //     the user authored. Gate on sunDirWS.y so a manually
-                //     down-pointing sun also turns flare off.
+                //   - TOD active and TODOutput flagged moon active → LightCB
+                //     tracks the moon (moonDir.y > 0 at night), so the dir.y
+                //     check below would *not* fire. Read TODOutput to catch.
+                //   - TOD off → directional light is whatever the user
+                //     authored. Gate on sunDirWS.y so a manually down-pointing
+                //     sun also turns flare off.
                 bool sunBelowHorizon = false;
-                if (m_skyIBLPass && m_skyIBLPass->IsTimeOfDayEnabled()
-                                 && m_skyIBLPass->IsMoonActive())
-                    sunBelowHorizon = true;
+                if (m_lastWorld) {
+                    if (const auto* todOut = TODUtil::FindOutput(*m_lastWorld);
+                        todOut && todOut->isMoonActive)
+                        sunBelowHorizon = true;
+                }
                 if (sunDirWS.y < 0.02f)   // ~1° above horizon
                     sunBelowHorizon = true;
 
@@ -2095,18 +1983,22 @@ RHI::CommandList Renderer::Render()
                 ppCtx.cameraPos      = m_view.cameraPosition;
                 ppCtx.world          = m_lastWorld;   // for EntityVolumeSource
                 ppCtx.hdrSrv         = resolvedSrv;
+                uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "PostProcessStack");
                 m_postProcessStack->Execute(ppCtx);
+                m_gfx.EndGPUTimestamp(computeCL, r);
             }
 
             // GlassShatterPass: composites shards in-place into Tonemap output; restores entry state.
             if (m_glassShatterPass && m_glassShatterPass->IsActive() && m_toneMapPass)
             {
+                uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "GlassShatter");
                 m_glassShatterPass->Execute(
                     computeCL,
                     m_toneMapPass->GetFinalOutputTexture(),
                     RHI::ResourceState::SHADER_RESOURCE_COMPUTE,
                     m_vpWidth, m_vpHeight,
                     m_deltaTime);
+                m_gfx.EndGPUTimestamp(computeCL, r);
             }
         });
 
@@ -2156,6 +2048,7 @@ RHI::CommandList Renderer::Render()
         if (m_worldUIPass && m_worldUIPass->enabled && m_toneMapPass && m_lastWorld)
         {
             const RHI::ResourceState entry = m_toneMapPass->GetFinalOutputState();
+            uint32_t r = m_gfx.BeginGPUTimestamp(restoreCL, "WorldUI");
             m_worldUIPass->Execute(restoreCL,
                                     *m_lastWorld,
                                     m_view.viewProjMatrixNoJitter,
@@ -2163,6 +2056,7 @@ RHI::CommandList Renderer::Render()
                                     m_toneMapPass->GetFinalOutputTexture(),
                                     entry,
                                     m_vpWidth, m_vpHeight);
+            m_gfx.EndGPUTimestamp(restoreCL, r);
             m_toneMapPass->SetFinalOutputState(RHI::ResourceState::SHADER_RESOURCE);
         }
 
@@ -2171,10 +2065,12 @@ RHI::CommandList Renderer::Render()
         {
             // Pass actual tracked state so the barrier matches (resize paths can leave UAV/SR_COMPUTE).
             const RHI::ResourceState entry = m_toneMapPass->GetFinalOutputState();
+            uint32_t r = m_gfx.BeginGPUTimestamp(restoreCL, "UI");
             m_uiPass->Execute(restoreCL,
                               m_toneMapPass->GetFinalOutputTexture(),
                               entry,
                               m_vpWidth, m_vpHeight);
+            m_gfx.EndGPUTimestamp(restoreCL, r);
             m_toneMapPass->SetFinalOutputState(RHI::ResourceState::SHADER_RESOURCE);
         }
         // Always clear drawlist — widgets re-emit each frame; prevents disabled-UI accumulation.
@@ -2186,33 +2082,12 @@ RHI::CommandList Renderer::Render()
     return colorLastCL.IsValid() ? colorLastCL : shadowCL;
 }
 
-uint64_t Renderer::GetFinalOutputSrvHandle() const
-{
-    if (m_toneMapPass) return m_toneMapPass->GetFinalOutputSrvHandle();
-    return 0;
-}
-
-void Renderer::TriggerGlassShatter(float impactU, float impactV)
-{
-    if (m_glassShatterPass) m_glassShatterPass->Trigger(impactU, impactV);
-}
-
-uint64_t Renderer::GetSSRResultSrv() const
-{
-    return m_ssrPass ? m_ssrPass->GetResultSrv() : 0;
-}
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
-
 void Renderer::InitMeshManager()
 {
     m_meshMgr.Init(m_gfx);
     m_meshMgr.InitPrimitives();
     // Billboard quad deferred to InitSkinningSystems — same lifetime as its pass.
 }
-
 
 // ---------------------------------------------------------------------------
 const ShaderReflect::Reflection*
@@ -2240,2525 +2115,19 @@ bool Renderer::CaptureViewportToPNG(const char* path)
     return m_gfx.CaptureTextureToPNG(*tex, RHI::ResourceState::SHADER_RESOURCE, path);
 }
 
-void Renderer::SyncMaterialTextures(Entity e, MaterialComponent& mc)
-{
-    if (!m_texSys || !m_resMgr) return;
-
-    // try_emplace: one lookup whether hit or miss (avoids find-then-insert two-hash).
-    auto [cacheIt, _inserted] = m_matTexCache.try_emplace(e);
-    auto& cache = cacheIt->second;
-    for (int s = 0; s < MaterialComponent::TEXTURESLOT_COUNT; ++s)
-    {
-        auto& slot  = mc.textures[s];
-        auto& entry = cache[s];
-
-        // Re-acquire when the path changes (or is first seen).
-        if (slot.name != entry.path)
-        {
-            if (entry.handle != Resource::kInvalidTextureHandle)
-                m_texSys->Release(entry.handle, m_gfx);
-
-            entry.path   = slot.name;
-            entry.handle = slot.name.empty()
-                ? Resource::kInvalidTextureHandle
-                : m_texSys->Acquire(slot.name, *m_resMgr, m_gfx);
-            slot.gpuHandle = 0; // clear until load completes
-        }
-
-        // Promote once async load finishes; gpuHandle==0 gate skips virtuals on subsequent frames.
-        if (slot.gpuHandle == 0
-            && entry.handle != Resource::kInvalidTextureHandle
-            && m_texSys->IsReady(entry.handle))
-        {
-            if (const RHI::Texture* tex = m_texSys->GetTexture(entry.handle))
-            {
-                slot.gpuHandle        = m_gfx.GetTextureSRVGpuHandle(*tex);
-                slot.bindlessIndex    = static_cast<int32_t>(tex->handle_id);
-                slot.previewGpuHandle = m_gfx.GetTexturePreviewSrvGpuHandle(*tex);
-            }
-        }
-    }
-}
-
-// Name-keyed mirror of SyncMaterialTextures for the customTextures map.
-void Renderer::SyncMaterialCustomTextures(Entity e, MaterialComponent& mc)
-{
-    if (!m_texSys || !m_resMgr) return;
-    if (mc.customTextures.empty())
-    {
-        // Free entries left over from a previous shader's textures.
-        auto it = m_customMatTexCache.find(e);
-        if (it != m_customMatTexCache.end())
-        {
-            for (auto& [_name, entry] : it->second)
-                if (entry.handle != Resource::kInvalidTextureHandle)
-                    m_texSys->Release(entry.handle, m_gfx);
-            m_customMatTexCache.erase(it);
-        }
-        return;
-    }
-
-    auto [cacheIt, _inserted] = m_customMatTexCache.try_emplace(e);
-    auto& cache = cacheIt->second;
-
-    for (auto& [name, slot] : mc.customTextures)
-    {
-        auto [entIt, _added] = cache.try_emplace(name);
-        auto& entry = entIt->second;
-
-        if (slot.name != entry.path)
-        {
-            if (entry.handle != Resource::kInvalidTextureHandle)
-                m_texSys->Release(entry.handle, m_gfx);
-
-            entry.path   = slot.name;
-            entry.handle = slot.name.empty()
-                ? Resource::kInvalidTextureHandle
-                : m_texSys->Acquire(slot.name, *m_resMgr, m_gfx);
-            slot.gpuHandle     = 0;
-            slot.bindlessIndex = -1;
-        }
-
-        if (slot.gpuHandle == 0
-            && entry.handle != Resource::kInvalidTextureHandle
-            && m_texSys->IsReady(entry.handle))
-        {
-            if (const RHI::Texture* tex = m_texSys->GetTexture(entry.handle))
-            {
-                slot.gpuHandle        = m_gfx.GetTextureSRVGpuHandle(*tex);
-                slot.bindlessIndex    = static_cast<int32_t>(tex->handle_id);
-                slot.previewGpuHandle = m_gfx.GetTexturePreviewSrvGpuHandle(*tex);
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-void Renderer::BuildRenderScene(World& world)
-{
-    m_drawPackets.clear();
-
-    // Cache ECS pool pointers once — pool->Get(e) is two array loads vs hash lookup.
-    auto* pMaterial    = world.GetPool<MaterialComponent>();
-    auto* pGlobalXf    = world.GetPool<GlobalTransform>();
-    auto* pWorldAabb   = world.GetPool<WorldAabb>();
-    auto* pMeshHandle  = world.GetPool<MeshHandle>();
-    auto* pMeshLibRef  = world.GetPool<MeshLibRef>();
-    auto* pLightData   = world.GetPool<LightData>();
-    auto* pVolLight    = world.GetPool<VolumetricLightComponent>();
-    auto* pBillboard   = world.GetPool<BillboardComponent>();
-    auto* pSkinned     = world.GetPool<MeshSkinnedComponent>();
-    auto* pSkinOut     = world.GetPool<SkinningOutputComponent>();
-    auto* pVisibility  = world.GetPool<Visibility>();
-    auto pGet = [](auto* p, Entity e) { return p ? p->Get(e) : nullptr; };
-
-    // Current-frame camera forward for transparent sort (m_view is updated AFTER this function).
-    const float _cp = std::cos(m_camera.pitch);
-    const float _sp = std::sin(m_camera.pitch);
-    const float _cy = std::cos(m_camera.yaw);
-    const float _sy = std::sin(m_camera.yaw);
-    const XMFLOAT3 camForwardThisFrame = { _sy * _cp, -_sp, _cy * _cp };
-
-    // ---- Sync material textures + NPR ramp scan (merged single pass) --------
-    m_nprRampTexHandle = 0;
-    if (m_texSys && m_resMgr && pMaterial)
-    {
-        auto& matEnts = pMaterial->Entities();
-        auto& matData = pMaterial->Data();
-        const size_t matN = matData.size();
-        for (size_t mi = 0; mi < matN; ++mi)
-        {
-            const Entity e = matEnts[mi];
-            if (!world.IsAlive(e)) continue;
-            MaterialComponent* mc = &matData[mi];
-
-            // NPR ramp scan (piggyback on material iteration).
-            if (m_nprRampTexHandle == 0
-                && mc->shaderType == MaterialComponent::SHADERTYPE_NPR_RAMP
-                && mc->textures[MaterialComponent::RAMPMAP].gpuHandle != 0)
-            {
-                m_nprRampTexHandle = mc->textures[MaterialComponent::RAMPMAP].gpuHandle;
-            }
-
-            // Fast skip: clean + all slots GPU-ready (or empty) → no sync work.
-            if (!mc->IsDirty())
-            {
-                bool allReady = true;
-                for (int s = 0; s < MaterialComponent::TEXTURESLOT_COUNT; ++s)
-                {
-                    if (!mc->textures[s].name.empty() && mc->textures[s].gpuHandle == 0)
-                    { allReady = false; break; }
-                }
-                if (allReady) continue;
-            }
-
-            SyncMaterialTextures(e, *mc);
-            SyncMaterialCustomTextures(e, *mc);
-            mc->SetDirty(false);
-        }
-    }
-
-    // ---- Phase 0.5: BVH + frustum cull. Dense bitmasks (no hashing) — bvhVisibleMask /
-    // bvhTestedMask indexed by Entity ID; tested = in BVH (has MeshLibRef + WorldAabb).
-    Entity maxEntity = 0;
-    for (Entity e : world.GetEntities())
-        if (e > maxEntity) maxEntity = e;
-    std::vector<uint8_t> bvhVisibleMask(static_cast<size_t>(maxEntity) + 1, 0);
-    std::vector<uint8_t> bvhTestedMask (static_cast<size_t>(maxEntity) + 1, 0);
-    auto inMask = [](const std::vector<uint8_t>& m, Entity e) -> bool {
-        return e < m.size() && m[e] != 0;
-    };
-    if (m_gpuCullingEnabled)
-    {
-        std::vector<Entity>              bvhEntities;
-        std::vector<SceneBVH::AABB>      bvhAABBs;
-        std::vector<SceneBVH::LeafType>  bvhTypes;
-        bvhEntities.reserve(1024);
-        bvhAABBs.reserve(1024);
-        bvhTypes.reserve(1024);
-
-        if (pMeshLibRef)
-        {
-            auto& mlrEnts = pMeshLibRef->Entities();
-            auto& mlrData = pMeshLibRef->Data();
-            const size_t mlrN = mlrData.size();
-            for (size_t k = 0; k < mlrN; ++k)
-            {
-                const Entity e = mlrEnts[k];
-                if (!world.IsAlive(e)) continue;
-                if (!mlrData[k].IsValid()) continue;
-                const WorldAabb* aabb = pGet(pWorldAabb, e);
-                if (!aabb) continue;
-
-                bvhEntities.push_back(e);
-                bvhAABBs.push_back({ aabb->min, aabb->max });
-
-                const MeshSkinnedComponent* skMesh = pGet(pSkinned, e);
-                bvhTypes.push_back(skMesh ? SceneBVH::LeafType::Skinned
-                                          : SceneBVH::LeafType::Static);
-            }
-        }
-
-        const uint32_t entityCount = static_cast<uint32_t>(bvhEntities.size());
-
-        if (m_sceneBVH.NeedsRebuild() || m_sceneBVH.GetLeafCount() != entityCount)
-        {
-            // Full SAH rebuild — first frame or entity count changed.
-            m_sceneBVH.Build(bvhEntities.data(), bvhAABBs.data(), bvhTypes.data(), entityCount);
-        }
-        else
-        {
-            // Incremental refit: leaf AABBs then bottom-up propagate.
-            for (uint32_t i = 0; i < entityCount; ++i)
-                m_sceneBVH.RefitLeaf(bvhEntities[i], bvhAABBs[i]);
-            m_sceneBVH.RefitInternal();
-        }
-
-        std::vector<Entity> visibleEntities;
-        visibleEntities.reserve(entityCount);
-        m_sceneBVH.FrustumCull(m_view.boundingFrustum, visibleEntities);
-
-        for (Entity e : visibleEntities) if (e < bvhVisibleMask.size()) bvhVisibleMask[e] = 1;
-        for (Entity e : bvhEntities)     if (e < bvhTestedMask .size()) bvhTestedMask [e] = 1;
-    }
-
-    // ---- Debug wireframes (NOT gated on culling — needs Clear() each frame regardless). ----
-    if (m_debugWirePass && m_debugWirePass->enabled)
-    {
-        m_debugWirePass->Clear();
-
-        if (m_debugWirePass->showAABBs)
-        {
-            for (Entity e : world.GetEntities())
-            {
-                if (!world.IsAlive(e)) continue;
-                const WorldAabb* wa = world.GetComponent<WorldAabb>(e);
-                if (wa && wa->min.x <= wa->max.x)
-                    m_debugWirePass->AddAABB(wa->min, wa->max, 0xFF00FF00); // green
-            }
-        }
-
-        if (m_debugWirePass->showFrustum)
-        {
-            // Compute frustum corners from inverse viewProj.
-            XMMATRIX invVP = XMLoadFloat4x4(&m_view.viewProjMatrixNoJitter);
-            invVP = XMMatrixInverse(nullptr, invVP);
-
-            XMFLOAT3 frustumCorners[8];
-            static const XMFLOAT3 ndcCorners[8] = {
-                {-1, -1, 0}, { 1, -1, 0}, {-1,  1, 0}, { 1,  1, 0}, // near
-                {-1, -1, 1}, { 1, -1, 1}, {-1,  1, 1}, { 1,  1, 1}, // far
-            };
-            for (int i = 0; i < 8; ++i)
-            {
-                XMVECTOR v = XMVector3TransformCoord(
-                    XMLoadFloat3(&ndcCorners[i]), invVP);
-                XMStoreFloat3(&frustumCorners[i], v);
-            }
-            m_debugWirePass->AddFrustum(frustumCorners, 0xFF00FFFF); // cyan
-        }
-
-        if (m_debugWirePass->showCapsules)
-        {
-            for (Entity e : world.GetEntities())
-            {
-                if (!world.IsAlive(e)) continue;
-                const auto* capComp = world.GetComponent<CapsuleColliderComponent>(e);
-                if (!capComp || capComp->count == 0) continue;
-
-                // Find skeleton — on this entity or via SkeletonRef.
-                Entity skelEntity = e;
-                const auto* skelComp = world.GetComponent<SkeletonComponent>(e);
-                if (!skelComp)
-                {
-                    const SkeletonRef* ref = world.GetComponent<SkeletonRef>(e);
-                    if (ref && ref->entity != NullEntity)
-                    {
-                        skelEntity = ref->entity;
-                        skelComp = world.GetComponent<SkeletonComponent>(skelEntity);
-                    }
-                }
-                if (!skelComp || skelComp->assetIndex == kInvalidSkeletonIndex) continue;
-
-                const SkeletonAsset& skel = m_skin.GetSkeletonRegistry().Get(skelComp->assetIndex);
-                AnimationSystem::LocalPose* poses = m_skin.GetAnimationSystem()
-                    ? m_skin.GetAnimationSystem()->GetMutableLocalPose(skelEntity) : nullptr;
-                if (!poses) continue;
-
-                // Skeleton entity's world transform (skeleton space → world space).
-                const GlobalTransform* gt = world.GetComponent<GlobalTransform>(skelEntity);
-                XMMATRIX entityWorld = gt ? XMLoadFloat4x4(&gt->matrix) : XMMatrixIdentity();
-
-                // Compute bone world matrix: local pose chain × entity transform.
-                auto boneWorldMat = [&](uint32_t bi) -> XMMATRIX {
-                    if (bi >= skel.boneCount) return XMMatrixIdentity();
-                    uint32_t chain[SkeletonAsset::MAX_BONES];
-                    uint32_t depth = 0;
-                    int32_t cur = static_cast<int32_t>(bi);
-                    while (cur >= 0 && depth < skel.boneCount)
-                    { chain[depth++] = static_cast<uint32_t>(cur); cur = skel.parentIndex[cur]; }
-                    XMMATRIX w = XMMatrixIdentity();
-                    for (uint32_t d = depth; d > 0; --d)
-                    {
-                        auto& p = poses[chain[d-1]];
-                        XMMATRIX S = XMMatrixScaling(p.scl.x, p.scl.y, p.scl.z);
-                        XMMATRIX R = XMMatrixRotationQuaternion(XMLoadFloat4(&p.rot));
-                        XMMATRIX T = XMMatrixTranslation(p.pos.x, p.pos.y, p.pos.z);
-                        w = S * R * T * w;
-                    }
-                    return XMMatrixMultiply(w, entityWorld);
-                };
-
-                for (int ci = 0; ci < capComp->count; ++ci)
-                {
-                    const auto& def = capComp->capsules[ci];
-                    if (!def.enabled) continue;
-                    XMMATRIX wA = boneWorldMat(def.boneA);
-                    XMMATRIX wB = boneWorldMat(def.boneB);
-                    XMVECTOR posA = XMVectorAdd(wA.r[3], XMVector3TransformNormal(XMLoadFloat3(&def.offsetA), wA));
-                    XMVECTOR posB = XMVectorAdd(wB.r[3], XMVector3TransformNormal(XMLoadFloat3(&def.offsetB), wB));
-                    XMFLOAT3 wa, wb;
-                    XMStoreFloat3(&wa, posA);
-                    XMStoreFloat3(&wb, posB);
-                    m_debugWirePass->AddCapsule(wa, wb, def.radius, 0xFFFF8800);
-                }
-            }
-        }
-
-        if (m_debugWirePass->showReflectionProbes)
-        {
-            // Iterate the probe pool directly (see memory: ECS pool iteration).
-            auto* probePool = world.GetPool<ReflectionProbeComponent>();
-            if (probePool)
-            {
-                const auto& ents = probePool->Entities();
-                auto&       data = probePool->Data();
-                for (size_t i = 0; i < ents.size(); ++i)
-                {
-                    Entity e = ents[i];
-                    if (!world.IsAlive(e)) continue;
-                    const GlobalTransform* gt = world.GetComponent<GlobalTransform>(e);
-                    if (!gt) continue;
-
-                    const ReflectionProbeComponent& comp = data[i];
-                    const XMFLOAT3 pos = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-
-                    // Match renderer upload clamp: outer >= inner per axis.
-                    XMFLOAT3 inner = comp.innerExtents;
-                    XMFLOAT3 outer = {
-                        std::max(comp.outerExtents.x, inner.x),
-                        std::max(comp.outerExtents.y, inner.y),
-                        std::max(comp.outerExtents.z, inner.z),
-                    };
-
-                    const XMFLOAT3 innerMin = { pos.x - inner.x, pos.y - inner.y, pos.z - inner.z };
-                    const XMFLOAT3 innerMax = { pos.x + inner.x, pos.y + inner.y, pos.z + inner.z };
-                    const XMFLOAT3 outerMin = { pos.x - outer.x, pos.y - outer.y, pos.z - outer.z };
-                    const XMFLOAT3 outerMax = { pos.x + outer.x, pos.y + outer.y, pos.z + outer.z };
-
-                    // Inner=magenta full-influence, outer=dim-purple falloff (0xAARRGGBB).
-                    m_debugWirePass->AddAABB(innerMin, innerMax, 0xFFFF00FF);
-                    m_debugWirePass->AddAABB(outerMin, outerMax, 0xFF802080);
-                }
-            }
-        }
-
-        // ---- DDGI volumes + probe grid ----
-        // Yellow volume AABB + green cross per probe — verify placement/spacing visually.
-        if (m_debugWirePass->showDDGIVolumes)
-        {
-            auto* volPool = world.GetPool<DDGIVolumeComponent>();
-            if (volPool)
-            {
-                const auto& ents = volPool->Entities();
-                auto&       data = volPool->Data();
-                for (size_t i = 0; i < ents.size(); ++i)
-                {
-                    if (!world.IsAlive(ents[i])) continue;
-                    const DDGIVolumeComponent& v = data[i];
-
-                    // Volume AABB — yellow.
-                    XMFLOAT3 mn{ v.origin.x - v.extent.x,
-                                 v.origin.y - v.extent.y,
-                                 v.origin.z - v.extent.z };
-                    XMFLOAT3 mx{ v.origin.x + v.extent.x,
-                                 v.origin.y + v.extent.y,
-                                 v.origin.z + v.extent.z };
-                    m_debugWirePass->AddAABB(mn, mx, 0xFF00FFFF);
-
-                    // Per-probe crosses gated on debugDraw flag (off by default).
-                    if (!v.debugDraw) continue;
-                    const float spacingX = (v.probeCountsX > 1)
-                        ? (2.0f * v.extent.x) / float(v.probeCountsX - 1) : 0.0f;
-                    const float spacingY = (v.probeCountsY > 1)
-                        ? (2.0f * v.extent.y) / float(v.probeCountsY - 1) : 0.0f;
-                    const float spacingZ = (v.probeCountsZ > 1)
-                        ? (2.0f * v.extent.z) / float(v.probeCountsZ - 1) : 0.0f;
-                    const float crossSize = std::min({ spacingX, spacingY, spacingZ }) * 0.18f;
-                    for (uint32_t z = 0; z < v.probeCountsZ; ++z)
-                    for (uint32_t y = 0; y < v.probeCountsY; ++y)
-                    for (uint32_t x = 0; x < v.probeCountsX; ++x)
-                    {
-                        XMFLOAT3 p{
-                            mn.x + spacingX * float(x),
-                            mn.y + spacingY * float(y),
-                            mn.z + spacingZ * float(z) };
-                        // RGB-encoded probe coord (R = +x, G = +y, B = +z).
-                        const uint8_t r = uint8_t(255.0f * float(x) / std::max(1u, v.probeCountsX - 1));
-                        const uint8_t g = uint8_t(255.0f * float(y) / std::max(1u, v.probeCountsY - 1));
-                        const uint8_t b = uint8_t(255.0f * float(z) / std::max(1u, v.probeCountsZ - 1));
-                        const uint32_t color = 0xFF000000u | (r) | (g << 8) | (b << 16);
-                        m_debugWirePass->AddCross(p, crossSize, color);
-                    }
-                }
-            }
-        }
-    }
-
-    // ---- Phase 1: Collect draw candidates ----------------------------------
-    struct DrawCandidate
-    {
-        Entity     entity;
-        uint32_t   meshDescSlot;
-        uint32_t   indexCount;
-        XMFLOAT4X4 worldMatrix;
-        const MaterialComponent* mc;
-        uint64_t       texBaseColor  = 0;
-        uint64_t       texSurfaceMap = 0;
-        uint64_t       texNormalMap  = 0;
-        uint32_t       matHash       = 0;
-        DrawFilter     filter        = DrawFilter::Opaque;
-        PermutationKey perm          = {};
-        // World-space depth-sort centroid; MeshLibRef overrides w/ WorldAabb centre to fix off-pivot meshes.
-        XMFLOAT3       worldCenter   = { 0.0f, 0.0f, 0.0f };
-        float          depth              = 0.0f;  // view-space Z (transparent painter's-algorithm sort)
-        float          outlinePixels      = 2.0f;  // per-material outline width (Custom packets only)
-        bool           screenSpaceOutline = true;  // enable screen-space edge detection
-        uint8_t        stencilRef         = 1;     // 1=PBR, 2=NPR
-        uint8_t        shadowCullMode     = 0;     // ShadowCullMode raw; 0=Default back-cull
-        uint8_t        castShadow         = 1;     // 0 = material opted out of ShadowPass
-        uint32_t       prevPosElementBase = 0xFFFFFFFFu; // TAA: skinned prev pos (0xFFFFFFFF = static)
-        uint32_t       customPSID         = 0;     // 0 = default GBuffer PS; non-zero = dynamic id
-    };
-
-    // Helper: compute filter + permutation + stencil ref from a MaterialComponent.
-    auto applyBlendMode = [&](DrawCandidate& c)
-    {
-        if (!c.mc) return;
-        // Stencil ref: 1=PBR (default), 2=NPR (texture ramp or color ramp), 3=Unlit
-        switch (c.mc->shaderType)
-        {
-        case MaterialComponent::SHADERTYPE_NPR_RAMP:
-        case MaterialComponent::SHADERTYPE_NPR_COLOR:
-            c.stencilRef = 2; break;
-        case MaterialComponent::SHADERTYPE_UNLIT:
-            c.stencilRef = 3; break;
-        default:
-            c.stencilRef = 1; break;
-        }
-        c.perm.Set(PermutationKey::HAS_NORMALMAP,
-                   c.mc->textures[MaterialComponent::NORMALMAP].gpuHandle != 0);
-        c.perm.Set(PermutationKey::HAS_EMISSIVE,
-                   c.mc->GetEmissiveStrength() > 0.0f);
-        c.perm.Set(PermutationKey::DOUBLE_SIDED,
-                   (c.mc->_flags & MaterialComponent::DOUBLE_SIDED) != 0);
-        c.shadowCullMode = static_cast<uint8_t>(c.mc->shadowCullMode);
-        c.castShadow     = c.mc->IsCastingShadow() ? 1 : 0;
-
-        switch (c.mc->userBlendMode)
-        {
-        case BlendMode::Alpha:
-            c.filter = DrawFilter::Transparent;
-            c.perm.Set(PermutationKey::ALPHA_BLEND, true);
-            // Alpha-blended foliage with alphaRef set still wants alpha-tested shadow casting.
-            if (c.mc->IsAlphaTestEnabled())
-                c.perm.Set(PermutationKey::ALPHA_TEST, true);
-            break;
-        case BlendMode::Additive:
-            c.filter = DrawFilter::Transparent;
-            c.perm.Set(PermutationKey::ADDITIVE_BLEND, true);
-            break;
-        case BlendMode::Premultiplied:
-            c.filter = DrawFilter::Transparent;
-            c.perm.Set(PermutationKey::PREMULTIPLIED_BLEND, true);
-            if (c.mc->IsAlphaTestEnabled())
-                c.perm.Set(PermutationKey::ALPHA_TEST, true);
-            break;
-        case BlendMode::Multiply:
-            c.filter = DrawFilter::Transparent;
-            c.perm.Set(PermutationKey::MULTIPLY_BLEND, true);
-            break;
-        default: // BlendMode::Opaque
-            c.filter = DrawFilter::Opaque;
-            // IsAlphaTestEnabled(): alphaRef strict enough to discard (< full-opaque threshold).
-            c.perm.Set(PermutationKey::ALPHA_TEST, c.mc->IsAlphaTestEnabled());
-            break;
-        }
-
-        // View-space Z depth: project worldCenter onto cam forward (NOT Euclidean — produces pops).
-        // worldCenter set by builder: MeshLibRef uses WorldAabb centroid; primitive uses pivot.
-        {
-            const float dx = c.worldCenter.x - m_camera.position.x;
-            const float dy = c.worldCenter.y - m_camera.position.y;
-            const float dz = c.worldCenter.z - m_camera.position.z;
-            c.depth = dx * camForwardThisFrame.x
-                    + dy * camForwardThisFrame.y
-                    + dz * camForwardThisFrame.z;
-        }
-    };
-
-    // Lazy-resolve customShaderPath → dynamic PS id; stash in MaterialComponent on first hit.
-    // Post-resolve, sync custom-param maps to shader reflection (preserves existing user values).
-    auto resolveCustomPSID = [this](const MaterialComponent& m) -> uint32_t
-    {
-        if (!m.useCustomShader || m.customShaderPath.empty()) return 0;
-        if (m.customShaderID < 0 && m_gbufferPass)
-        {
-            const uint32_t id = m_gbufferPass->GetShaderLibrary().RegisterDynamic(
-                m.customShaderPath.c_str(), RHI::ShaderStage::PS);
-            m.customShaderID =
-                (id == ShaderLibrary::kInvalidDynShaderID) ? -1 : static_cast<int>(id);
-
-            if (m.customShaderID > 0)
-            {
-                if (auto* refl = m_gbufferPass->GetShaderLibrary()
-                                     .GetDynamicReflection(static_cast<uint32_t>(m.customShaderID)))
-                {
-                    // const_cast: cached customTextures/customParams are part of the same lazy-resolve bucket.
-                    MaterialReflectionSync::Sync(const_cast<MaterialComponent&>(m), *refl);
-                }
-            }
-        }
-        return (m.customShaderID > 0) ? static_cast<uint32_t>(m.customShaderID) : 0;
-    };
-
-    std::vector<DrawCandidate> candidates;
-    // Adaptive reserve: use last frame's count to avoid reallocation.
-    static uint32_t s_lastCandidateCount = 256;
-    candidates.reserve(s_lastCandidateCount + 64);
-
-    // m_frameLights / m_volumetricLights: adaptive reserve from last frame's count.
-    static uint32_t s_lastFrameLightCount = 32;
-    static uint32_t s_lastVolLightCount   = 8;
-    m_frameLights.clear();
-    m_volumetricLights.clear();
-    if (m_frameLights.capacity()      < s_lastFrameLightCount + 8)
-        m_frameLights.reserve(s_lastFrameLightCount + 8);
-    if (m_volumetricLights.capacity() < s_lastVolLightCount + 4)
-        m_volumetricLights.reserve(s_lastVolLightCount + 4);
-    m_sunVolumetric      = false;
-    m_sunVolumetricScale = 1.0f;
-    auto* lb = m_lightCBMapped ? static_cast<LightCB*>(m_lightCBMapped) : nullptr;
-
-    for (Entity e : world.GetEntities())
-    {
-        if (!world.IsAlive(e)) continue;
-
-        // ---- Inline light collection (avoids separate full-entity loop) ----
-        const LightData* ld = pGet(pLightData, e);
-        if (ld)
-        {
-            const GlobalTransform* lgt = pGet(pGlobalXf, e);
-            XMFLOAT3 wPos = { 0,0,0 }, wDir = ld->direction;
-            if (lgt)
-            {
-                wPos = { lgt->matrix._41, lgt->matrix._42, lgt->matrix._43 };
-                XMVECTOR rd = XMVector3Normalize(
-                    XMVector3TransformNormal(XMLoadFloat3(&ld->direction),
-                                             XMLoadFloat4x4(&lgt->matrix)));
-                XMStoreFloat3(&wDir, rd);
-            }
-            if (ld->type == LightType::Directional && lb)
-            {
-                XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&wDir));
-                XMStoreFloat3(reinterpret_cast<XMFLOAT3*>(lb->lightDir), dir);
-                lb->lightColor[0] = ld->color.x * ld->intensity;
-                lb->lightColor[1] = ld->color.y * ld->intensity;
-                lb->lightColor[2] = ld->color.z * ld->intensity;
-            }
-            m_frameLights.emplace_back(ResolvedLight{
-                wPos, ld->radius, ld->color, ld->intensity,
-                wDir, ld->spotAngle, ld->type,
-                ld->castsShadow, 0xFFFFFFFFu });
-
-            // VolumetricLightComponent opts the light into the fog (sun=CSM god-rays, point/spot=froxel shafts).
-            const VolumetricLightComponent* vc = pGet(pVolLight, e);
-            const bool volumetric = vc && vc->enabled;
-
-            if (volumetric && ld->type == LightType::Directional)
-            {
-                // Sun path via SetSun() below — one-shot, FIRST volumetric directional wins.
-                m_sunVolumetric        = true;
-                m_sunVolumetricScale   = vc->intensityScale;
-            }
-            else if (volumetric && ld->type != LightType::Directional)
-            {
-                VolumetricFogPass::VolLight vl{};
-                vl.position       = wPos;
-                vl.radius         = ld->radius;
-                vl.color          = ld->color;
-                vl.intensity      = ld->intensity * vc->intensityScale;
-                vl.direction      = wDir;
-                vl.spotAngle      = ld->spotAngle;
-                vl.type           = static_cast<uint32_t>(ld->type);
-                vl.shadowSliceIdx = 0xFFFFFFFFu; // filled after slice assignment in UploadLights
-                m_volumetricLights.push_back(vl);
-            }
-        }
-
-        // ---- Primitive mesh entity (MeshHandle + Transform) ----------------
-        const MeshHandle* mh = pGet(pMeshHandle, e);
-        if (mh && mh->IsValid() &&
-            mh->gpuMeshID < static_cast<uint32_t>(PrimitiveMeshType::Count))
-        {
-            // Honour Visibility (explicit + inherited_hidden propagation from TransformSystem).
-            if (const Visibility* v = pGet(pVisibility, e);
-                v && !v->IsEffectivelyVisible())
-                continue;
-
-            const auto& mesh = m_meshMgr.GetPrimitive(mh->gpuMeshID);
-            if (mesh.meshDescSlot == RHI::kInvalidBufferIndex) continue;
-
-            // GlobalTransform is the single source of truth.
-            const GlobalTransform* gt = pGet(pGlobalXf, e);
-            if (!gt) continue;
-            const XMFLOAT4X4 worldMtx = gt->matrix;
-
-            DrawCandidate c;
-            c.entity       = e;
-            c.meshDescSlot = mesh.meshDescSlot;
-            c.indexCount   = mesh.indexCount;
-            XMStoreFloat4x4(&c.worldMatrix,
-                XMMatrixTranspose(XMLoadFloat4x4(&worldMtx)));
-            // Primitives are unit-sized and centred — pivot == centroid for depth sort.
-            c.worldCenter = { worldMtx.m[3][0], worldMtx.m[3][1], worldMtx.m[3][2] };
-            c.mc = pGet(pMaterial, e);
-            if (c.mc)
-            {
-                c.texBaseColor  = c.mc->textures[MaterialComponent::BASECOLORMAP].gpuHandle;
-                c.texSurfaceMap = c.mc->textures[MaterialComponent::SURFACEMAP].gpuHandle;
-                c.texNormalMap  = c.mc->textures[MaterialComponent::NORMALMAP].gpuHandle;
-                c.matHash       = HashMatParams(c.mc);
-                c.customPSID    = resolveCustomPSID(*c.mc);
-            }
-            applyBlendMode(c);
-            candidates.push_back(c);
-            // Custom candidate for outlines: push-then-mutate avoids full DrawCandidate memcpy.
-            if (c.mc && c.mc->IsOutlineEnabled() && c.filter == DrawFilter::Opaque)
-            {
-                const float outlinePixels      = c.mc->outlinePixels;
-                const bool  screenSpaceOutline = c.mc->IsOutlineScreenSpaceEnabled();
-                candidates.push_back(c);
-                DrawCandidate& outline = candidates.back();
-                outline.filter             = DrawFilter::Custom;
-                outline.perm               = {};
-                outline.outlinePixels      = outlinePixels;
-                outline.screenSpaceOutline = screenSpaceOutline;
-            }
-            continue;
-        }
-
-        // Scene-mesh entities now live in the MeshLibRef pass below.
-    }
-
-    // ---- MeshLibRef entities (P1-P6 path). Phase A serial: gather + meshDesc cache.
-    // Phase B parallel: OBB cull + candidate construction (no shared writes).
-    if (m_meshLib)
-    {
-        struct MlrJob {
-            Entity                 e;
-            const MeshLibRef*      mlr;
-            const GlobalTransform* gt;
-            uint32_t               meshDescSlot;
-            uint32_t               indexCount;
-        };
-        // Local (NOT thread_local): worker lambdas read by ref; thread_local trips subscript asserts.
-        std::vector<MlrJob> mlrJobs;
-        if (pMeshLibRef)
-        {
-            auto& mlrEnts = pMeshLibRef->Entities();
-            auto& mlrData = pMeshLibRef->Data();
-            const size_t mlrN = mlrData.size();
-            mlrJobs.reserve(mlrN);
-            for (size_t k = 0; k < mlrN; ++k)
-            {
-                const Entity e = mlrEnts[k];
-                if (!world.IsAlive(e)) continue;
-                const MeshLibRef& mlr = mlrData[k];
-                if (!mlr.IsValid()) continue;
-                const GlobalTransform* gt = pGet(pGlobalXf, e);
-                if (!gt) continue;
-
-                // MeshDesc slot: skinned+active → skinning slot; skinned+inactive → meshlib (rest pose);
-                // non-skinned → meshlib. BuildSkinJobs patches the skinning slot to SkinnedVertexRing.
-                const MeshSkinnedComponent*    skMesh  = pGet(pSkinned, e);
-                const SkinningOutputComponent* skinOut = pGet(pSkinOut, e);
-                const bool skinningActive =
-                    skMesh && skinOut && skinOut->poseByteOffset != ~0u
-                    && skMesh->meshDescriptorIdx != RHI::kInvalidBufferIndex;
-
-                uint32_t slot = RHI::kInvalidBufferIndex;
-                uint32_t indexCountForDraw = 0;
-                if (skinningActive)
-                {
-                    slot              = skMesh->meshDescriptorIdx;
-                    indexCountForDraw = skMesh->indexCount;
-                }
-                else
-                {
-                    // Serial: populates MeshManager caches safely.
-                    slot = m_meshMgr.RegisterMeshLibMesh(*m_meshLib, mlr);
-                    if (slot == RHI::kInvalidBufferIndex) continue;
-                    const auto* entry = m_meshLib->GetEntry(mlr.libHandle, mlr.meshId);
-                    if (!entry) continue;
-                    indexCountForDraw = entry->indexCount;
-                }
-                mlrJobs.push_back({ e, &mlr, gt, slot, indexCountForDraw });
-            }
-        }
-
-        // Per-entity work; used from both serial fallback and parallel tasks.
-        auto processJob = [&](const MlrJob& j, std::vector<DrawCandidate>& out)
-        {
-            // Transparent materials skip camera-cull drop (alpha-blend rarely casts shadow).
-            const MaterialComponent* mcPre        = pGet(pMaterial, j.e);
-            const bool               isTransparent =
-                mcPre && mcPre->userBlendMode != BlendMode::Opaque;
-
-            // Frustum cull with shadow-fallback.
-            bool isShadowOnly = false;
-            if (m_gpuCullingEnabled)
-            {
-                if (inMask(bvhTestedMask, j.e) && !inMask(bvhVisibleMask, j.e)
-                    && !isTransparent)
-                {
-                    if (!m_shadowFrustum.IsValid()) return;
-                    const MaterialComponent* mcSh = pGet(pMaterial, j.e);
-                    if (mcSh && !mcSh->IsCastingShadow()) return;
-                    const WorldAabb* aabb = pGet(pWorldAabb, j.e);
-                    if (!aabb) return;
-                    BoundingBox bb;
-                    bb.Center  = { (aabb->min.x + aabb->max.x) * 0.5f,
-                                   (aabb->min.y + aabb->max.y) * 0.5f,
-                                   (aabb->min.z + aabb->max.z) * 0.5f };
-                    bb.Extents = { (aabb->max.x - aabb->min.x) * 0.5f,
-                                   (aabb->max.y - aabb->min.y) * 0.5f,
-                                   (aabb->max.z - aabb->min.z) * 0.5f };
-                    if (!m_shadowFrustum.IntersectsAny(bb)) return;
-                    isShadowOnly = true;
-                }
-            }
-            else
-            {
-                const WorldAabb* aabb = pGet(pWorldAabb, j.e);
-                if (aabb && !FrustumTestAABB(m_view.boundingFrustum, aabb->min, aabb->max)
-                    && !isTransparent)
-                {
-                    if (!m_shadowFrustum.IsValid()) return;
-                    const MaterialComponent* mcSh = pGet(pMaterial, j.e);
-                    if (mcSh && !mcSh->IsCastingShadow()) return;
-                    BoundingBox bb;
-                    bb.Center  = { (aabb->min.x + aabb->max.x) * 0.5f,
-                                   (aabb->min.y + aabb->max.y) * 0.5f,
-                                   (aabb->min.z + aabb->max.z) * 0.5f };
-                    bb.Extents = { (aabb->max.x - aabb->min.x) * 0.5f,
-                                   (aabb->max.y - aabb->min.y) * 0.5f,
-                                   (aabb->max.z - aabb->min.z) * 0.5f };
-                    if (!m_shadowFrustum.IntersectsAny(bb)) return;
-                    isShadowOnly = true;
-                }
-            }
-
-            DrawCandidate c;
-            c.entity       = j.e;
-            c.meshDescSlot = j.meshDescSlot;
-            c.indexCount   = j.indexCount;
-            XMStoreFloat4x4(&c.worldMatrix,
-                XMMatrixTranspose(XMLoadFloat4x4(&j.gt->matrix)));
-            // Depth-sort centroid: WorldAabb centre when present, else pivot fallback.
-            if (const WorldAabb* aabb = pGet(pWorldAabb, j.e))
-            {
-                c.worldCenter = { (aabb->min.x + aabb->max.x) * 0.5f,
-                                  (aabb->min.y + aabb->max.y) * 0.5f,
-                                  (aabb->min.z + aabb->max.z) * 0.5f };
-            }
-            else
-            {
-                c.worldCenter = { j.gt->matrix.m[3][0],
-                                  j.gt->matrix.m[3][1],
-                                  j.gt->matrix.m[3][2] };
-            }
-            c.mc = pGet(pMaterial, j.e);
-            if (c.mc)
-            {
-                c.texBaseColor  = c.mc->textures[MaterialComponent::BASECOLORMAP].gpuHandle;
-                c.texSurfaceMap = c.mc->textures[MaterialComponent::SURFACEMAP].gpuHandle;
-                c.texNormalMap  = c.mc->textures[MaterialComponent::NORMALMAP].gpuHandle;
-                c.matHash       = HashMatParams(c.mc);
-            }
-
-            if (isShadowOnly)
-            {
-                c.filter = DrawFilter::Shadow;
-                c.perm   = {};
-                if (c.mc && c.mc->IsAlphaTestEnabled())
-                    c.perm.Set(PermutationKey::ALPHA_TEST, true);
-            }
-            else
-            {
-                applyBlendMode(c);
-            }
-            out.push_back(c);
-
-            // Outline path: push-then-mutate avoids full DrawCandidate memcpy.
-            if (!isShadowOnly && c.mc && c.mc->IsOutlineEnabled() && c.filter == DrawFilter::Opaque)
-            {
-                const float outlinePixels      = c.mc->outlinePixels;
-                const bool  screenSpaceOutline = c.mc->IsOutlineScreenSpaceEnabled();
-                out.push_back(c);
-                DrawCandidate& outline = out.back();
-                outline.filter             = DrawFilter::Custom;
-                outline.perm               = {};
-                outline.outlinePixels      = outlinePixels;
-                outline.screenSpaceOutline = screenSpaceOutline;
-            }
-        };
-
-        const uint32_t N = static_cast<uint32_t>(mlrJobs.size());
-        // Below this the fork/join overhead exceeds the work savings.
-        constexpr uint32_t kParallelThreshold = 128;
-        const unsigned numWorkers = TaskSystem::Get().GetWorkerCount();
-
-        if (N >= kParallelThreshold && numWorkers > 1)
-        {
-            const uint32_t numChunks = (std::min)(static_cast<uint32_t>(numWorkers), N);
-            const uint32_t chunkSize = (N + numChunks - 1) / numChunks;
-
-            // Local vector-of-vectors; each worker writes only its own slot.
-            std::vector<std::vector<DrawCandidate>> local(numChunks);
-
-            std::atomic<uint32_t>    remaining(numChunks);
-            std::mutex               doneMtx;
-            std::condition_variable  doneCv;
-
-            for (uint32_t t = 0; t < numChunks; ++t)
-            {
-                const uint32_t lo = t * chunkSize;
-                const uint32_t hi = (std::min)(N, lo + chunkSize);
-                TaskSystem::Get().Push(
-                    [&, t, lo, hi]()
-                    {
-                        auto& out = local[t];
-                        out.reserve((hi - lo) * 2 + 8);
-                        for (uint32_t i = lo; i < hi; ++i)
-                            processJob(mlrJobs[i], out);
-                        if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
-                        {
-                            std::lock_guard<std::mutex> lk(doneMtx);
-                            doneCv.notify_one();
-                        }
-                    },
-                    TaskSystem::TaskPriority::High);
-            }
-
-            std::unique_lock<std::mutex> lk(doneMtx);
-            doneCv.wait(lk, [&] { return remaining.load(std::memory_order_acquire) == 0; });
-
-            // Merge via single resize + memcpy (DrawCandidate is trivially copyable).
-            size_t total = 0;
-            for (uint32_t i = 0; i < numChunks; ++i) total += local[i].size();
-            const size_t oldSize = candidates.size();
-            candidates.resize(oldSize + total);
-            DrawCandidate* dst = candidates.data() + oldSize;
-            for (uint32_t i = 0; i < numChunks; ++i)
-            {
-                const size_t n = local[i].size();
-                if (n == 0) continue;
-                std::memcpy(dst, local[i].data(), n * sizeof(DrawCandidate));
-                dst += n;
-            }
-        }
-        else
-        {
-            for (uint32_t i = 0; i < N; ++i)
-                processJob(mlrJobs[i], candidates);
-        }
-    }
-
-    // ---- Billboard entities → additional DrawCandidates ----
-    // Lazy-load light icon texture (m_texSys not available during Compile/Init)
-    if (m_lightIconHandle == Resource::kInvalidTextureHandle && m_texSys && m_resMgr)
-    {
-        m_lightIconHandle = m_texSys->Acquire(
-            "asset/Default_Texture/lightsymbol.itex", *m_resMgr, m_gfx);
-    }
-    if (m_lightIconSRV == 0 && m_texSys && m_lightIconHandle != Resource::kInvalidTextureHandle)
-    {
-        if (m_texSys->IsReady(m_lightIconHandle))
-        {
-            const RHI::Texture* tex = m_texSys->GetTexture(m_lightIconHandle);
-            if (tex) m_lightIconSRV = m_gfx.GetTextureSRVGpuHandle(*tex);
-        }
-    }
-
-    if (m_meshMgr.GetBillboardMeshDescSlot() != RHI::kInvalidBufferIndex && pBillboard)
-    {
-        XMVECTOR camPos = XMLoadFloat3(&m_view.cameraPosition);
-
-        auto& bbEnts = pBillboard->Entities();
-        auto& bbData = pBillboard->Data();
-        const size_t bbN = bbData.size();
-        for (size_t bi = 0; bi < bbN; ++bi)
-        {
-            const Entity e = bbEnts[bi];
-            if (!world.IsAlive(e)) continue;
-            const auto* bb = &bbData[bi];
-            const GlobalTransform* gt = pGet(pGlobalXf, e);
-            if (!gt) continue;
-
-            XMFLOAT3 pos = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-            float size = bb->worldSize;
-
-            // Camera world axes = view matrix columns (orthogonal: inv = transpose).
-            float crx = m_view.viewMatrix._11, cry = m_view.viewMatrix._21, crz = m_view.viewMatrix._31;
-            float cux = m_view.viewMatrix._12, cuy = m_view.viewMatrix._22, cuz = m_view.viewMatrix._32;
-            float cfx = m_view.viewMatrix._13, cfy = m_view.viewMatrix._23, cfz = m_view.viewMatrix._33;
-
-            XMFLOAT4X4 billboardWorld;
-            XMStoreFloat4x4(&billboardWorld, XMMatrixIdentity());
-            // Row 0 = camera right × size
-            billboardWorld._11 = crx * size;
-            billboardWorld._12 = cry * size;
-            billboardWorld._13 = crz * size;
-            // Row 1 = camera up × size
-            billboardWorld._21 = cux * size;
-            billboardWorld._22 = cuy * size;
-            billboardWorld._23 = cuz * size;
-            // Row 2 = camera forward
-            billboardWorld._31 = cfx;
-            billboardWorld._32 = cfy;
-            billboardWorld._33 = cfz;
-            // Row 3 = position
-            billboardWorld._41 = pos.x;
-            billboardWorld._42 = pos.y;
-            billboardWorld._43 = pos.z;
-
-            DrawCandidate c;
-            c.entity       = e;
-            c.meshDescSlot = m_meshMgr.GetBillboardMeshDescSlot();
-            c.indexCount   = m_meshMgr.GetBillboardQuad().indexCount;
-
-            // Transpose for GPU (row-vector mul); pivot==centroid for billboard depth sort.
-            XMStoreFloat4x4(&c.worldMatrix,
-                XMMatrixTranspose(XMLoadFloat4x4(&billboardWorld)));
-            c.worldCenter = { pos.x, pos.y, pos.z };
-
-            c.mc = pGet(pMaterial, e);
-            if (c.mc)
-            {
-                c.texBaseColor = c.mc->textures[MaterialComponent::BASECOLORMAP].gpuHandle;
-            }
-            // Route by BillboardMode
-            PermutationKey perm{};
-            perm.Set(PermutationKey::BILLBOARD, true);
-
-            // Auto-assign light icon if LightData and no explicit texture; UNLIT branch.
-            if (pGet(pLightData, e))
-            {
-                if (c.texBaseColor == 0 && m_lightIconSRV)
-                    c.texBaseColor = m_lightIconSRV;
-                perm.Set(PermutationKey::UNLIT, true);
-            }
-
-            switch (bb->mode)
-            {
-            case BillboardMode::Opaque:
-                c.filter = DrawFilter::Opaque;
-                break;
-            case BillboardMode::AlphaClip:
-                c.filter = DrawFilter::Opaque;
-                perm.Set(PermutationKey::ALPHA_TEST, true);
-                break;
-            case BillboardMode::Transparent:
-                c.filter = DrawFilter::Transparent;
-                perm.Set(PermutationKey::ALPHA_BLEND, true);
-                break;
-            case BillboardMode::Additive:
-                c.filter = DrawFilter::Transparent;
-                perm.Set(PermutationKey::ADDITIVE_BLEND, true);
-                break;
-            }
-            c.perm = perm;
-
-            // View-space Z depth via current-frame camForward (m_view is 1-frame stale here).
-            XMVECTOR ePos    = XMLoadFloat3(&pos);
-            XMVECTOR forward = XMLoadFloat3(&camForwardThisFrame);
-            c.depth = XMVectorGetX(XMVector3Dot(XMVectorSubtract(ePos, camPos), forward));
-
-            candidates.push_back(c);
-        }
-    }
-
-    // ---- Beam entities → CS-generated tube DrawCandidates. World-space control points.
-    // For beam-follows-entity, leave transform non-identity (VS multiplies world matrix).
-    if (m_beamSystem)
-    {
-        auto* pBeam = world.GetPool<BeamComponent>();
-        if (pBeam)
-        {
-            auto& bEnts = pBeam->Entities();
-            auto& bData = pBeam->Data();
-            const size_t bN = bData.size();
-            for (size_t bi = 0; bi < bN; ++bi)
-            {
-                const Entity e = bEnts[bi];
-                if (!world.IsAlive(e)) continue;
-                BeamComponent& beam = bData[bi];
-                if (beam.controlPoints.size() < 2) continue;
-
-                const GlobalTransform*   gt = pGet(pGlobalXf, e);
-                const MaterialComponent* mc = pGet(pMaterial, e);
-                if (!gt || !mc) continue;
-
-                // Lazy slot acquisition. Released in OnEntityDestroyed.
-                if (beam.beamSlot == 0xFFFFFFFFu)
-                {
-                    beam.beamSlot = m_beamSystem->Acquire();
-                    if (beam.beamSlot == 0xFFFFFFFFu) continue; // pool exhausted
-                }
-
-                // BeamControlPoint and BeamControlPointGPU share the 32-byte layout — direct reinterpret.
-                static_assert(sizeof(BeamControlPoint) == sizeof(BeamControlPointGPU),
-                              "BeamControlPoint vs GPU layout drift");
-                m_beamSystem->SetControlPoints(
-                    beam.beamSlot,
-                    reinterpret_cast<const BeamControlPointGPU*>(beam.controlPoints.data()),
-                    static_cast<uint32_t>(beam.controlPoints.size()));
-
-                BeamGenParamsGPU params{};
-                params.globalRadiusScale = beam.globalRadiusScale;
-                params.wobbleAmplitude   = beam.wobbleAmplitude;
-                params.wobbleSpeed       = beam.wobbleSpeed;
-                m_beamSystem->SetParams(beam.beamSlot, params);
-
-                const uint32_t meshDescSlot = m_beamSystem->GetMeshDescSlot(beam.beamSlot);
-                if (meshDescSlot == 0xFFFFFFFFu) continue;
-
-                DrawCandidate c;
-                c.entity       = e;
-                c.meshDescSlot = meshDescSlot;
-                c.indexCount   = BeamSystem::GetIndexCount();
-
-                // World matrix — transposed for HLSL row-vec convention.
-                XMStoreFloat4x4(&c.worldMatrix,
-                    XMMatrixTranspose(XMLoadFloat4x4(&gt->matrix)));
-
-                // Centroid: avg control-point positions for transparent depth sort.
-                XMFLOAT3 centroid{ 0, 0, 0 };
-                for (const auto& cp : beam.controlPoints)
-                {
-                    centroid.x += cp.position.x;
-                    centroid.y += cp.position.y;
-                    centroid.z += cp.position.z;
-                }
-                const float invN = 1.0f / static_cast<float>(beam.controlPoints.size());
-                centroid.x *= invN; centroid.y *= invN; centroid.z *= invN;
-                c.worldCenter = centroid;
-
-                c.mc            = mc;
-                c.texBaseColor  = mc->textures[MaterialComponent::BASECOLORMAP].gpuHandle;
-                c.texSurfaceMap = mc->textures[MaterialComponent::SURFACEMAP].gpuHandle;
-                c.texNormalMap  = mc->textures[MaterialComponent::NORMALMAP].gpuHandle;
-
-                applyBlendMode(c);
-                c.customPSID = resolveCustomPSID(*mc);
-
-                // Depth (view-space Z) for transparent painter's-algorithm sort.
-                {
-                    const float dx = c.worldCenter.x - m_camera.position.x;
-                    const float dy = c.worldCenter.y - m_camera.position.y;
-                    const float dz = c.worldCenter.z - m_camera.position.z;
-                    c.depth = dx * camForwardThisFrame.x
-                            + dy * camForwardThisFrame.y
-                            + dz * camForwardThisFrame.z;
-                }
-
-                candidates.push_back(c);
-            }
-        }
-    }
-
-    s_lastCandidateCount = static_cast<uint32_t>(candidates.size());
-    s_lastFrameLightCount = static_cast<uint32_t>(m_frameLights.size());
-    s_lastVolLightCount   = static_cast<uint32_t>(m_volumetricLights.size());
-
-    // ---- Phase 2: Sort. Opaque/Shadow by PSO state (perm→stencil→tex→mat→meshDescSlot);
-    // Transparent back-to-front. Sort indices not structs (~30× less memcpy on 3k candidates).
-    thread_local std::vector<uint32_t> s_sortIdx;
-    s_sortIdx.resize(candidates.size());
-    for (uint32_t k = 0; k < candidates.size(); ++k) s_sortIdx[k] = k;
-    // par_unseq: MSVC parallel sort kicks in once N>~500; comparator is read-only/thread-safe.
-    std::sort(std::execution::par_unseq,
-        s_sortIdx.begin(), s_sortIdx.end(),
-        [&candidates](uint32_t ia, uint32_t ib)
-        {
-            const DrawCandidate& a = candidates[ia];
-            const DrawCandidate& b = candidates[ib];
-            if (a.filter != b.filter)
-                return static_cast<uint8_t>(a.filter) < static_cast<uint8_t>(b.filter);
-            if (a.filter == DrawFilter::Transparent)
-            {
-                // Painter's order; entity-id tiebreaker pins equal-depth pairs (prevents flicker).
-                if (a.depth != b.depth) return a.depth > b.depth;
-                return a.entity < b.entity;
-            }
-            // PSO state first (most expensive to switch).
-            if (a.perm != b.perm)
-                return a.perm.bits < b.perm.bits;
-            if (a.stencilRef    != b.stencilRef)    return a.stencilRef    < b.stencilRef;
-            // Texture descriptors (moderate switch cost).
-            if (a.texBaseColor  != b.texBaseColor)  return a.texBaseColor  < b.texBaseColor;
-            if (a.texSurfaceMap != b.texSurfaceMap) return a.texSurfaceMap < b.texSurfaceMap;
-            if (a.texNormalMap  != b.texNormalMap)  return a.texNormalMap  < b.texNormalMap;
-            if (a.matHash       != b.matHash)       return a.matHash       < b.matHash;
-            // Mesh descriptor last (just a root constant, cheapest to switch).
-            return a.meshDescSlot < b.meshDescSlot;
-        });
-    const auto& indices = s_sortIdx;
-
-    // ---- Phase 3: Write buffers + emit batched DrawPackets -----------------
-    auto* instances = static_cast<GPUInstanceData*>(m_instanceBufferMapped);
-    auto* matBuf   = static_cast<Resource::MaterialGPUData*>(m_materialBufferMapped);
-    uint32_t instIdx = 0;
-    // Independent matIdx capped at kMaxMaterials (instIdx caps at kMaxInstances=32k).
-    uint32_t matIdx = 0;
-
-    // Phase E/F: per-material CBV VA + tex-table; cleared each frame so unused materials read 0.
-    if (m_matCustomCbvVA.size() < kMaxMaterials)
-        m_matCustomCbvVA.resize(kMaxMaterials, 0ULL);
-    std::fill(m_matCustomCbvVA.begin(), m_matCustomCbvVA.end(), 0ULL);
-    if (m_matCustomTexHandle.size() < kMaxMaterials)
-        m_matCustomTexHandle.resize(kMaxMaterials, 0ULL);
-    std::fill(m_matCustomTexHandle.begin(), m_matCustomTexHandle.end(), 0ULL);
-
-    // O(1) prev-batch material-slot reuse — adjacent same-mat batches share one slot.
-    bool     hasPrevMat  = false;
-    uint32_t prevMatHash = 0;
-    uint64_t prevTexBase = 0, prevTexSurf = 0, prevTexNorm = 0;
-    uint32_t prevMatIdx  = 0;
-
-    const int n = static_cast<int>(candidates.size());
-    for (int i = 0; i < n && instIdx < kMaxInstances; )
-    {
-        const DrawCandidate& first = candidates[indices[i]];
-
-        // End of batch: same key. Transparent rarely batches (depth-sorted).
-        int j = i + 1;
-        while (j < n && (instIdx + static_cast<uint32_t>(j - i)) < kMaxInstances)
-        {
-            const DrawCandidate& cur = candidates[indices[j]];
-            if (cur.filter        != first.filter        ||
-                cur.perm          != first.perm          ||
-                cur.stencilRef    != first.stencilRef    ||
-                cur.meshDescSlot  != first.meshDescSlot  ||
-                cur.texBaseColor  != first.texBaseColor  ||
-                cur.texSurfaceMap != first.texSurfaceMap ||
-                cur.texNormalMap  != first.texNormalMap  ||
-                cur.matHash       != first.matHash       ||
-                cur.outlinePixels != first.outlinePixels ||
-                cur.customPSID   != first.customPSID)
-                break;
-            ++j;
-        }
-
-        const uint32_t batchStart = instIdx;
-        const uint32_t batchCount = static_cast<uint32_t>(j - i);
-
-        // Allocate or reuse material slot via O(1) prev-batch compare.
-        uint32_t thisMatIdx;
-        if (first.mc
-            && hasPrevMat
-            && first.matHash       == prevMatHash
-            && first.texBaseColor  == prevTexBase
-            && first.texSurfaceMap == prevTexSurf
-            && first.texNormalMap  == prevTexNorm)
-        {
-            thisMatIdx = prevMatIdx;
-        }
-        else
-        {
-            thisMatIdx = (matIdx < kMaxMaterials) ? matIdx++ : 0u;
-
-            // Custom reflection only when custom PS resolved; else slots stay zeroed.
-            const ShaderReflect::Reflection* customRefl = nullptr;
-            if (first.customPSID > 0 && m_gbufferPass)
-                customRefl = m_gbufferPass->GetShaderLibrary()
-                                 .GetDynamicReflection(first.customPSID);
-
-            WriteMatSlot(matBuf, thisMatIdx, first.mc, customRefl);
-
-            // Phase E — per-material CBV from reflection. Walks first non-reserved cbuffer;
-            // places customParams[name] at reflected byte offset.
-            if (first.mc && customRefl && first.mc->useCustomShader)
-            {
-                const ShaderReflect::CBufferLayout* userCB = nullptr;
-                for (const auto& cb : customRefl->cbuffers)
-                {
-                    if (MaterialReflectionSync::IsReservedCBuffer(cb.name.c_str())) continue;
-                    userCB = &cb;
-                    break;
-                }
-                if (userCB && userCB->sizeBytes > 0)
-                {
-                    auto slice = m_customMatCbvRing.Allocate(userCB->sizeBytes);
-                    if (slice.cpu)
-                    {
-                        // Zero-fill first so cbuffer holes are deterministic.
-                        std::memset(slice.cpu, 0, userCB->sizeBytes);
-                        for (const auto& v : userCB->vars)
-                        {
-                            auto it = first.mc->customParams.find(v.name);
-                            if (it == first.mc->customParams.end()) continue;
-                            // Copy min(v.size, sizeof(val[])) — values stored as float[4]; shader decides.
-                            const uint32_t copy = (v.size < sizeof(it->second))
-                                ? v.size : static_cast<uint32_t>(sizeof(it->second));
-                            std::memcpy(
-                                static_cast<uint8_t*>(slice.cpu) + v.offset,
-                                it->second.data(),
-                                copy);
-                        }
-                        m_matCustomCbvVA[thisMatIdx] = slice.gpu;
-                    }
-                }
-
-                // Phase F — per-material texture descriptor table; reflection-ordered, reserved names skipped.
-                auto texSlice = m_customMatSrvRing.Allocate(
-                    GraphicsDX12::kCustomMatTextureSlots);
-                if (texSlice.gpu)
-                {
-                    // Unset slots leave zero-descriptor (sampling returns black).
-                    uint32_t texSlot = 0;
-                    for (const auto& b : customRefl->bindings)
-                    {
-                        if (texSlot >= GraphicsDX12::kCustomMatTextureSlots) break;
-                        if (b.type != ShaderReflect::ResourceType::Texture) continue;
-                        if (MaterialReflectionSync::IsReservedTexture(b.name.c_str())) continue;
-
-                        const uint64_t dst = texSlice.cpu.ptr +
-                            static_cast<uint64_t>(texSlot) * texSlice.descIncBytes;
-
-                        uint64_t src = 0;
-                        if (auto it = first.mc->customTextures.find(b.name);
-                            it != first.mc->customTextures.end() &&
-                            it->second.bindlessIndex >= 0)
-                        {
-                            RHI::Texture t;
-                            t.handle_id = static_cast<uint32_t>(it->second.bindlessIndex);
-                            src = m_gfx.GetTextureSRVCpuHandle(t);
-                        }
-
-                        if (src != 0)
-                            m_gfx.CopyCbvSrvUavDescriptors(dst, src, 1);
-                        ++texSlot;
-                    }
-                    m_matCustomTexHandle[thisMatIdx] = texSlice.gpu;
-                }
-            }
-            if (first.mc)
-            {
-                hasPrevMat  = true;
-                prevMatHash = first.matHash;
-                prevTexBase = first.texBaseColor;
-                prevTexSurf = first.texSurfaceMap;
-                prevTexNorm = first.texNormalMap;
-                prevMatIdx  = thisMatIdx;
-            }
-            else
-            {
-                hasPrevMat = false;
-            }
-        }
-
-        // Write per-instance data (transform + mesh/material indices).
-        for (int k = i; k < j; ++k, ++instIdx)
-        {
-            const DrawCandidate& ck = candidates[indices[k]];
-            if (instances)
-            {
-                GPUInstanceData& inst = instances[instIdx];
-                inst.world       = ck.worldMatrix;
-                inst.meshDescIdx = ck.meshDescSlot;
-                inst.materialIdx = thisMatIdx; // material slot in material buffer
-                inst.lodLevel    = 0;
-                inst.pad         = 0;
-            }
-            m_instanceSlotToEntity[instIdx] = ck.entity;
-        }
-
-        DrawPacket dp;
-        dp.meshDescriptorIndex = first.meshDescSlot;
-        dp.instanceOffset      = batchStart;
-        dp.instanceCount       = batchCount;
-        dp.vertexOrIndexCount  = first.indexCount;
-        dp.materialIndex       = thisMatIdx;
-        dp.permutation         = first.perm;
-        dp.filter              = first.filter;
-        dp.sortKey             = DrawPacket::MakeSortKey(
-                                    static_cast<uint16_t>(first.perm.bits), 0, 0);
-        dp.texBaseColor        = first.texBaseColor;
-        dp.texSurfaceMap       = first.texSurfaceMap;
-        dp.texNormalMap        = first.texNormalMap;
-        dp.outlinePixels       = first.outlinePixels;
-        dp.screenSpaceOutline  = first.screenSpaceOutline;
-        dp.stencilRef          = first.stencilRef;
-        dp.shadowCullMode      = first.shadowCullMode;
-        dp.castShadow          = first.castShadow;
-        dp.prevPosElementBase  = first.prevPosElementBase;
-        dp.customPSID          = first.customPSID;
-        dp.customCbvVA         = (thisMatIdx < m_matCustomCbvVA.size())
-                                 ? m_matCustomCbvVA[thisMatIdx]
-                                 : 0ULL;
-        dp.customTexTable      = (thisMatIdx < m_matCustomTexHandle.size())
-                                 ? m_matCustomTexHandle[thisMatIdx]
-                                 : 0ULL;
-        m_drawPackets.push_back(dp);
-
-        // Also write IndirectDrawCommand for ExecuteIndirect path.
-        if (m_indirectArgMapped)
-        {
-            auto* indirectArgs = static_cast<IndirectDrawCommand*>(m_indirectArgMapped);
-            uint32_t cmdIdx = static_cast<uint32_t>(m_drawPackets.size()) - 1;
-            if (cmdIdx < kMaxInstances)
-            {
-                IndirectDrawCommand& ic = indirectArgs[cmdIdx];
-                ic.meshDescIdx     = dp.meshDescriptorIndex;
-                ic.instanceOffset  = dp.instanceOffset;
-                ic.materialIndex   = dp.materialIndex;
-                ic.prevPosInfo     = dp.prevPosElementBase;
-                ic.vertexCountPerInstance = dp.vertexOrIndexCount;
-                ic.instanceCount          = dp.instanceCount;
-                ic.startVertexLocation    = 0;
-                ic.startInstanceLocation  = 0;
-            }
-        }
-
-        i = j;
-    }
-
-    m_indirectDrawCount = static_cast<uint32_t>(m_drawPackets.size());
-
-    // Build per-PSO groups for ExecuteIndirect batching (only opaque filter).
-    m_indirectGroups.clear();
-    if (m_indirectArgMapped && m_indirectDrawCount > 0)
-    {
-        uint32_t groupStart = 0;
-        for (uint32_t di = 0; di < m_indirectDrawCount; ++di)
-        {
-            const DrawPacket& dp = m_drawPackets[di];
-            // Only include opaque draws in indirect groups (transparent handled separately).
-            if (dp.filter != DrawFilter::Opaque) continue;
-
-            bool newGroup = m_indirectGroups.empty()
-                || m_indirectGroups.back().perm           != dp.permutation
-                || m_indirectGroups.back().stencilRef     != dp.stencilRef
-                || m_indirectGroups.back().customPSID     != dp.customPSID
-                || m_indirectGroups.back().customCbvVA    != dp.customCbvVA
-                || m_indirectGroups.back().customTexTable != dp.customTexTable;
-
-            if (newGroup)
-            {
-                IndirectGroup g;
-                g.perm           = dp.permutation;
-                g.stencilRef     = dp.stencilRef;
-                g.customPSID     = dp.customPSID;
-                g.customCbvVA    = dp.customCbvVA;
-                g.customTexTable = dp.customTexTable;
-                g.argOffset      = di * sizeof(IndirectDrawCommand);
-                g.cmdCount       = 1;
-                m_indirectGroups.push_back(g);
-            }
-            else
-            {
-                m_indirectGroups.back().cmdCount++;
-            }
-        }
-    }
-
-    // Phase 4: upload lights + sync IBL (separated for future extensibility).
-    BuildScene_UploadLights(world);
-
-    // Phase 5: pack reflection probes into GPU StructuredBuffer (placement/bounds/count only).
-    BuildScene_UploadProbes(world);
-
-    // Phase 5b: DDGI volume scan + tick — must run before LightingPass binds DDGI SRVs.
-    BuildScene_UpdateDDGI(world);
-
-    // Phase 6: terrain heightmap sync + CB upload + arm TerrainPass.
-    BuildScene_SyncTerrain(world);
-
-    // 1 Hz draw-stats log: packet count, instance count, max batch size.
-    {
-        static uint32_t s_statFrameCounter = 0;
-        if ((++s_statFrameCounter % 60u) == 0)
-        {
-            uint32_t totalInstances  = 0;
-            uint32_t instancedDraws  = 0;  // packets with instanceCount > 1
-            uint32_t maxBatch        = 0;
-            uint32_t opaqueDraws     = 0;
-            uint32_t shadowDraws     = 0;
-            uint32_t transparentDraws= 0;
-            uint32_t customDraws     = 0;
-            for (const DrawPacket& dp : m_drawPackets)
-            {
-                totalInstances += dp.instanceCount;
-                if (dp.instanceCount > 1) ++instancedDraws;
-                if (dp.instanceCount > maxBatch) maxBatch = dp.instanceCount;
-                switch (dp.filter)
-                {
-                case DrawFilter::Opaque:      ++opaqueDraws;      break;
-                case DrawFilter::Shadow:      ++shadowDraws;      break;
-                case DrawFilter::Transparent: ++transparentDraws; break;
-                case DrawFilter::Custom:      ++customDraws;      break;
-                default: break;
-                }
-            }
-           // (disabled) DrawStats LOG_INFO; re-enable for tuning batch behaviour.
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-void Renderer::BuildScene_UploadLights(World& world)
-{
-    auto* lb = m_lightCBMapped ? static_cast<LightCB*>(m_lightCBMapped) : nullptr;
-
-    // ---- Spot-shadow slice assignment: first kMaxCasters shadow-casting spots.
-    // Non-casters keep shadowSliceIdx = ~0u; shaders fall back to occlusion-only path.
-    uint32_t activeCasters = 0;
-    if (m_spotShadowPass && m_spotShadowVPMapped)
-    {
-        auto* vpDst = static_cast<XMFLOAT4X4*>(m_spotShadowVPMapped);
-        const uint32_t kMaxCasters = SpotShadowPass::kMaxCasters;
-
-        for (auto& L : m_frameLights)
-        {
-            if (activeCasters >= kMaxCasters) break;
-            if (L.type != LightType::Spot || !L.castsShadow)  continue;
-            if (L.radius <= 0.0f || L.spotAngle <= 0.0f)      continue;
-
-            // Light-space VP; up chosen away from light axis so LookToLH stays non-degenerate.
-            XMVECTOR dir = XMVector3Normalize(XMLoadFloat3(&L.direction));
-            XMFLOAT3 d3;  XMStoreFloat3(&d3, dir);
-            XMVECTOR up = (std::fabs(d3.y) > 0.99f)
-                        ? XMVectorSet(0, 0, 1, 0)
-                        : XMVectorSet(0, 1, 0, 0);
-            XMMATRIX view = XMMatrixLookToLH(
-                XMLoadFloat3(&L.position), dir, up);
-
-            // Reversed-Z perspective (engine convention: near=1.0, far=0.0, GREATER_EQUAL).
-            // fov = 2× outer spot angle so the entire cone is covered.
-            float fov = std::min(L.spotAngle * 2.0f, XM_PI - 0.01f);
-            XMMATRIX proj = XMMatrixPerspectiveFovLH(fov, 1.0f, L.radius, 0.1f);
-            XMMATRIX vp   = view * proj;
-
-            // SpotShadowPass transposes internally; pass un-transposed row-major.
-            XMFLOAT4X4 vpUntransposed;
-            XMStoreFloat4x4(&vpUntransposed, vp);
-            m_spotShadowPass->SetShadowMatrix(activeCasters, vpUntransposed);
-
-            // StructuredBuffer<float4x4> default is column-major — store transposed.
-            XMStoreFloat4x4(&vpDst[activeCasters], XMMatrixTranspose(vp));
-
-            L.shadowSliceIdx = activeCasters;
-
-            // Propagate to volumetric list so FroxelLightInject samples the spot-shadow atlas
-            // (avoids "light through wall" leaks from the screen-space+voxel fallback).
-            for (auto& vl : m_volumetricLights)
-            {
-                if (vl.type == static_cast<uint32_t>(LightType::Spot)
-                    && std::abs(vl.position.x - L.position.x) < 1e-4f
-                    && std::abs(vl.position.y - L.position.y) < 1e-4f
-                    && std::abs(vl.position.z - L.position.z) < 1e-4f)
-                {
-                    vl.shadowSliceIdx = activeCasters;
-                    break;
-                }
-            }
-
-            ++activeCasters;
-        }
-
-        m_spotShadowPass->SetActiveCasterCount(activeCasters);
-    }
-
-    {
-        // Upload to ClusterPass
-        if (m_clusterPass)
-        {
-            // Convert to ClusterPass::ResolvedLight
-            std::vector<ClusterPass::ResolvedLight> clusterLights(m_frameLights.size());
-            for (size_t i = 0; i < m_frameLights.size(); ++i)
-            {
-                auto& s = m_frameLights[i];
-                auto& d = clusterLights[i];
-                d.position       = s.position;
-                d.radius         = s.radius;
-                d.color          = s.color;
-                d.intensity      = s.intensity;
-                d.direction      = s.direction;
-                d.spotAngle      = s.spotAngle;
-                d.type           = s.type;
-                d.shadowSliceIdx = s.shadowSliceIdx;
-            }
-            m_clusterPass->SetLights(clusterLights);
-
-            // Set cluster camera params
-            XMMATRIX view = XMLoadFloat4x4(&m_view.viewMatrix);
-            XMMATRIX proj = XMLoadFloat4x4(&m_view.projMatrixNoJitter);
-            XMMATRIX invP = XMMatrixInverse(nullptr, proj);
-            XMFLOAT4X4 invProjF, viewF;
-            XMStoreFloat4x4(&invProjF, XMMatrixTranspose(invP));
-            XMStoreFloat4x4(&viewF, XMMatrixTranspose(view));
-            m_clusterPass->SetCamera(invProjF, viewF,
-                                     m_camera.nearZ, m_camera.farZ,
-                                     m_vpWidth, m_vpHeight);
-
-            // Update LightCB with cluster params
-            if (lb)
-            {
-                XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(lb->viewMatrix),
-                                XMMatrixTranspose(view));
-                lb->clusterNearZ      = m_camera.nearZ;
-                lb->clusterFarZ       = m_camera.farZ;
-                lb->clusterLightCount = m_clusterPass->GetLightCount();
-            }
-        }
-
-        // NPR params are per-material now; LightCB.nprMinBrightness=0 so shadows reach true black.
-        lb->nprMinBrightness = 0.0f;
-    }
-
-    // ---- Sync IBL from SkyboxComponent → LightCB + passes ------------------
-    SyncSkyboxIBL(world);
-
-    // ---- Clustered decals — asset-driven; shares ClusterPass camera state.
-    // Pump Resolve()+TryPromote() on each unique asset referenced this frame.
-    if (m_decalPass)
-    {
-        std::vector<DecalPass::ResolvedDecal> resolvedDecals;
-        auto* pDecal = world.GetPool<DecalComponent>();
-        auto* pGT    = world.GetPool<GlobalTransform>();
-        const bool haveTexSys = (m_texSys && m_resMgr);
-
-        if (pDecal && pGT && pDecal->Size() > 0 && haveTexSys)
-        {
-            // Pump assets referenced this frame exactly once each.
-            std::unordered_set<Resource::DecalMaterialAsset*> pumped;
-            pumped.reserve(pDecal->Size());
-
-            const auto& ents = pDecal->Entities();
-            resolvedDecals.reserve(ents.size());
-            for (size_t i = 0; i < ents.size(); ++i)
-            {
-                Entity e = ents[i];
-                DecalComponent* dc  = pDecal->Get(e);
-                const GlobalTransform* gt = pGT->Get(e);
-                if (!dc || !gt || !dc->material) continue;
-
-                Resource::DecalMaterialAsset* asset = dc->material.get();
-                if (pumped.insert(asset).second)
-                {
-                    asset->Resolve(*m_texSys, *m_resMgr, m_gfx);
-                    asset->TryPromote(*m_texSys);
-                }
-
-                // Skip only when no textures AND no scalar overrides (allows pure-scalar decals).
-                bool anySlot = false;
-                for (uint32_t s = 0; s < Resource::DecalMaterialAsset::SLOT_COUNT; ++s)
-                    if (asset->texBindless[s] >= 0) { anySlot = true; break; }
-                const bool scalarOnlyWrite =
-                    (asset->flags & (Resource::DecalMaterialAsset::WRITE_ROUGHNESS |
-                                     Resource::DecalMaterialAsset::WRITE_SPECULAR  |
-                                     Resource::DecalMaterialAsset::WRITE_AO)) != 0;
-                if (!anySlot && !scalarOnlyWrite) continue;
-
-                // worldToDecal = inverse(world); row-major DX-style (last row = translation).
-                XMMATRIX worldMtx = XMLoadFloat4x4(&gt->matrix);
-                XMMATRIX inv      = XMMatrixInverse(nullptr, worldMtx);
-
-                DecalPass::ResolvedDecal rd;
-                XMStoreFloat4x4(&rd.worldToDecal, XMMatrixTranspose(inv));
-                rd.boundsCenter = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-
-                // OBB-sphere radius: unit cube's half-diagonal = sqrt(3)/2.
-                XMVECTOR sx = XMVector3Length(worldMtx.r[0]);
-                XMVECTOR sy = XMVector3Length(worldMtx.r[1]);
-                XMVECTOR sz = XMVector3Length(worldMtx.r[2]);
-                float maxScale = std::max({ XMVectorGetX(sx), XMVectorGetX(sy), XMVectorGetX(sz) });
-                rd.boundsRadius = maxScale * 0.8660254f;
-
-                // Decal world-space +Z = normalized row 2 of the world matrix.
-                XMVECTOR zAxis = XMVector3Normalize(worldMtx.r[2]);
-                XMStoreFloat3(&rd.decalForwardWS, zAxis);
-
-                // Fill 9 bindless indices + scalars from the asset.
-                using A = Resource::DecalMaterialAsset;
-                rd.texBaseColor    = asset->texBindless[A::SLOT_BASECOLOR];
-                rd.texNormal       = asset->texBindless[A::SLOT_NORMAL];
-                rd.texOpacity      = asset->texBindless[A::SLOT_OPACITY];
-                rd.texRoughness    = asset->texBindless[A::SLOT_ROUGHNESS];
-                rd.texSpecular     = asset->texBindless[A::SLOT_SPECULAR];
-                rd.texAO           = asset->texBindless[A::SLOT_AO];
-                rd.texBump         = asset->texBindless[A::SLOT_BUMP];
-                rd.texCavity       = asset->texBindless[A::SLOT_CAVITY];
-                rd.texDisplacement = asset->texBindless[A::SLOT_DISPLACEMENT];
-
-                rd.flags          = asset->flags;
-                rd.angleFadeStart = asset->angleFadeStart;
-                rd.sortLayer      = static_cast<float>(asset->sortLayer);
-
-                // Tint: per-instance override wins; .a pre-multiplied with fadeAlpha.
-                const bool tintOverridden = (dc->tintOverride.w > 0.f);
-                const DirectX::XMFLOAT4 baseTint = tintOverridden ? dc->tintOverride : asset->baseColorTint;
-                rd.baseColorTint = { baseTint.x, baseTint.y, baseTint.z, baseTint.w * dc->fadeAlpha };
-
-                rd.scalars0 = { asset->opacity, asset->roughness, asset->specular, asset->ao };
-                rd.scalars1 = { asset->normalStrength, asset->bumpStrength,
-                                asset->cavityStrength, asset->displacementScale };
-
-                resolvedDecals.push_back(rd);
-            }
-        }
-
-        m_decalPass->SetDecals(resolvedDecals);
-
-        // Camera data: invVP→apply CS world-pos; invProj+view→cull CS; camPos→displacement parallax.
-        XMMATRIX view    = XMLoadFloat4x4(&m_view.viewMatrix);
-        XMMATRIX proj    = XMLoadFloat4x4(&m_view.projMatrixNoJitter);
-        XMMATRIX invP    = XMMatrixInverse(nullptr, proj);
-        XMMATRIX viewProj = view * proj;
-        XMMATRIX invVP   = XMMatrixInverse(nullptr, viewProj);
-        XMFLOAT4X4 invProjF, invVPF, viewF;
-        XMStoreFloat4x4(&invProjF, XMMatrixTranspose(invP));
-        XMStoreFloat4x4(&invVPF,   XMMatrixTranspose(invVP));
-        XMStoreFloat4x4(&viewF,    XMMatrixTranspose(view));
-        m_decalPass->SetCamera(invProjF, invVPF, viewF,
-                                m_camera.position,
-                                m_camera.nearZ, m_camera.farZ,
-                                m_vpWidth, m_vpHeight);
-    }
-}
-
-// Pack ReflectionProbeComponents into GPU StructuredBuffer; FIFO slice assignment (kMaxReflectionProbes).
-void Renderer::BuildScene_UploadProbes(World& world)
-{
-    using namespace Reflection;
-
-    uint32_t activeCount = 0;
-    m_probeMgr.SetActiveProbeCount(0);
-    auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-
-    auto publishCount = [&]() {
-        m_probeMgr.SetActiveProbeCount(activeCount);
-        if (lb) lb->reflectionProbeCount = activeCount;
-    };
-
-    auto* dst = m_probeMgr.GetUploadPointer();
-    if (!dst) { publishCount(); return; }
-
-    auto* probePool = world.GetPool<ReflectionProbeComponent>();
-    if (!probePool)                     { publishCount(); return; }
-    const auto& probeEnts = probePool->Entities();
-    if (probeEnts.empty())              { publishCount(); return; }
-
-    auto& probeData = probePool->Data();
-
-    bool overflowed = false;
-    for (size_t i = 0; i < probeEnts.size(); ++i)
-    {
-        Entity e = probeEnts[i];
-        if (!world.IsAlive(e)) continue;
-
-        const GlobalTransform* gt = world.GetComponent<GlobalTransform>(e);
-        if (!gt) continue;  // probe needs a transform to live in world space
-
-        if (activeCount >= kMaxReflectionProbes) { overflowed = true; break; }
-
-        ReflectionProbeComponent& comp = probeData[i];
-
-        const uint32_t slice = activeCount;
-        comp.cubemapSlice = slice;
-
-        const DirectX::XMFLOAT3 pos = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-
-        DirectX::XMFLOAT3 inner = comp.innerExtents;
-        DirectX::XMFLOAT3 outer = comp.outerExtents;
-        outer.x = std::max(outer.x, inner.x);
-        outer.y = std::max(outer.y, inner.y);
-        outer.z = std::max(outer.z, inner.z);
-
-        GPUReflectionProbe& gpu = dst[slice];
-        gpu.position        = pos;
-        gpu.influenceRadius = std::sqrt(outer.x*outer.x + outer.y*outer.y + outer.z*outer.z);
-        gpu.boxMin          = { pos.x - outer.x, pos.y - outer.y, pos.z - outer.z };
-        gpu.boxMax          = { pos.x + outer.x, pos.y + outer.y, pos.z + outer.z };
-        gpu.cubemapSlice    = slice;
-        gpu.flags           = comp.IsBaked() ? GPU_PROBE_FLAG_BAKED : 0u;
-        gpu.innerExtents = {
-            std::min(inner.x, outer.x),
-            std::min(inner.y, outer.y),
-            std::min(inner.z, outer.z) };
-
-        if (!comp.IsBaked() || comp.NeedsRebake())
-            m_probeMgr.EnqueueBake(slice);
-
-        if (comp.realtime && comp.IsBaked() && comp.tickIntervalFrames > 0)
-        {
-            const uint64_t interval = comp.tickIntervalFrames;
-            if (m_currentFrame >= comp.lastBakedFrame + interval)
-            {
-                comp.RequestRebake();
-                m_probeMgr.EnqueueBake(slice);
-                comp.lastBakedFrame = m_currentFrame;
-            }
-        }
-
-        ++activeCount;
-    }
-
-    if (overflowed)
-    {
-        static bool s_warned = false;
-        if (!s_warned)
-        {
-            LOG_WARNING("Renderer: more reflection probes in scene than kMaxReflectionProbes=%u — extras ignored",
-                        kMaxReflectionProbes);
-            s_warned = true;
-        }
-    }
-
-    publishCount();
-
-    if (m_clusterPass)
-        m_clusterPass->SetProbes(m_probeMgr.GetBufferSrv(), activeCount);
-}
-
-// Bake queue API; ProcessProbeBakeQueue consumes one entry/frame (amortizes 6-face + prefilter cost).
-void Renderer::BakeProbe(uint32_t cubeSlice)
-{
-    m_probeMgr.EnqueueBake(cubeSlice);
-}
-
-void Renderer::BakeAllProbes()
-{
-    if (!m_lastWorld) return;
-    auto* probePool = m_lastWorld->GetPool<ReflectionProbeComponent>();
-    if (!probePool) return;
-    auto& probeData = probePool->Data();
-    auto& probeEnts = probePool->Entities();
-    for (size_t i = 0; i < probeEnts.size(); ++i)
-    {
-        ReflectionProbeComponent& comp = probeData[i];
-        if (comp.cubemapSlice == ReflectionProbeComponent::kInvalidSlice) continue;
-        comp.RequestRebake();
-        m_probeMgr.EnqueueBake(comp.cubemapSlice);
-    }
-}
-
-// CPU-side DDGI bookkeeping: collect volumes, alloc/resize, refresh CBs, publish to LightCB.
-// GPU dispatches (TLAS build + trace + relight) live in Render().
-void Renderer::BuildScene_UpdateDDGI(World& world)
-{
-    auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-
-    // Singleton-entity settings override; else Renderer's defaults remain in effect.
-    if (auto* settingsPool = world.GetPool<IndirectLightingSettingsComponent>())
-    {
-        const auto& sEnts = settingsPool->Entities();
-        if (!sEnts.empty()) m_ddgiSettings = settingsPool->Data().front();
-    }
-
-    // No volume pool → 0 volumes this frame; LightCB still needs the master toggles.
-    // EnsurePool for runtime component: World serialization deliberately skips
-    // DDGIVolumeRuntimeComponent (GPU handles, rebuilt on demand). After a fresh
-    // load, no entity holds one yet, so the runtime pool would not exist and the
-    // auto-promote loop below would never run — DDGI silently disabled until the
-    // user manually adds a volume in the editor. EnsurePool creates the empty pool
-    // so the loop can attach the runtime component on first tick.
-    auto* volPool = world.GetPool<DDGIVolumeComponent>();
-    auto* runPool = world.EnsurePool<DDGIVolumeRuntimeComponent>();
-    uint32_t activeCount    = 0;
-
-    static uint32_t s_ddgiScanLogCounter = 0;
-    //const bool ddgiScanLogTick = (++s_ddgiScanLogCounter % 60u) == 0;
-    const bool ddgiScanLogTick = false;
-
-    if (ddgiScanLogTick)
-    {
-        size_t volEntCount = (volPool ? volPool->Entities().size() : 0);
-        LOG_INFO("DDGI scan: volPool=%s entities=%zu",
-                 volPool ? "ok" : "null", volEntCount);
-    }
-
-    if (volPool && runPool)
-    {
-        auto& volEnts = volPool->Entities();
-        auto& volData = volPool->Data();
-
-        // Promote runtime component for newly-added volumes.
-        for (size_t i = 0; i < volEnts.size(); ++i)
-        {
-            Entity e = volEnts[i];
-            if (!world.IsAlive(e)) continue;
-            if (!runPool->Get(e))
-                world.AddComponent<DDGIVolumeRuntimeComponent>(e, {});
-        }
-
-        // Parallel arrays for manager's Tick — alloc/resize on first sight or probe-count change.
-        const DDGIVolumeComponent*       vols[DDGI::kMaxVolumes] = {};
-        DDGIVolumeRuntimeComponent*      runs[DDGI::kMaxVolumes] = {};
-
-        for (size_t i = 0; i < volEnts.size() && activeCount < DDGI::kMaxVolumes; ++i)
-        {
-            Entity e = volEnts[i];
-            if (!world.IsAlive(e)) continue;
-            DDGIVolumeRuntimeComponent* rt = runPool->Get(e);
-            if (!rt) continue;
-
-            DDGIVolumeComponent& vc = volData[i];
-            if (!m_ddgiMgr.AllocateOrUpdate(m_gfx, vc, *rt))
-                continue;
-
-            vols[activeCount] = &vc;
-            runs[activeCount] = rt;
-            activeCount++;
-        }
-
-        // Trace CS picks random light per ray from cluster buffer; 0 → sky-miss + multi-bounce only.
-        const uint32_t ddgiLightCount =
-            m_clusterPass ? m_clusterPass->GetLightCount() : 0u;
-        m_ddgiMgr.Tick(m_gfx, vols, runs, activeCount, ddgiLightCount);
-
-        // GC orphaned slots — without this, lighting reads stale slot with wrong probe-count layout.
-        uint32_t claimed[DDGI::kMaxVolumes] = {};
-        for (uint32_t i = 0; i < activeCount; ++i)
-            claimed[i] = runs[i] ? runs[i]->volumeSlot : 0xFFFFFFFFu;
-        m_ddgiMgr.FreeUnclaimedSlots(m_gfx, claimed, activeCount);
-    }
-
-    // LightCB integration knobs. ddgiVolumeCount==0 → shader keeps Sky IBL.
-    if (lb)
-    {
-        lb->ddgiVolumeCount         = activeCount;
-        lb->ddgiEnabled             = (m_ddgiSettings.ddgiEnabled && activeCount > 0) ? 1u : 0u;
-        lb->ddgiDiffuseScale        = m_ddgiSettings.ddgiDiffuseScale;
-        lb->skyIBLDiffuseScale      = m_ddgiSettings.skyIBLDiffuseScale;
-        lb->ddgiAONearFieldStrength = m_ddgiSettings.ddgiAONearFieldStrength;
-    }
-
-    // SRV table bases for multi-volume; shader indexes by its loop counter (slot offset).
-    if (m_lightingPass)
-    {
-        if (activeCount > 0)
-        {
-            m_lightingPass->SetDDGI(
-                m_ddgiMgr.GetVolumeBufferSrv(),
-                m_ddgiMgr.GetProbeSHTableGpu(),
-                m_ddgiMgr.GetDepthTableGpu(),
-                m_ddgiMgr.GetProbeDataTableGpu());
-        }
-        else
-        {
-            // ddgiVolumeCount==0 prevents reads; clearing routes to placeholder handle.
-            m_lightingPass->SetDDGI(0, 0, 0, 0);
-        }
-    }
-}
-
-// Single-tile terrain sync: TextureSystem paths, TerrainCB upload, arm TerrainPass.
-void Renderer::BuildScene_SyncTerrain(World& world)
-{
-    if (!m_terrainPass || !m_terrainCBMapped) return;
-
-    auto* pTerrain = world.GetPool<TerrainComponent>();
-    if (!pTerrain || pTerrain->Size() == 0)
-    {
-        m_terrainPass->SetActiveTile({});
-        return;
-    }
-
-    // First TerrainComponent only (single-tile); multi-tile/quadtree later.
-    const auto& ents = pTerrain->Entities();
-    auto&       data = pTerrain->Data();
-
-    Entity            activeEntity = NullEntity;
-    TerrainComponent* activeTC     = nullptr;
-    for (size_t i = 0; i < ents.size(); ++i)
-    {
-        if (ents[i] == NullEntity) continue;
-        activeEntity = ents[i];
-        activeTC     = &data[i];
-        break;
-    }
-    if (!activeTC)
-    {
-        m_terrainPass->SetActiveTile({});
-        return;
-    }
-
-    // Texture sync helper: acquire/release/promote, writes SRV + optional bindless idx.
-    uint64_t heightmapSRV = 0;
-    uint64_t splatmapSRV  = 0;
-    int32_t  layerAlbedoIdx[4] = { -1, -1, -1, -1 };
-    int32_t  layerNormalIdx[4] = { -1, -1, -1, -1 };
-    int32_t  layerARMIdx   [4] = { -1, -1, -1, -1 };
-    int32_t  layerDispIdx  [4] = { -1, -1, -1, -1 };
-
-    if (m_texSys && m_resMgr)
-    {
-        auto [it, _] = m_terrainTexCache.try_emplace(activeEntity);
-        TerrainTexCache& cache = it->second;
-
-        // path-change → acquire/release; tex-ready → promote. outBindless optional (skip for table-bound).
-        auto syncSlot = [&](const std::string& path,
-                            TerrainTexSlot&    slot,
-                            int32_t*           outBindless,
-                            uint64_t*          outSrv) -> void
-        {
-            if (path != slot.path)
-            {
-                if (slot.handle != Resource::kInvalidTextureHandle)
-                    m_texSys->Release(slot.handle, m_gfx);
-
-                slot.path   = path;
-                slot.handle = path.empty()
-                    ? Resource::kInvalidTextureHandle
-                    : m_texSys->Acquire(path, *m_resMgr, m_gfx);
-                if (outBindless) *outBindless = -1;
-                if (outSrv)      *outSrv      = 0;
-            }
-
-            if (slot.handle != Resource::kInvalidTextureHandle
-                && m_texSys->IsReady(slot.handle))
-            {
-                if (const RHI::Texture* tex = m_texSys->GetTexture(slot.handle))
-                {
-                    if (tex->IsValid())
-                    {
-                        if (outSrv)      *outSrv      = m_gfx.GetTextureSRVGpuHandle(*tex);
-                        if (outBindless) *outBindless = static_cast<int32_t>(tex->handle_id);
-                    }
-                }
-            }
-        };
-
-        // Heightmap (root[10] descriptor table).
-        // Path-change → invalidate the CPU-side HeightField below.
-        const std::string priorHeightPath = cache.heightmap.path;
-        syncSlot(activeTC->heightmapPath, cache.heightmap, nullptr, &heightmapSRV);
-        activeTC->heightmapHandle = cache.heightmap.handle;
-        activeTC->heightmapSRV    = heightmapSRV;
-        if (priorHeightPath != cache.heightmap.path)
-            activeTC->heightField.reset();
-
-        // CPU HeightField for collision: decode raw R16_UNORM once per heightmap path.
-        if (!activeTC->heightField
-            && activeTC->heightmapHandle != Resource::kInvalidTextureHandle
-            && m_texSys->IsReady(activeTC->heightmapHandle))
-        {
-            Resource::Handle rmHandle =
-                m_texSys->GetResourceManagerHandle(activeTC->heightmapHandle);
-            if (const auto* texRes = m_resMgr->Get<Resource::TextureResource>(rmHandle))
-            {
-                const DirectX::TexMetadata&  meta = texRes->GetMetadata();
-                const DirectX::ScratchImage& img  = texRes->GetImage();
-                if (meta.format == DXGI_FORMAT_R16_UNORM
-                    && meta.width > 0 && meta.height > 0)
-                {
-                    auto hf = std::make_shared<Resource::HeightField>();
-                    hf->width  = static_cast<uint32_t>(meta.width);
-                    hf->height = static_cast<uint32_t>(meta.height);
-                    hf->samples.resize(static_cast<size_t>(hf->width) *
-                                       static_cast<size_t>(hf->height));
-
-                    // Mip 0 / slice 0 = full-res for collision; respect rowPitch (DXTex may pad).
-                    if (const DirectX::Image* mip0 = img.GetImage(0, 0, 0))
-                    {
-                        const size_t rowBytes = static_cast<size_t>(hf->width) * sizeof(uint16_t);
-                        for (uint32_t y = 0; y < hf->height; ++y)
-                        {
-                            const uint8_t* src = mip0->pixels + static_cast<size_t>(y) * mip0->rowPitch;
-                            std::memcpy(hf->samples.data() + static_cast<size_t>(y) * hf->width,
-                                        src, rowBytes);
-                        }
-                    }
-
-                    hf->baseY       = activeTC->worldCenter.y;
-                    hf->heightScale = activeTC->heightScale;
-                    LOG_INFO("Terrain: HeightField populated (%ux%u, baseY=%.1f, scale=%.1f)",
-                             hf->width, hf->height, hf->baseY, hf->heightScale);
-                    activeTC->heightField = std::move(hf);
-                }
-                else
-                {
-                    LOG_WARNING("Terrain: heightmap '%s' format=%u — expected R16_UNORM. Re-import to enable CPU collision.",
-                                activeTC->heightmapPath.c_str(),
-                                static_cast<unsigned>(meta.format));
-                }
-            }
-        }
-        // Sync world-Y every frame so live edits flow to collision without re-decoding.
-        if (activeTC->heightField)
-        {
-            activeTC->heightField->baseY       = activeTC->worldCenter.y;
-            activeTC->heightField->heightScale = activeTC->heightScale;
-        }
-
-        // Splatmap (root[11] descriptor table).
-        syncSlot(activeTC->splatmapPath, cache.splatmap, nullptr, &splatmapSRV);
-        activeTC->splatmapHandle = cache.splatmap.handle;
-        activeTC->splatmapSRV    = splatmapSRV;
-
-        // 4 layers × 4 bindless maps (albedo, normal, ARM, disp).
-        for (int li = 0; li < 4; ++li)
-        {
-            auto& l    = activeTC->layers[li];
-            auto& slot = cache.layers[li];
-            syncSlot(l.albedoPath, slot.albedo, &layerAlbedoIdx[li], nullptr);
-            syncSlot(l.normalPath, slot.normal, &layerNormalIdx[li], nullptr);
-            syncSlot(l.armPath,    slot.arm,    &layerARMIdx[li],    nullptr);
-            syncSlot(l.dispPath,   slot.disp,   &layerDispIdx[li],   nullptr);
-
-            l.albedoHandle      = slot.albedo.handle;
-            l.normalHandle      = slot.normal.handle;
-            l.armHandle         = slot.arm.handle;
-            l.dispHandle        = slot.disp.handle;
-            l.albedoBindlessIdx = layerAlbedoIdx[li];
-            l.normalBindlessIdx = layerNormalIdx[li];
-            l.armBindlessIdx    = layerARMIdx[li];
-            l.dispBindlessIdx   = layerDispIdx[li];
-        }
-
-        // First-resident-per-layer debug print to disambiguate load-failure vs shader bug.
-        static int s_lastLoggedAlbedoIdx[4] = { -2, -2, -2, -2 };
-        for (int li = 0; li < 4; ++li)
-        {
-            const int32_t cur = layerAlbedoIdx[li];
-            if (cur != s_lastLoggedAlbedoIdx[li])
-            {
-                LOG_INFO("Terrain layer[%d] albedo bindlessIdx=%d (path='%s')",
-                         li, cur,
-                         activeTC->layers[li].albedoPath.c_str());
-                s_lastLoggedAlbedoIdx[li] = cur;
-            }
-        }
-    }
-
-    // ---- Upload TerrainCB. CB stores bottom-left corner (XZ) so MS uses origin + gridXY * step.
-    {
-        TerrainParamsCB cb{};
-        const float halfSize = activeTC->worldSize * 0.5f;
-        cb.worldOriginX       = activeTC->worldCenter.x - halfSize;
-        cb.worldOriginY       = activeTC->worldCenter.z - halfSize;  // .y is world Z
-        cb.worldSize          = activeTC->worldSize;
-        cb.heightScale        = activeTC->heightScale;
-        cb.worldCenterY       = activeTC->worldCenter.y;
-        cb.heightmapUVOffsetX = activeTC->heightmapUVOffset.x;
-        cb.heightmapUVOffsetY = activeTC->heightmapUVOffset.y;
-        cb.heightmapUVScaleX  = activeTC->heightmapUVScale.x;
-        cb.heightmapUVScaleY  = activeTC->heightmapUVScale.y;
-
-        // Heightmap width drives texel size; fall back to 1024 pre-load for analytic-normal gradient.
-        uint32_t hmWidth = 1024;
-        if (m_texSys && activeTC->heightmapHandle != Resource::kInvalidTextureHandle
-            && m_texSys->IsReady(activeTC->heightmapHandle))
-        {
-            if (const RHI::Texture* tex = m_texSys->GetTexture(activeTC->heightmapHandle))
-                if (tex->IsValid() && tex->desc.width > 0)
-                    hmWidth = tex->desc.width;
-        }
-        cb.heightmapTexel = 1.0f / static_cast<float>(hmWidth);
-        cb.hasHeightmap   = (heightmapSRV != 0) ? 1u : 0u;
-        cb.hasSplatmap    = (splatmapSRV  != 0) ? 1u : 0u;
-
-        for (int li = 0; li < 4; ++li)
-        {
-            const auto& l            = activeTC->layers[li];
-            cb.layerBindlessIdx[li]  = layerAlbedoIdx[li];
-            cb.layerTilingScale[li]  = l.tilingScale;
-            cb.layerNormalIdx[li]    = layerNormalIdx[li];
-            cb.layerARMIdx[li]       = layerARMIdx[li];
-            cb.layerDispIdx[li]      = layerDispIdx[li];
-            cb.layerMinHeight   [li] = l.minHeight;
-            cb.layerMaxHeight   [li] = l.maxHeight;
-            cb.layerFadeHeight  [li] = (l.fadeHeight   > 1e-3f) ? l.fadeHeight   : 1e-3f;
-            cb.layerMinSlopeDeg [li] = l.minSlopeDeg;
-            cb.layerMaxSlopeDeg [li] = l.maxSlopeDeg;
-            cb.layerFadeSlopeDeg[li] = (l.fadeSlopeDeg > 1e-3f) ? l.fadeSlopeDeg : 1e-3f;
-        }
-
-        cb.tilesPerSide       = activeTC->tilesPerSide ? activeTC->tilesPerSide : 1u;
-        cb.enableFrustumCull  = 1u;     // colour pass uses camera frustum
-
-        // Frustum planes (unjittered VP). dot(n,P) + d ≥ 0 = inside; order = L,R,B,T,N,F.
-        const auto& fp = m_view.frustum;
-        for (int p = 0; p < 6; ++p)
-        {
-            cb.frustumPlanes[p][0] = fp[p].normal.x;
-            cb.frustumPlanes[p][1] = fp[p].normal.y;
-            cb.frustumPlanes[p][2] = fp[p].normal.z;
-            cb.frustumPlanes[p][3] = fp[p].distance;
-        }
-
-        std::memcpy(m_terrainCBMapped, &cb, sizeof(cb));
-    }
-
-    // Arm the pass; pass self-skips without heightmapSRV. Splatmap optional (PS slope-debug fallback).
-    TerrainPass::TileBindings tb;
-    tb.heightmapSRV      = heightmapSRV;
-    tb.splatmapSRV       = splatmapSRV;
-    // 1 AS group per 32 sub-tiles → tilesPerSide² / 32 dispatches; AS culls + DispatchMesh's survivors.
-    {
-        constexpr uint32_t kASGroupSize = 32;   // must match Terrain.as.hlsl
-        const uint32_t n            = activeTC->tilesPerSide ? activeTC->tilesPerSide : 1u;
-        const uint32_t totalSubTiles = n * n;
-        tb.dispatchAsGroupCount = (totalSubTiles + kASGroupSize - 1u) / kASGroupSize;
-    }
-    m_terrainPass->SetActiveTile(tb);
-}
-
-// ---------------------------------------------------------------------------
-void Renderer::ProcessProbeBakeQueue(RHI::CommandList colorLastCL)
-{
-    if (m_probeMgr.BakeQueueEmpty())                return;
-    if (!m_lastWorld)                               return;
-    if (!m_probeMgr.GetArrayTexture().IsValid())    return;
-    if (!m_materialBuffer.IsValid())                return;
-
-    const uint32_t cubeSlice = m_probeMgr.PeekBake();
-    m_probeMgr.PopBake();
-
-    // Resolve slice → entity → component (linear scan; N ≤ 64).
-    auto* probePool = m_lastWorld->GetPool<ReflectionProbeComponent>();
-    if (!probePool) return;
-    auto& probeData = probePool->Data();
-    auto& probeEnts = probePool->Entities();
-
-    Entity probeEntity = NullEntity;
-    ReflectionProbeComponent* probeComp = nullptr;
-    for (size_t i = 0; i < probeEnts.size(); ++i)
-    {
-        if (probeData[i].cubemapSlice == cubeSlice)
-        {
-            probeEntity = probeEnts[i];
-            probeComp   = &probeData[i];
-            break;
-        }
-    }
-    if (!probeComp) return;  // probe disappeared since enqueue
-
-    const GlobalTransform* gt = m_lastWorld->GetComponent<GlobalTransform>(probeEntity);
-    if (!gt) return;
-
-    // Build the bake context — pull lighting state from SkyIBLPass when present.
-    ReflectionProbeCapturePass::BakeContext ctx{};
-    ctx.probeArray       = &m_probeMgr.GetArrayTexture();
-    ctx.probePos         = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-    if (m_skyIBLPass)
-    {
-        ctx.sunDir   = m_skyIBLPass->GetSunDir();
-        ctx.sunColor = m_skyIBLPass->GetSunColor();
-        ctx.ambient  = m_skyIBLPass->GetAmbientColor();
-        ctx.skySHSrv = m_skyIBLPass->GetSHSrvHandle();
-    }
-    ctx.materialBufSrv   = m_gfx.GetBufferSRVGpuHandle(m_materialBuffer);
-    ctx.bindlessTexTable = m_gfx.GetBindlessTextureTableGpuHandle();
-    ctx.bindlessBufTable = m_meshMgr.GetDescriptorHeap().GetBufferTableGpuHandle().ptr;
-    ctx.instanceBuffer   = &m_instanceBuffer;
-    ctx.meshDescBuffer   = &m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer();
-
-    // Probe-specific cull via BVH range query → DrawList copies filtered by influence AABB.
-    // Filtered vectors live on this stack until BakeProbe returns (synchronous record).
-    SceneBVH::AABB influenceAabb;
-    influenceAabb.min = {
-        ctx.probePos.x - probeComp->outerExtents.x,
-        ctx.probePos.y - probeComp->outerExtents.y,
-        ctx.probePos.z - probeComp->outerExtents.z };
-    influenceAabb.max = {
-        ctx.probePos.x + probeComp->outerExtents.x,
-        ctx.probePos.y + probeComp->outerExtents.y,
-        ctx.probePos.z + probeComp->outerExtents.z };
-
-    std::vector<Entity> bvhVisible;
-    bvhVisible.reserve(256);
-    m_sceneBVH.QueryAABB(influenceAabb, bvhVisible);
-    std::unordered_set<Entity> visibleSet(bvhVisible.begin(), bvhVisible.end());
-
-    std::vector<DrawPacket> probeOpaque, probeShadow, probeTransparent;
-    auto filterList = [&](DrawList src, std::vector<DrawPacket>& dst)
-    {
-        dst.reserve(src.size());
-        for (const DrawPacket& dp : src)
-        {
-            // Keep packet if ANY instance sits in influence AABB; off-AABB instances still rasterize.
-            const uint32_t endSlot = (std::min)(
-                dp.instanceOffset + dp.instanceCount,
-                kMaxInstances);
-            bool keep = false;
-            for (uint32_t i = dp.instanceOffset; i < endSlot; ++i)
-            {
-                if (visibleSet.count(m_instanceSlotToEntity[i])) { keep = true; break; }
-            }
-            if (keep) dst.push_back(dp);
-        }
-    };
-    filterList(GetDrawList(DrawFilter::Opaque),      probeOpaque);
-    filterList(GetDrawList(DrawFilter::Shadow),      probeShadow);
-    filterList(GetDrawList(DrawFilter::Transparent), probeTransparent);
-
-    ctx.opaqueDraws      = DrawList(probeOpaque.data(),      probeOpaque.size());
-    ctx.shadowDraws      = DrawList(probeShadow.data(),      probeShadow.size());
-    ctx.transparentDraws = DrawList(probeTransparent.data(), probeTransparent.size());
-    ctx.defaultWhiteSrv    = m_gbufferPass ? m_gbufferPass->GetDefaultWhiteSrvHandle()      : 0;
-    ctx.defaultFlatNormSrv = m_gbufferPass ? m_gbufferPass->GetDefaultFlatNormalSrvHandle() : 0;
-    // Skybox capture: reuse SkyboxPass cube VB + active sky cubemap. Either 0 → sky draw skipped.
-    if (m_skyboxPass)
-        ctx.skyCubeVB = &m_skyboxPass->GetCubeVB();
-    if (m_skyIBLPass)
-        ctx.skyCubemapSrv = m_skyIBLPass->ResolveSkyboxSrvHandle(/*staticFallback=*/0);
-
-    // Dedicated graphics CL sequenced after main graph (mirrors HiZ Phase 4.5).
-    RHI::CommandList bakeCL = m_gfx.BeginCommandList(RHI::QUEUE_TYPE::GRAPHICS);
-    bakeCL.gfx = &m_gfx;
-    if (colorLastCL.IsValid())
-        m_gfx.AddCommandListDependency(bakeCL, colorLastCL);
-
-    m_probeMgr.GetCapturePass().BakeProbe(bakeCL, cubeSlice, ctx);
-
-    probeComp->SetBaked(true);
-    probeComp->ClearRebakeRequest();
-    // Seed realtime tick so freshly-baked realtime probes wait a full interval.
-    probeComp->lastBakedFrame = m_currentFrame;
-
-   /* LOG_INFO("Renderer: baked probe slice %u (entity %u, BVH hits=%zu, draws O=%zu S=%zu T=%zu)",
-             cubeSlice, probeEntity, bvhVisible.size(),
-             ctx.opaqueDraws.size(), ctx.shadowDraws.size(), ctx.transparentDraws.size());*/
-}
-
-// ---------------------------------------------------------------------------
-void Renderer::SyncSkyboxIBL(World& world)
-{
-    uint64_t irradianceHandle = 0;
-    uint64_t radianceHandle   = 0;
-    uint64_t skyboxHandle     = 0;
-    uint32_t radianceMips     = 5;
-    float    iblStrength      = 1.0f;
-
-    for (Entity e : world.GetEntities())
-    {
-        if (!world.IsAlive(e)) continue;
-        SkyboxComponent* sc = world.GetComponent<SkyboxComponent>(e);
-        if (!sc) continue;
-
-        if (m_texSys && m_resMgr)
-        {
-            auto syncTex = [&](SkyboxTexEntry& entry, const std::string& path, uint64_t& outHandle)
-            {
-                if (path.empty()) return;
-                if (entry.path != path)
-                {
-                    if (entry.handle != Resource::kInvalidTextureHandle)
-                        m_texSys->Release(entry.handle, m_gfx);
-                    entry.path   = path;
-                    entry.handle = m_texSys->Acquire(path, *m_resMgr, m_gfx);
-                    outHandle    = 0;
-                }
-                if (entry.handle != Resource::kInvalidTextureHandle && m_texSys->IsReady(entry.handle))
-                    if (const RHI::Texture* tex = m_texSys->GetTexture(entry.handle))
-                        outHandle = m_gfx.GetTextureSRVGpuHandle(*tex);
-            };
-
-            const uint64_t prevIrr = m_skyboxTexCache[0].lastLoggedHandle;
-            const uint64_t prevRad = m_skyboxTexCache[1].lastLoggedHandle;
-            syncTex(m_skyboxTexCache[0], sc->irradiancePath, irradianceHandle);
-            syncTex(m_skyboxTexCache[1], sc->radiancePath,   radianceHandle);
-            syncTex(m_skyboxTexCache[2], sc->skyboxPath,     skyboxHandle);
-
-            if (irradianceHandle && irradianceHandle != prevIrr)
-            {
-                m_skyboxTexCache[0].lastLoggedHandle = irradianceHandle;
-                LOG_INFO("SyncSkyboxIBL: irradiance handle ready (gpu=0x%llX)", irradianceHandle);
-            }
-            if (radianceHandle && radianceHandle != prevRad)
-            {
-                m_skyboxTexCache[1].lastLoggedHandle = radianceHandle;
-                LOG_INFO("SyncSkyboxIBL: radiance handle ready (gpu=0x%llX)", radianceHandle);
-            }
-
-            sc->irradianceGpuHandle = irradianceHandle;
-            sc->radianceGpuHandle   = radianceHandle;
-            sc->skyboxGpuHandle     = skyboxHandle;
-        }
-
-        radianceMips = sc->radianceMipLevels;
-        // SkyboxComponent.iblStrength ignored — global setting on SkyIBLPass (Post Processing panel).
-        break; // only one skybox per scene
-    }
-
-    // Global IBL strength lives on SkyIBLPass.
-    if (m_skyIBLPass)
-        iblStrength = m_skyIBLPass->GetIBLStrength();
-
-    // BRDF LUT — fixed asset, loaded once.
-    static constexpr const char* kBRDFLUTPath = "asset/IBL/BRDF_LUT.itex";
-    uint64_t brdfLutHandle = 0;
-    if (m_texSys && m_resMgr)
-    {
-        if (m_brdfLutEntry.path.empty())
-        {
-            m_brdfLutEntry.path   = kBRDFLUTPath;
-            m_brdfLutEntry.handle = m_texSys->Acquire(kBRDFLUTPath, *m_resMgr, m_gfx);
-        }
-        if (m_brdfLutEntry.handle != Resource::kInvalidTextureHandle
-            && m_texSys->IsReady(m_brdfLutEntry.handle))
-        {
-            if (const RHI::Texture* tex = m_texSys->GetTexture(m_brdfLutEntry.handle))
-                brdfLutHandle = m_gfx.GetTextureSRVGpuHandle(*tex);
-        }
-    }
-
-    // SkyIBL: atmosphere drives SH/specular/backdrop by default. Disabled fallback priority: skybox > radiance > irradiance.
-    uint64_t shSourceHandle = skyboxHandle ? skyboxHandle
-                            : radianceHandle ? radianceHandle
-                            : irradianceHandle;
-    if (m_skyIBLPass)
-    {
-        m_skyIBLPass->SetSourceCubemap(shSourceHandle);
-
-        // Feed camera state to AP LUT so it builds world-space view rays matching deferred lighting.
-        if (m_lightCBMapped)
-        {
-            auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-            DirectX::XMFLOAT3 camPos{ lb->cameraPos[0], lb->cameraPos[1], lb->cameraPos[2] };
-            DirectX::XMFLOAT3 camFwd{ lb->cameraForward[0], lb->cameraForward[1], lb->cameraForward[2] };
-            m_skyIBLPass->SetCameraForAerial(camPos, camFwd, lb->invViewProj);
-        }
-
-        // TOD: when active SkyIBLPass owns the sun (no LightCB round-trip — that crushed night to 0.01 → flash).
-        const bool todActive = m_skyIBLPass->TickTimeOfDay(m_deltaTime);
-
-        if (todActive)
-        {
-            // TOD → LightCB so shading + CSM stay in sync with sky. LightCB.lightDir = -sunDir.
-            const DirectX::XMFLOAT3& sd = m_skyIBLPass->GetSunDir();
-            const DirectX::XMFLOAT3& sc = m_skyIBLPass->GetSunColor();
-            if (m_lightCBMapped)
-            {
-                auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-                lb->lightDir[0] = -sd.x; lb->lightDir[1] = -sd.y; lb->lightDir[2] = -sd.z;
-                lb->lightColor[0] = sc.x; lb->lightColor[1] = sc.y; lb->lightColor[2] = sc.z;
-            }
-            // Do NOT SetSunDir here — pass already authoritative.
-        }
-        else if (m_lightCBMapped)
-        {
-            // TOD off → directional light drives sun (0.01 floor only when nothing else provides color).
-            auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-            DirectX::XMFLOAT3 sunDir{ -lb->lightDir[0], -lb->lightDir[1], -lb->lightDir[2] };
-            DirectX::XMFLOAT3 sunCol{ lb->lightColor[0], lb->lightColor[1], lb->lightColor[2] };
-            const float minC = 0.01f;
-            if (sunCol.x < minC && sunCol.y < minC && sunCol.z < minC)
-                sunCol = { 10.0f, 10.0f, 10.0f };
-            m_skyIBLPass->SetSunDir(sunDir, sunCol);
-        }
-    }
-
-    const bool atmosphereOn = m_skyIBLPass && m_skyIBLPass->IsAtmosphereEnabled();
-    // Static mode skips every compute pass — gate on atmosphereOn so stale LUTs don't leak.
-    const bool skyUseSH     = atmosphereOn
-                           && m_skyIBLPass && m_skyIBLPass->IsSHValid();
-
-    // Atmosphere on → ensure non-zero IBL even without SkyboxComponent.
-    if (atmosphereOn && iblStrength <= 0.0f)
-        iblStrength = 1.0f;
-
-    // Effective mip count may come from SkyIBLPass's pre-filtered cube vs static radiance.
-    uint32_t cbRadianceMips = radianceMips;
-    if (m_skyIBLPass && m_skyIBLPass->IsSpecularValid())
-        cbRadianceMips = m_skyIBLPass->GetSpecularMipCount();
-
-    if (m_lightCBMapped)
-    {
-        auto* lb = static_cast<LightCB*>(m_lightCBMapped);
-        lb->iblRadianceMips = cbRadianceMips;
-        lb->iblStrength     = iblStrength;
-        lb->iblUseSH        = skyUseSH ? 1u : 0u;
-        // Per-frame ambient (editor slider on SkyIBLPass). Black = IBL-only indirect.
-        if (m_skyIBLPass)
-        {
-            const DirectX::XMFLOAT3& a = m_skyIBLPass->GetAmbientColor();
-            lb->ambient[0] = a.x; lb->ambient[1] = a.y; lb->ambient[2] = a.z;
-        }
-        // AP composite gated on atmosphere+valid+opt-in; first frame's ap.a=0 would multiply scene→black.
-        const bool apReady = m_skyIBLPass
-                          && m_skyIBLPass->IsAtmosphereEnabled()
-                          && m_skyIBLPass->IsAerialValid()
-                          && m_skyIBLPass->IsAerialCompositeEnabled();
-        lb->aerialMaxDistKm = apReady ? m_skyIBLPass->GetAerialMaxDistanceKm() : 0.0f;
-    }
-
-    // Atmosphere → prefer live SkyIBLPass specular; static → loaded .itex (SkyIBLPass cube would be stale).
-    uint64_t effectiveRadiance = radianceHandle;
-    uint32_t effectiveRadianceMips = radianceMips;
-    if (atmosphereOn && m_skyIBLPass && m_skyIBLPass->IsSpecularValid())
-    {
-        const uint64_t spec = m_skyIBLPass->GetSpecularSrvHandle();
-        if (spec)
-        {
-            effectiveRadiance     = spec;
-            effectiveRadianceMips = m_skyIBLPass->GetSpecularMipCount();
-        }
-    }
-
-    // SSR composite cache (same handle as LightingPass split-sum BRDF LUT).
-    m_brdfLutSrv             = brdfLutHandle;
-    // DDGI miss samples RADIANCE cube (sun disk preserved); irradiance would smear sun → L1 SH ≈ 0.
-    m_skyRadianceSrvForDDGI  = effectiveRadiance;
-
-    // Forward handles to passes
-    if (m_lightingPass)
-    {
-        m_lightingPass->SetIBL(irradianceHandle, effectiveRadiance, effectiveRadianceMips, iblStrength);
-        m_lightingPass->SetBRDFLUT(brdfLutHandle);
-        m_lightingPass->SetSkySH(m_skyIBLPass ? m_skyIBLPass->GetSHSrvHandle() : 0,
-                                 skyUseSH);
-        // AP: 3D LUT + max distance. Handle 0 → 1×1×1 fallback binds (inscatter=0, T=1, no-op).
-        if (m_skyIBLPass)
-            m_lightingPass->SetAerialPerspective(
-                m_skyIBLPass->GetAerialPerspectiveSrvHandle(),
-                m_skyIBLPass->GetAerialMaxDistanceKm());
-    }
-    if (m_transparentPass)
-    {
-        // Mirror LightingPass: procedural specular cube when atmosphere on (forward agrees w/ deferred).
-        // Diffuse stays on irradiance cube; iblUseSH=1 routes forward through EvalSH2.
-        m_transparentPass->SetIBL(irradianceHandle, effectiveRadiance,
-                                  effectiveRadianceMips, iblStrength);
-        m_transparentPass->SetBRDFLUT(brdfLutHandle);
-        m_transparentPass->SetSkySH(m_skyIBLPass ? m_skyIBLPass->GetSHSrvHandle() : 0);
-    }
-    if (m_skyboxPass)
-    {
-        const uint64_t staticFallback = skyboxHandle ? skyboxHandle
-                                      : radianceHandle ? radianceHandle
-                                      : irradianceHandle;
-        const uint64_t resolved = m_skyIBLPass
-            ? m_skyIBLPass->ResolveSkyboxSrvHandle(staticFallback)
-            : staticFallback;
-        m_skyboxPass->SetEnvMap(resolved);
-
-        // Analytic sun disk in PS for pixel-sharp result; uses whichever sun drives the atmosphere.
-        if (m_skyIBLPass)
-        {
-            const DirectX::XMFLOAT3& sd = m_skyIBLPass->GetSunDir();
-            const DirectX::XMFLOAT3& sc = m_skyIBLPass->GetSunColor();
-            // Real solar half-angle ≈ 0.27° (0.00465 rad); slightly tighter for crisp point.
-            m_skyboxPass->SetSun(sd, sc, /*half-angle rad*/ 0.005f,
-                                 /*intensity*/ 15.0f);
-
-            if (m_moonHandle == Resource::kInvalidTextureHandle && m_texSys && m_resMgr)
-                m_moonHandle = m_texSys->Acquire(
-                    "asset/Default_Texture/moon.itex", *m_resMgr, m_gfx);
-            if (m_moonSRV == 0 && m_texSys
-                && m_moonHandle != Resource::kInvalidTextureHandle
-                && m_texSys->IsReady(m_moonHandle))
-            {
-                if (const RHI::Texture* tex = m_texSys->GetTexture(m_moonHandle))
-                    m_moonSRV = m_gfx.GetTextureSRVGpuHandle(*tex);
-            }
-
-            // Moon disk independent of active-body lighting; fades smoothly across horizon (~1.5°).
-            m_skyboxPass->SetMoon(m_moonSRV,
-                                  m_skyIBLPass->IsMoonDiskVisible(),
-                                  m_skyIBLPass->GetMoonDir(),
-                                  m_skyIBLPass->GetMoonColor(),
-                                  /*half-angle rad*/ 0.026f);
-
-            // Stars drive off MOON altitude (not GetSunDir which is active lighting body).
-            // smoothstep(-0.20, 0.10, moonY): below=day/no stars; above=night/max; matches moon fade-in.
-            float moonY = m_skyIBLPass->GetMoonDir().y;
-            auto smoothstepF = [](float e0, float e1, float x) {
-                float t = std::clamp((x - e0) / (e1 - e0), 0.0f, 1.0f);
-                return t * t * (3.0f - 2.0f * t);
-            };
-            float nightAlpha = smoothstepF(-0.20f, 0.10f, moonY);
-
-            // Star twinkle: wraps every ~10 min for sin-phase float precision.
-            static float s_starTime = 0.0f;
-            s_starTime = std::fmod(s_starTime + m_deltaTime, 600.0f);
-
-            m_skyboxPass->SetStars(nightAlpha, s_starTime);
-        }
-    }
-}
-
-
-
 // ---------------------------------------------------------------------------
 void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
 {
     if (vpW == 0 || vpH == 0)  return;
-    if (!m_perObjectCBMapped)   return;
+    auto* pvCB = m_perObjectCB.Current(m_gfx);
+    if (!pvCB)                  return;
 
     m_vpWidth  = vpW;
     m_vpHeight = vpH;
 
-    // Build view from current camera orientation.
-    const float cp = std::cos(m_camera.pitch);
-    const float sp = std::sin(m_camera.pitch);
-    const float cy = std::cos(m_camera.yaw);
-    const float sy = std::sin(m_camera.yaw);
-    const XMVECTOR forward = XMVectorSet(sy * cp, -sp, cy * cp, 0.f);
+    // Build view from current camera pose (position + forward come from the
+    // camera entity's GlobalTransform — see App::Run / Renderer::SetCamera).
+    const XMVECTOR forward = XMVector3Normalize(XMLoadFloat3(&m_camera.forward));
     const XMVECTOR pos     = XMLoadFloat3(&m_camera.position);
     const XMVECTOR up      = XMVectorSet(0.f, 1.f, 0.f, 0.f);
 
@@ -4785,7 +2154,7 @@ void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
     // Current UNJITTERED VP for velocity (real motion only, not TAA jitter).
     XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.curViewProjNoJitter),
                     XMMatrixTranspose(viewProjNoJitter));
-    std::memcpy(m_perObjectCBMapped, &cb, sizeof(cb));
+    *pvCB = cb;
 
     XMStoreFloat4x4(&m_view.viewMatrix,              view);
     XMStoreFloat4x4(&m_view.projMatrix,              proj);              // jittered
@@ -4829,12 +2198,13 @@ void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
     }
 
     // LightCB camera + invViewProj (transposed for HLSL row-vector mul); cache for TAACB.
-    if (m_lightCBMapped)
+    if (m_lightCB.Current(m_gfx))
     {
-        auto* lb = static_cast<LightCB*>(m_lightCBMapped);
+        auto* lb = m_lightCB.Current(m_gfx);
         lb->cameraPos[0] = m_camera.position.x;
         lb->cameraPos[1] = m_camera.position.y;
         lb->cameraPos[2] = m_camera.position.z;
+        lb->viewMode     = (uint32_t)m_viewMode;   // global Lit/Unlit/Wireframe switch
 
         XMMATRIX invVP = XMMatrixTranspose(XMMatrixInverse(nullptr, viewProjJittered));
         XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(lb->invViewProj), invVP);
@@ -4843,9 +2213,9 @@ void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
     }
 
     // ---- Compute cascade shadow matrices ------------------------------------
-    if (m_shadowSystem && m_lightCBMapped)
+    if (m_shadowSystem && m_lightCB.Current(m_gfx))
     {
-        auto* lb = static_cast<LightCB*>(m_lightCBMapped);
+        auto* lb = m_lightCB.Current(m_gfx);
 
         ShadowSystem::FrameInput fi{};
         fi.view           = view;
@@ -4890,18 +2260,11 @@ void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
 // ---------------------------------------------------------------------------
 void Renderer::CreateConstantBuffers()
 {
-    // ---- PerViewCB ----------------------------------------------------------
+    // ---- PerViewCB (triple-buffered) ----------------------------------------
+    if (!m_perObjectCB.Create(m_gfx, "Renderer.PerViewCB"))
     {
-        RHI::GPUBufferDesc desc;
-        desc.size       = kPerViewCBSize;
-        desc.usage      = RHI::Usage::UPLOAD;
-        desc.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (!m_gfx.CreateBuffer(desc, m_perObjectCB))
-        {
-            m_perObjectCB.Reset();
-            return;
-        }
-        m_perObjectCBMapped = m_gfx.MapBuffer(m_perObjectCB);
+        LOG_ERROR("Renderer: PerViewCB creation failed");
+        return;
     }
     {
         m_vpWidth  = static_cast<uint32_t>(m_gfx.GetWidth());
@@ -4909,38 +2272,33 @@ void Renderer::CreateConstantBuffers()
         UploadFrameData(0, m_vpWidth, m_vpHeight);
     }
 
-    // ---- TerrainParams CB (UPLOAD, mapped) ---------------------------------
-    {
-        RHI::GPUBufferDesc desc;
-        desc.size       = kTerrainCBSize;
-        desc.usage      = RHI::Usage::UPLOAD;
-        desc.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (m_gfx.CreateBuffer(desc, m_terrainCB))
-            m_terrainCBMapped = m_gfx.MapBuffer(m_terrainCB);
-        else
-            LOG_ERROR("Renderer: TerrainCB creation failed");
-    }
+    // ---- TerrainParams CB (triple-buffered) --------------------------------
+    if (!m_terrainCB.Create(m_gfx, "Renderer.TerrainCB"))
+        LOG_ERROR("Renderer: TerrainCB creation failed");
 
-    // ---- InstanceBuffer (GPUInstanceData per instance, UPLOAD heap) ---------
+    // ---- InstanceBuffer (GPUInstanceData per instance, UPLOAD heap, triple-buffered)
     {
         RHI::GPUBufferDesc desc;
         desc.size       = static_cast<uint64_t>(kMaxInstances) * sizeof(GPUInstanceData);
         desc.stride     = sizeof(GPUInstanceData);
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
-        if (!m_gfx.CreateBuffer(desc, m_instanceBuffer))
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
         {
-            LOG_ERROR("Renderer: InstanceBuffer creation failed");
-            return;
+            if (!m_gfx.CreateBuffer(desc, m_instanceBuffer[i]))
+            {
+                LOG_ERROR("Renderer: InstanceBuffer[%u] creation failed", i);
+                return;
+            }
+            m_instanceBufferMapped[i] = m_gfx.MapBuffer(m_instanceBuffer[i]);
         }
-        m_instanceBufferMapped = m_gfx.MapBuffer(m_instanceBuffer);
     }
 
     // ---- ExecuteIndirect buffers --------------------------------------------
     {
         const uint64_t argSize = static_cast<uint64_t>(kMaxInstances) * sizeof(IndirectDrawCommand);
 
-        // DEFAULT heap: GPU-side indirect arg buffer
+        // DEFAULT heap: GPU-side indirect arg buffer (single — GPU-only, no CPU race)
         RHI::GPUBufferDesc desc;
         desc.size       = argSize;
         desc.stride     = sizeof(IndirectDrawCommand);
@@ -4948,39 +2306,39 @@ void Renderer::CreateConstantBuffers()
         desc.bind_flags = RHI::BindFlag::UNORDERED_ACCESS; // GPU culling will write here
         m_gfx.CreateBuffer(desc, m_indirectArgBuffer);
 
-        // UPLOAD heap: CPU staging
+        // UPLOAD heap: CPU staging (triple-buffered)
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::NONE;
-        if (m_gfx.CreateBuffer(desc, m_indirectArgUpload))
-            m_indirectArgMapped = m_gfx.MapBuffer(m_indirectArgUpload);
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
+        {
+            if (m_gfx.CreateBuffer(desc, m_indirectArgUpload[i]))
+                m_indirectArgMapped[i] = m_gfx.MapBuffer(m_indirectArgUpload[i]);
+        }
 
-        // Draw count buffer (4 bytes)
+        // Draw count buffer (4 bytes, DEFAULT — GPU-only)
         desc.size       = sizeof(uint32_t);
         desc.stride     = sizeof(uint32_t);
         desc.usage      = RHI::Usage::DEFAULT;
         desc.bind_flags = RHI::BindFlag::UNORDERED_ACCESS;
         m_gfx.CreateBuffer(desc, m_drawCountBuffer);
 
+        // Draw count staging (UPLOAD, triple-buffered)
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::NONE;
-        if (m_gfx.CreateBuffer(desc, m_drawCountUpload))
-            m_drawCountMapped = m_gfx.MapBuffer(m_drawCountUpload);
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
+        {
+            if (m_gfx.CreateBuffer(desc, m_drawCountUpload[i]))
+                m_drawCountMapped[i] = m_gfx.MapBuffer(m_drawCountUpload[i]);
+        }
 
         LOG_INFO("Renderer: ExecuteIndirect buffers ready (max %u commands)", kMaxInstances);
     }
 
-    // ---- LightCB ------------------------------------------------------------
+    // ---- LightCB (triple-buffered) ------------------------------------------
+    if (!m_lightCB.Create(m_gfx, "Renderer.LightCB"))
     {
-        RHI::GPUBufferDesc desc;
-        desc.size       = kLightCBSize;
-        desc.usage      = RHI::Usage::UPLOAD;
-        desc.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (!m_gfx.CreateBuffer(desc, m_lightCB))
-        {
-            m_lightCB.Reset();
-            return;
-        }
-        m_lightCBMapped = m_gfx.MapBuffer(m_lightCB);
+        LOG_ERROR("Renderer: LightCB creation failed");
+        return;
     }
     {
         auto norm3 = [](float x, float y, float z, float o[3]) {
@@ -4990,14 +2348,16 @@ void Renderer::CreateConstantBuffers()
         LightCB lb{};
         norm3(1.f, -2.f, 0.5f, lb.lightDir);
         lb.lightColor[0] = 1.f;  lb.lightColor[1] = 0.92f; lb.lightColor[2] = 0.82f;
-        lb.ambient[0]    = 0.1f; lb.ambient[1]    = 0.12f; lb.ambient[2]    = 0.18f;
         lb.cameraPos[0]  = m_camera.position.x;
         lb.cameraPos[1]  = m_camera.position.y;
         lb.cameraPos[2]  = m_camera.position.z;
-        std::memcpy(m_lightCBMapped, &lb, sizeof(lb));
+        // Seed every slot so the first kFrameSlots frames don't read junk before
+        // BuildScene_UploadLights has overwritten the slot the GPU is reading.
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
+            if (m_lightCB.mapped[i]) *m_lightCB.mapped[i] = lb;
     }
 
-    // ---- SpotShadow VP matrix buffer; persistent-mapped, transposed on write.
+    // ---- SpotShadow VP matrix buffer (triple-buffered) ----------------------
     {
         RHI::GPUBufferDesc desc;
         desc.size       = static_cast<uint64_t>(SpotShadowPass::kMaxCasters)
@@ -5006,22 +2366,29 @@ void Renderer::CreateConstantBuffers()
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         desc.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-        if (m_gfx.CreateBuffer(desc, m_spotShadowVPBuffer))
+        DirectX::XMFLOAT4X4 ident;
+        DirectX::XMStoreFloat4x4(&ident, DirectX::XMMatrixIdentity());
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
         {
-            m_spotShadowVPMapped = m_gfx.MapBuffer(m_spotShadowVPBuffer);
-            m_spotShadowVPSrv    = m_gfx.GetBufferSRVGpuHandle(m_spotShadowVPBuffer);
-            if (m_spotShadowVPMapped)
+            if (m_gfx.CreateBuffer(desc, m_spotShadowVPBuffer[i]))
             {
-                DirectX::XMFLOAT4X4 ident;
-                DirectX::XMStoreFloat4x4(&ident, DirectX::XMMatrixIdentity());
-                auto* dst = static_cast<DirectX::XMFLOAT4X4*>(m_spotShadowVPMapped);
-                for (uint32_t i = 0; i < SpotShadowPass::kMaxCasters; ++i)
-                    dst[i] = ident;
+                m_spotShadowVPMapped[i] = m_gfx.MapBuffer(m_spotShadowVPBuffer[i]);
+                m_spotShadowVPSrv[i]    = m_gfx.GetBufferSRVGpuHandle(m_spotShadowVPBuffer[i]);
+                if (m_spotShadowVPMapped[i])
+                {
+                    auto* dst = static_cast<DirectX::XMFLOAT4X4*>(m_spotShadowVPMapped[i]);
+                    for (uint32_t k = 0; k < SpotShadowPass::kMaxCasters; ++k)
+                        dst[k] = ident;
+                }
             }
         }
     }
 
     // ---- MaterialBuffer (StructuredBuffer<MaterialGPUData>, UPLOAD heap) ----
+    // Triple-buffered: matBuf is rewritten from scratch every frame in
+    // BuildDrawListAndUploadInstances (matIdx resets to 0 each frame). Without
+    // ringing it, CPU writes for frame N+1 race GPU reads for frame N → flicker
+    // in motion.
     {
         RHI::GPUBufferDesc desc;
         desc.size       = static_cast<uint64_t>(kMaxMaterials) * sizeof(Resource::MaterialGPUData);
@@ -5029,26 +2396,31 @@ void Renderer::CreateConstantBuffers()
         desc.usage      = RHI::Usage::UPLOAD;
         desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         desc.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-        if (!m_gfx.CreateBuffer(desc, m_materialBuffer))
+        for (uint32_t s = 0; s < kFrameSlots; ++s)
         {
-            LOG_ERROR("Renderer: MaterialBuffer creation failed");
-            return;
-        }
-        m_materialBufferMapped = m_gfx.MapBuffer(m_materialBuffer);
-
-        // Pre-fill with default PBR values so slot 0 always has valid data.
-        if (m_materialBufferMapped)
-        {
-            auto* data = static_cast<Resource::MaterialGPUData*>(m_materialBufferMapped);
-            for (uint32_t i = 0; i < kMaxMaterials; ++i)
+            if (!m_gfx.CreateBuffer(desc, m_materialBuffer[s]))
             {
-                data[i] = {};
-                data[i].roughnessMin = 0.0f;  data[i].roughnessMax = 0.5f;
-                data[i].metalnessMin = 0.0f;  data[i].metalnessMax = 0.0f;
-                data[i].reflectance  = 0.5f;  // F0 = 0.16 * 0.5² = 0.04
-                data[i].baseColor[0] = data[i].baseColor[1] =
-                data[i].baseColor[2] = data[i].baseColor[3] = 1.0f;
-                for (auto& id : data[i].textureHandleIds) id = -1;
+                LOG_ERROR("Renderer: MaterialBuffer slot %u creation failed", s);
+                return;
+            }
+            m_materialBufferMapped[s] = m_gfx.MapBuffer(m_materialBuffer[s]);
+
+            // Pre-fill EVERY slot with default PBR values so any of the first
+            // kFrameSlots frames reads valid data even before the first scene
+            // gather has written its visible materials.
+            if (m_materialBufferMapped[s])
+            {
+                auto* data = static_cast<Resource::MaterialGPUData*>(m_materialBufferMapped[s]);
+                for (uint32_t i = 0; i < kMaxMaterials; ++i)
+                {
+                    data[i] = {};
+                    data[i].roughnessMin = 0.0f;  data[i].roughnessMax = 0.5f;
+                    data[i].metalnessMin = 0.0f;  data[i].metalnessMax = 0.0f;
+                    data[i].reflectance  = 0.5f;  // F0 = 0.16 * 0.5² = 0.04
+                    data[i].baseColor[0] = data[i].baseColor[1] =
+                    data[i].baseColor[2] = data[i].baseColor[3] = 1.0f;
+                    for (auto& id : data[i].textureHandleIds) id = -1;
+                }
             }
         }
     }
@@ -5167,6 +2539,14 @@ void Renderer::InitSkinningSystems()
     m_beamSimPass->Init(m_gfx);
     m_beamSimPass->SetSystem(m_beamSystem.get());
 
+    // ---- Afterimage system (post-skinning vertex snapshot pool) -----------
+    m_afterimageSystem = std::make_unique<AfterimageSystem>();
+    m_afterimageSystem->Init(m_gfx, m_meshMgr.GetDescriptorHeap());
+
+    m_afterimageCapturePass = std::make_unique<AfterimageCapturePass>();
+    m_afterimageCapturePass->Init(m_gfx);
+    m_afterimageCapturePass->SetSystem(m_afterimageSystem.get());
+
     // ---- ClusterPass (clustered deferred lighting) ----
     m_clusterPass = std::make_unique<ClusterPass>();
     m_clusterPass->Init(m_gfx);
@@ -5191,39 +2571,16 @@ void Renderer::InitSkinningSystems()
     m_hiZPass = std::make_unique<HiZPass>();
     m_hiZPass->Init(m_gfx);
 
-    // SSR chain (see SSR_HiZ_Architecture_Prompt.md): DepthHier → trace → Resolve → Temporal → Upsample → Composite.
-    m_ssrPass = std::make_unique<SSRPass>();
-    m_ssrPass->Init(m_gfx);
-
-    m_ssrResolvePass = std::make_unique<SSRResolvePass>();
-    m_ssrResolvePass->Init(m_gfx);
-
-    m_ssrTemporalPass = std::make_unique<SSRTemporalPass>();
-    m_ssrTemporalPass->Init(m_gfx);
-
-    m_ssrUpsamplePass = std::make_unique<SSRUpsamplePass>();
-    m_ssrUpsamplePass->Init(m_gfx);
-
-    m_ssrCompositePass = std::make_unique<SSRCompositePass>();
-    m_ssrCompositePass->Init(m_gfx);
-
-    m_ssrDepthHierPass = std::make_unique<SSRDepthHierarchyPass>();
-    m_ssrDepthHierPass->Init(m_gfx);
-
-    // Karis firefly HDR mip pyramid for SSR resolve cone-footprint sampling.
-    m_sceneColorPyramidPass = std::make_unique<SceneColorPyramidPass>();
-    m_sceneColorPyramidPass->Init(m_gfx);
+    // SSR pipeline lives behind a single owning subsystem; see Graphics/SSR/SSRSubsystem.h.
+    m_ssrSubsystem = std::make_unique<SSRSubsystem>();
+    m_ssrSubsystem->Init(m_gfx);
 
     // Lighting reads UPSAMPLE output (1-frame latent) to dampen its specIBL by (1 - ssrConf).
-    if (m_lightingPass && m_ssrUpsamplePass)
+    if (m_lightingPass)
     {
-        const uint32_t rw = m_gfx.GetRenderWidth();
-        const uint32_t rh = m_gfx.GetRenderHeight();
-        m_ssrPass->EnsureTexture(rw, rh);
-        m_ssrResolvePass->EnsureTextures(rw, rh);
-        m_ssrTemporalPass->EnsureTextures(rw, rh);
-        m_ssrUpsamplePass->EnsureTexture(rw, rh);
-        m_lightingPass->SetSSRResult(m_ssrUpsamplePass->GetColorSrv());
+        uint64_t srv = m_ssrSubsystem->OnResize(m_gfx.GetRenderWidth(),
+                                                m_gfx.GetRenderHeight());
+        m_lightingPass->SetSSRResult(srv);
     }
 
     // ---- DebugWirePass (AABB + frustum wireframe) ----

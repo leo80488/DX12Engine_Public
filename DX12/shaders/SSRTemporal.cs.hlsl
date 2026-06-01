@@ -27,12 +27,18 @@ cbuffer SSRTemporalCB : register(b0, space2)
     // perceptible "reflection misaligned" look even on static frames.
     float4x4 invViewProj;           // current inverse (jittered)
     float4x4 prevViewProj;          // previous-frame viewProj (jittered)
-    uint     screenW;    uint   screenH;
-    float    invScreenW; float  invScreenH;
+    // Phase 3: dispatch + ping-pong at HALF-RES (traceW/H). Full-res dims
+    // (renderW/H) used for GBuffer depth / velocity Loads via this frame's
+    // sub-pixel jitter (must match the trace's pattern).
+    uint     traceW;     uint   traceH;
+    float    invTraceW;  float  invTraceH;
     uint     resetHistory;          // 1 = skip history read (frame 0 / resize)
     float    nearZ;      float  farZ;
-    float    _pad0;
+    uint     renderW;    uint   renderH;
+    uint     frameIndex; uint   _pad0;
 };
+
+// Phase 7: jitter table removed — temporal runs at full render res.
 
 Texture2D<float4>  gColorCurrent    : register(t0, space2);  // resolve color
 Texture2D<float4>  gColorHistory    : register(t1, space2);  // prev-frame temporal
@@ -122,18 +128,19 @@ float GetDisocclusion(float curLinZ, float prevLinZ)
 [numthreads(8, 8, 1)]
 void CSMain(uint3 DTid : SV_DispatchThreadID)
 {
-    if (DTid.x >= screenW || DTid.y >= screenH) return;
-    const int2   pixel = int2(DTid.xy);
-    const float2 uv    = (float2(pixel) + 0.5) * float2(invScreenW, invScreenH);
+    // Phase 7: full-res dispatch — one thread per GBuffer pixel.
+    if (DTid.x >= traceW || DTid.y >= traceH) return;
 
-    float4 current  = gColorCurrent.Load(int3(pixel, 0));
-    float  curVar   = gVarianceCurrent.Load(int3(pixel, 0));
-    float  depth    = gDepth.Load(int3(pixel, 0));
+    const int2   pixel = int2(DTid.xy);
+    const float2 uv    = (float2(pixel) + 0.5) * float2(invTraceW, invTraceH);
+
+    float4 current = gColorCurrent.Load(int3(pixel, 0));
+    float  curVar  = gVarianceCurrent.Load(int3(pixel, 0));
+    float  depth   = gDepth.Load(int3(pixel, 0));
 
     // ALWAYS update depth history before any early-out — sky pixels and
     // history-reset pixels still have valid GBuffer depth, and next frame's
-    // disocclusion test needs every texel populated (otherwise neighbouring
-    // pixels read zero and the 3×3 search fallback can't find a valid match).
+    // disocclusion test needs every texel populated.
     OutDepthHistory[pixel] = depth;
 
     // History reset — frame 0 or after resize.
@@ -153,7 +160,8 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     [unroll] for (int dx = -1; dx <= 1; ++dx)
     {
         int2 np = clamp(pixel + int2(dx, dy),
-                        int2(0, 0), int2(screenW - 1, screenH - 1));
+                        int2(0, 0),
+                        int2(int(traceW) - 1, int(traceH) - 1));
         float4 s = gColorCurrent.Load(int3(np, 0));
         float3 c = RGBToYCoCg(s.rgb);
         m1 += c; m2 += c * c; n++;
@@ -188,8 +196,8 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 
     if (disocc < kDisoccThreshold && InRange01(prevUV))
     {
-        // Search 3×3 for the tap whose depth matches best.
-        float2 dudv = float2(invScreenW, invScreenH);
+        // Search 3×3 in half-res UV space for the tap whose depth matches best.
+        float2 dudv = float2(invTraceW, invTraceH);
         float bestDisocc = disocc;
         float2 bestUV    = prevUV;
         [unroll] for (int sy = -1; sy <= 1; ++sy)

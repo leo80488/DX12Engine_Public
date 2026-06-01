@@ -49,14 +49,7 @@ void BloomPass::Init(IGraphicsDevice& gfx)
             LOG_ERROR("BloomPass: upsample PSO failed");
     }
 
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = 256 * (kSteps * 2); // 5 downsample + 5 upsample = 10 steps max
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "Bloom.CB");
 
     LOG_SUCCESS("BloomPass: initialized");
 }
@@ -120,6 +113,10 @@ RHI::CommandList BloomPass::Execute(RHI::CommandList cl)
 
     auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
 
+    auto* cbMapped = m_cb.Current(gfx);
+    uint8_t* cbBase = cbMapped ? cbMapped->bytes : nullptr;
+    const RHI::GPUBuffer& cbBuf = m_cb.CurrentBuffer(gfx);
+
     // Helper to transition a bloom texture
     auto transitionBloom = [&](int i, RHI::ResourceState to)
     {
@@ -155,9 +152,9 @@ RHI::CommandList BloomPass::Execute(RHI::CommandList cl)
         cb.firstDownsample = (i == 0) ? 1u : 0u;
         
         uint32_t byteOffset = cbOffsetIndex * 256;
-        if (m_cbMapped) std::memcpy(static_cast<uint8_t*>(m_cbMapped) + byteOffset, &cb, sizeof(cb));
+        if (cbBase) std::memcpy(cbBase + byteOffset, &cb, sizeof(cb));
 
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, byteOffset, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, byteOffset, cl);
         cbOffsetIndex++;
 
         uint64_t srvHandle = (i == 0) ? m_hdrSrvHandle
@@ -190,9 +187,9 @@ RHI::CommandList BloomPass::Execute(RHI::CommandList cl)
         cb.firstDownsample = 0;
         
         uint32_t byteOffset = cbOffsetIndex * 256;
-        if (m_cbMapped) std::memcpy(static_cast<uint8_t*>(m_cbMapped) + byteOffset, &cb, sizeof(cb));
+        if (cbBase) std::memcpy(cbBase + byteOffset, &cb, sizeof(cb));
 
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, byteOffset, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, byteOffset, cl);
         cbOffsetIndex++;
         gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_bloom[i]), cl);
         gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_bloom[i - 1]), cl);

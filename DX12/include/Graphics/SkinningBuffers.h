@@ -116,6 +116,10 @@ public:
     uint32_t GetCurrentNrmBindlessIdx()     const { return nrmBindlessIdx[m_frameSlot]; }
     uint32_t GetCurrentPrevPosBindlessIdx() const { return prevPosBindlessIdx[m_frameSlot]; }
 
+    // Active frame slot (0..kFramesInFlight-1). Used by callers that need to
+    // walk every slot transiently (e.g. RebindBindlessVertexRing) and restore.
+    uint32_t GetFrameSlot() const { return m_frameSlot; }
+
 private:
     RHI::GPUBuffer m_posBuffers[kFramesInFlight];
     RHI::GPUBuffer m_nrmBuffers[kFramesInFlight];

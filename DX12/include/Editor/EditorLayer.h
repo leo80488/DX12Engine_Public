@@ -4,7 +4,9 @@
 // Layout: MenuBar | top = Hierarchy | Viewport | Inspector | bottom = Resource.
 
 #include "ECS/ECS.h"
-#include "Editor/TimelineEditor.h"
+#include "ECS/NotifyTypes.h"            // TimelineComponent (scratch edit target)
+#include "Editor/NotifyTrackEditor.h"
+#include "Editor/TimelineEditor.h"      // Timeline::TimelineEditor — read-only bone-curve overlay
 #include "Editor/ImGuiManager.h"
 #include "Graphics/RenderTypes.h"
 #include "Reflection/ReflectionEditor.h"
@@ -22,8 +24,13 @@
 class IGraphicsDevice;
 class Renderer;
 class AnimationSystem;
+class ScriptSystem;
 struct GPUProfiler;
+struct ScriptComponent;
 namespace Resource { class TextureSystem; class ResourceManager; class AssetManager; class AnimationClipSystem; }
+namespace DX12Physics { class PhysicsSystem; }
+namespace Nav { class NavMeshSystem; }
+namespace AI { class AISystem; }
 
 enum class ViewportPlayState { Stopped, Playing, Paused };
 
@@ -46,6 +53,11 @@ public:
     void EndImGuiFrame(RHI::CommandList cmd);
     // Draws DockSpace + all panels. Call once per frame.
     void OnUIRender();
+    // Run editor actions that were queued from inside an ImGui frame (Load
+    // Scene, ...). MUST be called BEFORE BeginImGuiFrame and Renderer::Render
+    // so resource teardown happens outside any in-flight draw lists — see the
+    // comment on m_pendingLoadScenePath.
+    void ProcessPendingActions();
 
     // ===== System injection =====
     void SetGraphicsDevice(IGraphicsDevice* gfx)             { m_gfx = gfx; }
@@ -55,6 +67,19 @@ public:
     void SetCPUFrameTime(float ms)                           { m_cpuFrameMs = ms; }
     void SetAnimationClipSystem(Resource::AnimationClipSystem* acs) { m_animClipSys = acs; }
     void SetAnimationSystem(AnimationSystem* sys)            { m_animSys = sys; }
+    // Injected so the "Bake Collision Meshes" tool can flush PhysicsSystem's
+    // trimesh shape cache after a re-bake. Optional — feature is a no-op if null.
+    void SetPhysicsSystem(DX12Physics::PhysicsSystem* phys)  { m_physicsSys = phys; }
+    // Injected so the "Build NavMesh" tool can call Build / Save / Load on
+    // the active navmesh. Optional — feature is a no-op if null.
+    void SetNavMeshSystem(Nav::NavMeshSystem* nav)           { m_navSys = nav; }
+    // Injected so the AIComponent Inspector can resolve treePath → BTAsset
+    // via AcquireTree. Optional — feature degrades to a read-only field if null.
+    void SetAISystem(AI::AISystem* ai)                       { m_aiSys = ai; }
+    // Injected so the Script component Inspector can read a Logic script's
+    // `exposed` variable schema and push edited values onto the live Lua
+    // instance during Play. Optional — exposed-var UI is hidden if null.
+    void SetScriptSystem(ScriptSystem* sys)                  { m_scriptSys = sys; }
     void SetResourceSystems(Resource::TextureSystem* texSys, Resource::ResourceManager* rm)
     {
         m_textureSys  = texSys;
@@ -90,6 +115,12 @@ public:
     // ===== Window-toggle accessors =====
     void SetShowAnimDebug(bool show) { m_showAnimDebug = show; }
     bool GetShowAnimDebug() const    { return m_showAnimDebug; }
+    // Phase Debug panel — actual ImGui draw lives in App.cpp (needs the
+    // Scheduler ref), gated on this toggle. Off by default; the user
+    // opens it from Debug menu when they want to inspect per-phase /
+    // per-system timing.
+    void SetShowPhaseDebug(bool show) { m_showPhaseDebug = show; }
+    bool GetShowPhaseDebug() const    { return m_showPhaseDebug; }
 
     // ===== Callbacks =====
     // meshType: 0=Cube, 1=Sphere, 2=Cone (called when user picks from Create menu).
@@ -104,6 +135,9 @@ public:
     }
     // Called by App after Renderer::ResolvePick (1-frame delay).
     void SetPickResult(Entity entity);
+    // Read by App to push the editor's selection into Renderer::SetPickingOutlineEntity
+    // for the picking-highlight overlay.
+    Entity GetSelectedEntity() const { return m_selectedEntity; }
 
     // ===== Component editor registration =====
     // drawFn receives (live component ptr, world, selected entity).
@@ -130,6 +164,17 @@ public:
         };
         m_componentEditors[std::type_index(typeid(T))] = std::move(entry);
         m_componentLabels [std::type_index(typeid(T))] = label;
+    }
+
+    // Open the inspector header for T closed by default (saves vertical space
+    // for chunky/rarely-edited components like Visibility). User can still
+    // expand it; this only affects the initial state per ImGui's policy.
+    template<typename T>
+    void SetComponentDefaultCollapsed(bool collapsed)
+    {
+        auto it = m_componentEditors.find(std::type_index(typeid(T)));
+        if (it != m_componentEditors.end())
+            it->second.defaultCollapsed = collapsed;
     }
 
     // Bucket a registered component into an Add Component submenu (default "Misc").
@@ -179,12 +224,17 @@ private:
     void RenderResourcePanel();
     void RenderMeshLibraryTab();         // tab inside Resource panel
     void RenderPostProcessPanel();       // color grading / post-process settings
-    void RenderTimelinePanel();          // toggled by m_showTimeline
+    void RenderTimelinePanel();          // toggled by m_showTimeline (tabbed: Clip Asset / Entity)
+    void RenderClipAssetTab();           // edit notify tracks on a .ianim clip asset
+    void RenderEntityTimelineTab();      // legacy per-entity TimelineComponent editing
+    void LoadAnimForEdit(const std::string& path); // begin async .ianim load for the editor
+    bool SaveAnimEdit();                 // re-serialize the loaded resource to .ianim on disk
     void RenderProfilerPanel();          // toggled by m_showProfiler
     void RenderAnimationDebugWindow();   // toggled by m_showAnimDebug
     void RenderDecalMaterialsWindow();   // toggled from Tools menu
     void RenderSSRDebugWindow();         // toggled by m_showSSRDebug
     void RenderFontEditorWindow();       // toggled by m_showFontEditor
+    void RenderCameraSwitcherWindow();   // toggled by m_showCameraSwitcher
 
     // Asset browser internals.
     enum class AssetType { Texture, Shader, Mesh, Material, Scene, Prefab, Skeleton, Animation, Audio, Script, Folder, Unknown };
@@ -194,6 +244,11 @@ private:
 
     // Per-frame helpers.
     void RenderMaterialInspector(struct MaterialComponent& mat);
+    // Inspector block for a Script component's editor-exposed variables. Reads
+    // the schema from m_scriptSys, renders one typed ImGui widget per variable,
+    // and writes edits into the component's per-entity override map (pushing
+    // live during Play). No-op without a ScriptSystem or an `exposed` table.
+    void DrawScriptExposedVars(ScriptComponent& sc, World* world, Entity e);
     // Left-click pick + left-hold drag inside the viewport.
     void HandleViewportPicking(float imageMinX, float imageMinY,
                                float contentW,  float contentH,
@@ -214,6 +269,10 @@ private:
     Resource::AnimationClipSystem* m_animClipSys  = nullptr;
     AnimationSystem*               m_animSys      = nullptr;
     GPUProfiler*                   m_gpuProfiler  = nullptr;
+    DX12Physics::PhysicsSystem*    m_physicsSys   = nullptr;
+    Nav::NavMeshSystem*            m_navSys       = nullptr;
+    AI::AISystem*                  m_aiSys        = nullptr;
+    ScriptSystem*                  m_scriptSys    = nullptr;
 
     // ===== ECS state =====
     struct ComponentEditorEntry
@@ -225,10 +284,21 @@ private:
         std::function<void(World&, Entity)>        add;      // default-construct
         std::function<void(World&, Entity)>        remove;
         int                                        priority = 100;   // lower = first
+        bool                                       defaultCollapsed = false; // true → CollapsingHeader opens closed
         std::function<bool(World&, Entity)>        condition;        // null = always show
     };
     World*  m_world          = nullptr;
     Entity  m_selectedEntity = NullEntity;
+    // Two-click Hierarchy selection: first click in the Hierarchy panel
+    // updates m_hierarchyHighlight only (so the row highlights and is
+    // drag-source-ready); a second click on the already-highlighted entity
+    // promotes it to m_selectedEntity (which is what Inspector reads).
+    // m_lastSeenSelectedEntity tracks the previous frame's m_selectedEntity
+    // so external setters (Create / Duplicate / viewport picking) can drive
+    // both fields without explicitly touching m_hierarchyHighlight — the
+    // OnUIRender sync detects the change and re-aligns the two.
+    Entity  m_hierarchyHighlight     = NullEntity;
+    Entity  m_lastSeenSelectedEntity = NullEntity;
     std::unordered_map<std::type_index, ComponentEditorEntry> m_componentEditors;
     std::unordered_map<std::type_index, std::string>          m_componentLabels;
 
@@ -301,6 +371,7 @@ private:
 
     // ===== Window-toggle flags =====
     bool m_showAnimDebug         = false;
+    bool m_showPhaseDebug        = false;
     bool m_showSSRDebug          = false;
     bool m_showFontEditor        = false;
     bool m_showProbeVizSpheres   = true;       // walks "ReflectionProbe" Visibility each frame
@@ -308,21 +379,55 @@ private:
     bool m_showProfiler          = false;
     bool m_showPostProcess       = false;
     bool m_showDecalMaterials    = false;
+    bool m_showCameraSwitcher    = false;      // View → Camera Switcher
     bool m_tracerTestModeEnabled = false;      // Debug menu; T fires a tracer along view ray
 
-    // ===== Timeline editor =====
-    Timeline::TimelineEditor m_timelineEditor;
+    // ===== Animation timeline editor =====
+    // Two-tab panel (see RenderTimelinePanel):
+    //   * "Clip Asset"  — edit AnimNotify tracks that live ON a .ianim clip
+    //                     (Unreal AnimSequence-style); Save round-trips to disk.
+    //   * "Entity"      — legacy per-entity TimelineComponent editing.
+    // The shared NotifyTrackEditor drives both via a TimelineComponent target.
+    Editor::NotifyTrackEditor m_notifyTrackEditor;
+    Timeline::TimelineEditor  m_curveEditor;        // read-only bone-curve overlay
+
+    // ---- Clip-asset editing state ----
+    Resource::AnimHandle m_animEditHandle{};        // loaded .ianim handle (0 = none)
+    std::string          m_animEditPath;            // source path for Save
+    bool                 m_animEditReady   = false; // resource finished loading
+    int                  m_animEditClipIdx = 0;     // which clip in the resource we edit
+    int                  m_animEditClipMirrored = -1;// clip idx the scratch currently mirrors
+    TimelineComponent    m_clipScratch;             // NotifyTrackEditor edit target for the clip
+    bool                 m_animPreviewOnEntity = false; // mirror edits into the selected entity's bound clip
+    bool                 m_animShowCurves      = false;  // show the read-only bone-curve overlay
+    char                 m_animPathInput[260]  = {};     // manual path entry buffer
+    std::string          m_animSaveStatus;              // transient "Saved/Failed" message
 
     // ===== Profiler smoothing & history =====
     static constexpr int   kProfilerHistoryLen = 240;          // ~4 seconds at 60fps
     static constexpr float kProfilerEmaAlpha   = 0.05f;        // EMA smoothing factor
-    static constexpr int   kMaxProfilerPasses  = 32;
-    struct PassStats { const char* name = nullptr; float smoothedMs = 0.f; };
+    static constexpr int   kMaxProfilerPasses  = 128;
+    // Per-pass row: name + smoothed time + queue type (which queue recorded
+    // it). Queue type matches GPUProfiler::kQueueGraphics/Compute/Copy.
+    struct PassStats {
+        const char* name        = nullptr;
+        float       smoothedMs  = 0.f;
+        uint8_t     queueType   = 0;
+    };
     float     m_cpuFrameMs   = 0.f;
     float     m_cpuSmoothed  = 0.f;
-    float     m_gpuSmoothed  = 0.f;
+    // GPU smoothed values:
+    //   m_gpuEffectiveSmoothed — critical path = max(graphics, compute)
+    //   m_gpuGraphicsSmoothed  — total time on graphics queue
+    //   m_gpuComputeSmoothed   — total time on compute queue
+    // m_gpuHistory plots the effective frame so the user sees the actual
+    // wall-clock GPU cost rather than the sum of overlapping queues.
+    float     m_gpuSmoothed          = 0.f;   // legacy "sum of everything"
+    float     m_gpuEffectiveSmoothed = 0.f;
+    float     m_gpuGraphicsSmoothed  = 0.f;
+    float     m_gpuComputeSmoothed   = 0.f;
     float     m_cpuHistory[kProfilerHistoryLen]{};
-    float     m_gpuHistory[kProfilerHistoryLen]{};
+    float     m_gpuHistory[kProfilerHistoryLen]{};  // effective frame ms
     int       m_historyOffset = 0;                              // ring buffer write position
     PassStats m_passStats[kMaxProfilerPasses];
     int       m_passStatsCount = 0;
@@ -332,8 +437,16 @@ private:
 
     // ===== Post-process =====
     // Path of the currently-bound post-process config (.ippc). Updated by
-    // Save/Load buttons + LoadWorld; passed back into SaveWorld.
+    // Save/Load buttons + LoadScene; passed back into SaveScene.
     std::string m_postProcessConfigPath;
+
+    // Load Scene is requested from inside the MainMenuBar (mid ImGui frame).
+    // Running the tear-down inline frees descriptor heap slots that earlier
+    // ImGui::Image calls in the same frame already captured as raw GPU handles,
+    // which the driver then dereferences during EndImGuiFrame → crash inside
+    // nvwgf2umx.dll. We defer the actual reload to ProcessPendingActions(),
+    // called from App before the next BeginImGuiFrame.
+    std::string m_pendingLoadScenePath;
 
     // ===== Log panel =====
     bool m_logShowSuccess = true;

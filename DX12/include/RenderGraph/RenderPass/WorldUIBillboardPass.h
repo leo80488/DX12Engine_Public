@@ -19,6 +19,7 @@
 #include "Graphics/GraphicsStruct.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
+#include "Graphics/FrameCB.h"
 
 #include <DirectXMath.h>
 
@@ -69,15 +70,16 @@ private:
     ShaderLibrary    m_shaderLib;
     PSOCache         m_psoCache;
 
-    // Per-frame UPLOAD-heap vertex buffer.
-    RHI::GPUBuffer   m_vertexBuffer;
-    void*            m_vbMapped = nullptr;
+    // Per-frame UPLOAD-heap vertex buffer (triple-buffered ring).
+    // 3 == GraphicsDX12::FrameCount.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer   m_vertexBuffer[kFrameCount];
+    void*            m_vbMapped[kFrameCount] = {};
 
     // Stub CB at b1 (the engine's PerViewCB lives there in shared root sig;
     // we still upload our own un-jittered viewProj into this slot to avoid
     // TAA jitter visibly shifting world UI between frames).
-    RHI::GPUBuffer   m_cb;
-    void*            m_cbMapped = nullptr;
+    FrameCB<DirectX::XMFLOAT4X4> m_cb;
 
     int              m_samplerIdx = -1;
 

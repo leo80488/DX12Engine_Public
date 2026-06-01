@@ -11,6 +11,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 class AutoExposurePass : public RG::RenderPass
 {
@@ -67,12 +68,30 @@ private:
     RHI::ResourceState m_exposureState = RHI::ResourceState::UNDEFINED;
     // Staging buffer (UPLOAD) used to push `m_manualExposure` into
     // m_exposureBuffer when the pass is disabled. Persistently mapped.
-    RHI::GPUBuffer m_manualStaging;
-    void*          m_manualStagingMapped = nullptr;
+    // Triple-buffered — Execute() writes one slot per frame, then CopyBuffer
+    // queues a GPU read of that same slot; a single buffer would race the
+    // pending copy when CPU runs ahead.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_manualStaging[kFrameCount];
+    void*          m_manualStagingMapped[kFrameCount] = {};
 
     // Per-dispatch CB
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
+    struct alignas(16) AutoExposureCB
+    {
+        uint32_t width;
+        uint32_t height;
+        float    minLogLuma;
+        float    invLogLumaRange;
+        float    adaptationRate;
+        float    lowPercent;
+        float    highPercent;
+        float    minExposure;
+        float    maxExposure;
+        float    evBias;
+        float    keyValue;
+        float    pad[2];
+    };
+    FrameCB<AutoExposureCB> m_cb;
 
     uint64_t m_hdrSrvHandle = 0;
     uint32_t m_vpW = 0;

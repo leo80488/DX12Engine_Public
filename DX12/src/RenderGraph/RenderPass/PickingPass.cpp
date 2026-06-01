@@ -84,7 +84,10 @@ PSODesc PickingPass::BuildPSODesc() const
     desc.psID        = ShaderID::PickingID_PS;
     desc.inputLayout = InputLayoutType::None;   // PVF
 
-    desc.rs.cull_mode         = RHI::CullMode::BACK;
+    // No back-face culling: double-sided transparents (leaves, banners, decals)
+    // must be pickable from either side. PickingPass only executes on click
+    // frames (see Execute() early-out), so the extra raster cost is negligible.
+    desc.rs.cull_mode         = RHI::CullMode::NONE;
     desc.rs.depth_clip_enable = true;
 
     desc.dss.depth_enable     = true;
@@ -205,36 +208,38 @@ RHI::CommandList PickingPass::Execute(RHI::CommandList cl)
     cl.SetScissorRect(vpW, vpH);
     cl.SetPrimitiveTopology();
 
-    // ---- Draw all opaque packets -------------------------------------------
-    DrawList draws = cl.GetContext().GetDrawList(DrawFilter::Opaque);
-    const RHI::PipelineState* activePSO = nullptr;
+    // ---- Draw opaque + transparent packets ---------------------------------
+    // Transparent meshes share the same PSO (R32_UINT RTV, reverse-Z depth
+    // GREATER_EQUAL). Drawing them after opaques into our private depth buffer
+    // makes the frontmost-fragment win — same selection rule editors use
+    // (Blender / Unity / Unreal): clicking a glass cube picks the glass,
+    // regardless of its alpha.
+    const RHI::PipelineState* pso = m_psoCache.GetOrCreate(BuildPSODesc());
+    if (!pso || !pso->IsValid())
+        return cl;
+
     const uint64_t bindlessHandle = cl.GetBindlessTableHandle();
 
-    auto bindGlobals = [&]()
-    {
-        cl.BindDescriptorHeaps();
-        cl.BindBufferSRVByName(kInstanceBufSlot, "InstanceBuffer");
-        cl.BindBufferSRVByName(kMeshDescSlot,    "MeshDescriptors");
-        if (bindlessHandle)
-            cl.BindDescriptorTableHandle(kBindlessSlot, bindlessHandle);
-        cl.BindCBByName(0, "PerView");
-    };
+    cl.SetPipelineState(*pso);
+    cl.BindDescriptorHeaps();
+    cl.BindBufferSRVByName(kInstanceBufSlot, "InstanceBuffer");
+    cl.BindBufferSRVByName(kMeshDescSlot,    "MeshDescriptors");
+    if (bindlessHandle)
+        cl.BindDescriptorTableHandle(kBindlessSlot, bindlessHandle);
+    cl.BindCBByName(0, "PerView");
 
-    for (const DrawPacket& dp : draws)
+    auto drawList = [&](DrawFilter f)
     {
-        const RHI::PipelineState* pso = m_psoCache.GetOrCreate(BuildPSODesc());
-        if (!pso || !pso->IsValid()) continue;
-
-        if (pso != activePSO)
+        for (const DrawPacket& dp : cl.GetContext().GetDrawList(f))
         {
-            cl.SetPipelineState(*pso);
-            activePSO = pso;
-            bindGlobals();
+            cl.SetPVFRootConstants(dp.meshDescriptorIndex,
+                                   dp.instanceOffset,
+                                   dp.materialIndex);
+            cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
         }
-
-        cl.SetPVFRootConstants(dp.meshDescriptorIndex, dp.instanceOffset, dp.materialIndex);
-        cl.DrawInstanced(dp.vertexOrIndexCount, dp.instanceCount, 0, 0);
-    }
+    };
+    drawList(DrawFilter::Opaque);
+    drawList(DrawFilter::Transparent);
 
     // ---- Copy picked pixel to readback buffer (only if requested this frame) --
     if (m_pickRequested

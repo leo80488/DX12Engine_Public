@@ -1,17 +1,21 @@
 #include "App.h"
-#include "System/Log.h"
-#ifdef WITH_EDITOR
-#include "imgui/imgui.h"
-#endif
-#include "System/Timer.h"
-#include "System/FileWatcher.h"
-#ifdef WITH_EDITOR
-#include "Editor/EditorLayer.h"
-#endif
-#include "Graphics/IGraphicsDevice.h"
-#include "Graphics/GraphicsDX12.h"
-#include "Graphics/Renderer.h"
-#include "Graphics/RenderTypes.h"
+
+// ---- Engine / ECS ----------------------------------------------------------
+#include "ECS/EngineSystems.h"
+#include "ECS/TimelineSystem.h"
+#include "ECS/NotifyConsumerSystems.h"
+#include "ECS/VideoSystem.h"
+#include "ECS/LifetimeComponent.h"
+#include "ECS/FrameContext.h"
+#include "ECS/Components.h"
+#include "ECS/HierarchyComponents.h"   // LocalTransform / GlobalTransform
+#include "ECS/LuaCharacterStateBindings.h"
+#include "ECS/LuaPlayerBindings.h"
+#include "ECS/CameraStackSystem.h"
+#include "ECS/CameraStackComponents.h"
+#include "ECS/GuidRegistry.h"
+
+// ---- Scene -----------------------------------------------------------------
 #include "Scene/TestScene.h"
 #include "Scene/TitleScene.h"
 #include "Scene/GameScene.h"
@@ -19,35 +23,32 @@
 #include "Scene/ShaderLabScene.h"
 #include "Scene/MeshSpawner.h"
 #include "Scene/TransformSystem.h"
-#include "ECS/Components.h"
-#include "System/EventBus.h"
-#include "AI/LuaBTBindings.h"
-#include "Audio/AudioEvents.h"
-#include "UI/UISystem.h"
-#include "UI/UIComponents.h"
-#include "UI/Font.h"
-#include "UI/LuaUIBindings.h"
-#include "RenderGraph/RenderPass/UIPass.h"
-#include "System/Mouse.h"
-#include "System/Keyboard.h"
 
-// Resource system headers (for per-frame pumps and shutdown)
+// ---- Graphics --------------------------------------------------------------
+#include "Graphics/IGraphicsDevice.h"
+#include "Graphics/GraphicsDX12.h"
+#include "Graphics/Renderer.h"
+#include "Graphics/AfterimageSystem.h"
+#include "Graphics/RenderTypes.h"
+#include "RenderGraph/RenderPass/DebugWirePass.h"
+#include "RenderGraph/RenderPass/UIPass.h"
+#include "Tools/CollisionMeshBaker.h"
+
+// ---- Resource (loaders + importers) ----------------------------------------
 #include "Resource/ResourceManager.h"
 #include "Resource/TextureSystem.h"
 #include "Resource/MeshSystem.h"
 #include "Resource/MaterialSystem.h"
 #include "Resource/BCCompressor.h"
 #include "Resource/AssetFS.h"
-
-// Loaders — internal format → Resource object
 #include "Resource/TextureLoader.h"
 #include "Resource/ShaderLoader.h"
 #include "Resource/MaterialLoader.h"
+#include "Resource/AnimationLoader.h"
+#include "Resource/AnimationClipSystem.h"
 #include "Audio/AudioClipLoader.h"
-
 #ifdef WITH_EDITOR
-// Importers — external source format → internal blob (editor-only;
-// runtime only loads already-imported .itex/.imsh/.imat/.ianim/.aclip).
+// Importers are editor-only; runtime loads pre-imported .itex/.imsh/.imat/.ianim/.aclip.
 #include "Resource/TextureImporter.h"
 #include "Resource/ShaderImporter.h"
 #include "Resource/MaterialImporter.h"
@@ -56,88 +57,79 @@
 #include "Audio/AudioImporter.h"
 #endif
 
-// Animation resource system
-#include "Resource/AnimationLoader.h"
-#include "Resource/AnimationClipSystem.h"
+// ---- Audio / UI / AI / Nav / Physics --------------------------------------
+#include "Audio/AudioEvents.h"
+#include "UI/UISystem.h"
+#include "UI/UIComponents.h"
+#include "UI/Font.h"
+#include "UI/LuaUIBindings.h"
+#include "AI/LuaBTBindings.h"
+#include "Nav/NavAgentSystem.h"
+#include "Nav/LuaNavBindings.h"
+#include "Intent/LuaIntentBindings.h"
+#include "Intent/LuaAIBindings.h"
+#include "Physics/LuaPhysicsBindings.h"
 
-static const UINT WindowWidth  = 1920;
-static const UINT WindowHeight = 1080;
+// ---- System / Input --------------------------------------------------------
+#include "System/TaskSystem.h"
+#include "System/Log.h"
+#include "System/Timer.h"
+#include "System/FileWatcher.h"
+#include "System/EventBus.h"
+#include "System/Mouse.h"
+#include "System/Keyboard.h"
+#include "Input/InputSystem.h"
 
-// Component editor registrations moved to EditorLayer::RegisterDefaultEditors().
+#ifdef WITH_EDITOR
+#include "Editor/EditorLayer.h"
+#include "imgui/imgui.h"
+#endif
 
+#define SOL_ALL_SAFETIES_ON 1
+#include <sol/sol.hpp>
+
+static const UINT  WindowWidth  = 1920;
+static const UINT  WindowHeight = 1080;
+static const float kClearColor[4] = { 0.05f, 0.05f, 0.1f, 1.0f };
+
+// ===========================================================================
+// Construction / Run
+// ===========================================================================
 
 App::App()
-    : wnd(WindowWidth, WindowHeight, L"DX12 \u2014 Deferred Rendering")
+    : wnd(WindowWidth, WindowHeight, L"DX12 — Deferred Rendering")
 {
     LOG_INFO("App initialized");
 #ifdef WITH_EDITOR
     m_editorLayer.OnAttach();
 #else
-    // Game build: scene always fills the backbuffer.
-    m_viewportFullscreen = true;
+    m_viewportFullscreen = true;   // Game build: scene always fills backbuffer.
 #endif
 }
 
 int App::Run()
 {
-    const float clearColor[4] = { 0.05f, 0.05f, 0.1f, 1.0f };
-
-    // Mount game.ipak if present. Release ships with a pak (single sealed
-    // archive, fast cold-start); Editor/dev runs ignore this and read loose
-    // files off disk, which AssetFS::ReadFile falls back to automatically.
+    // Release ships with game.ipak (single sealed archive). Editor/dev runs
+    // fall back to loose files automatically via AssetFS::ReadFile.
     ::Resource::AssetFS::Get().Mount("game.ipak");
 
     IGraphicsDevice& backend = wnd.Gfx();
 
-    // ---- Register resource loaders (internal format → Resource) --------
-    m_resourceMgr.RegisterLoader(std::make_shared<Resource::TextureLoader>());
-    m_resourceMgr.RegisterLoader(std::make_shared<Resource::ShaderLoader>(&backend));
-    m_resourceMgr.RegisterLoader(std::make_shared<Resource::MaterialLoader>());
-    m_resourceMgr.RegisterLoader(std::make_shared<Resource::AnimationLoader>());
-    m_resourceMgr.RegisterLoader(std::make_shared<Audio::AudioClipLoader>());
-
-#ifdef WITH_EDITOR
-    // ---- Register importers (external source → internal blob) ----------
-    m_resourceMgr.RegisterImporter(std::make_shared<Resource::TextureImporter>());
-    m_resourceMgr.RegisterImporter(std::make_shared<Resource::ShaderImporter>());
-    m_resourceMgr.RegisterImporter(std::make_shared<Resource::MaterialImporter>());
-    m_resourceMgr.RegisterImporter(std::make_shared<Resource::AnimationImporter>());
-    m_resourceMgr.RegisterImporter(std::make_shared<Resource::VmdImporter>());
-    m_resourceMgr.RegisterImporter(std::make_shared<Audio::AudioImporter>());
-#endif
-
+    RegisterResourceLoaders(backend);
     backend.InitPSOLibrary("pso_cache.bin");
 
-    // ---- Initialize AssetManager + AnimationClipSystem ---------------------
     m_assetMgr.Init(m_meshSys, m_textureSys, m_resourceMgr, backend);
     m_animClipSys.Init(m_resourceMgr);
 
-    // Bake the default UI font (FreeType → R8G8B8A8 atlas) and register it
-    // as the global text provider so UIDrawList::AddText / TextWidget /
-    // ButtonWidget labels render out of the box. Falls back silently to a
-    // no-op text path if the TTF isn't on disk.
-    {
-        // FGMiraiRen ships with the engine; switch to any TTF asset path here.
-        constexpr const char* kDefaultTTF = "asset/font/FGMiraiRen.ttf";
-        if (UI::DefaultFont().Init(backend, kDefaultTTF, /*pixelSize*/ 24.f))
-            UI::DefaultFont().InstallAsGlobal();
-        else
-            LOG_WARNING("UI font init failed — text rendering disabled");
-    }
+    // GUID registry — install destroy listener so entities with
+    // GuidComponent auto-unregister when they die. SceneSerializer
+    // separately Clears + RebuildFromWorld around each Load Scene.
+    ECS::GuidRegistry::Get().RegisterWithWorld(m_world);
 
-    // Wire UI mouse-capture into Window. When the cursor sits over a
-    // hit-testable widget, ImGui-style camera drag / picking should not
-    // fire — Window::ProcessMessage queries this on every input message.
-    // ImGui already installs its own hook in editor builds; combine the two
-    // via a Lambda forward so neither overrides the other.
-#ifdef WITH_EDITOR
-    {
-        // Editor: ImGui already owns the hook (set in InitImGuiBackends).
-        // The combined predicate is "ImGui wants OR UI wants".
-        // Install AFTER InitImGuiBackends so we wrap the existing one.
-        // (Done below, inside the editor wiring block.)
-    }
-#else
+    InitUIFont(backend);
+
+#ifndef WITH_EDITOR
+    // Game build: UI alone owns mouse/keyboard capture (no ImGui involved).
     Window::SetWantCaptureMouse(&UI::UISystem::GlobalWantsCaptureMouse);
     Window::SetWantCaptureKeyboard(&UI::UISystem::GlobalWantsCaptureKeyboard);
 #endif
@@ -150,30 +142,329 @@ int App::Run()
     renderer.SetTextureSystem(m_assetMgr.GetTextureSystem());
     renderer.SetResourceManager(m_assetMgr.GetResourceManager());
 
-    // ---- Engine systems (App-owned; persist across scene switches) ---------
-    // World, Script, Physics, Camera all live here. IScene::Init runs against
-    // the World below via ctx.world; engine systems tick uniformly in the
-    // main loop regardless of which IScene is active.
+    // ---- Engine systems (App-owned; persist across scene switches) --------
     m_scriptSystem.Initialize();
     m_scriptSystem.BindWorld(m_world);
+    // Boot scan loads services/*.lua and systems/*.lua; Logic templates load
+    // lazily on first ScriptComponent sight (per Script_Architecture §6.2).
+    m_scriptSystem.ScanScriptDirectory("asset/scripts");
 
-    // BT runtime shares ScriptSystem's sol::state — single VM, hot-reload
-    // and event bridges stay coherent. RegisterLuaBTBindings creates the
-    // empty Actions / Conditions tables that .bt.lua scripts populate.
-    if (sol::state* lua = m_scriptSystem.GetLua())
-    {
-        AI::RegisterLuaBTBindings(*lua);
-        UI::RegisterLuaUIBindings(*lua, m_world);
-        m_aiSystem.Init(lua);
-    }
+    InitLuaBindings(renderer);
 
     m_physicsSystem.Init();
+    InitAudio();
 
-    // Audio. Initialise the XAudio2 engine + clip system first, then wire
-    // the systems (events + per-frame ticks) so PlaySoundEvent / Stop /
-    // SetParam work immediately. AudioSystem installs an entity-destroy
-    // listener on the World so component teardown stops live voices and
-    // releases clip refcounts.
+    // ---- Build GameModeContext -------------------------------------------
+    GameModeContext ctx{ backend, renderer };
+    ctx.resourceMgr = &m_resourceMgr;
+    ctx.textureSys  = &m_textureSys;
+    ctx.meshSys     = &m_meshSys;
+    ctx.meshLib     = &m_meshLib;
+    ctx.matSys      = &m_matSys;
+    ctx.assetMgr    = &m_assetMgr;
+    ctx.world       = &m_world;
+
+    std::unique_ptr<IGameMode> pendingMode;
+    ctx.requestReplaceMode = [&pendingMode](std::unique_ptr<IGameMode> next) {
+        pendingMode = std::move(next);
+    };
+
+    // Initial mode varies by build: ShaderLab tool / Editor target / Game flow.
+#ifdef WITH_SHADERLAB
+    m_gameModeStack.PushMode(std::make_unique<ShaderLabScene>(), ctx);
+#elif defined(WITH_EDITOR)
+    m_gameModeStack.PushMode(std::make_unique<TestScene>(), ctx);
+#else
+    m_gameModeStack.PushMode(std::make_unique<TitleScene>(), ctx);
+#endif
+
+#ifdef WITH_EDITOR
+    WireEditor(backend, renderer, ctx);
+#endif
+
+    RegisterTickSystems(backend, renderer, ctx);
+
+    Timer timer;
+
+    // Watch shaders/ for .hlsl/.hlsli writes; on change, drop in-memory shader
+    // + PSO caches so every reload-aware pass re-fetches. Dev-only but cheap.
+    HotReload::FileWatcher shaderWatcher;
+    shaderWatcher.Init("shaders");
+
+    while (true)
+    {
+        // Hot-reload — drained BEFORE BeginFrame so no in-flight CL still
+        // references the old PSOs. FlushAndWait is the easy hammer for v1.
+        {
+            const auto changed = shaderWatcher.PollChanges();
+            if (!changed.empty())
+            {
+                LOG_INFO("Hot-reload: %zu shader file(s) changed", changed.size());
+                backend.FlushAndWait();
+                renderer.ReloadShaders();
+            }
+        }
+
+        if (auto ecode = Window::ProcessMessage())
+        {
+            m_gameModeStack.PopMode();
+            ShutdownAllSystems(backend);
+            backend.SavePSOLibrary("pso_cache.bin");
+            return *ecode;
+        }
+
+        const float dt = timer.Mark();
+
+        // Snapshot input ONCE per frame so every consumer below sees the same
+        // edge-state (WasKeyPressed/Released). Must precede every input read.
+        Input::Get().Update();
+
+        LARGE_INTEGER cpuStart, cpuEnd, cpuFreq;
+        QueryPerformanceCounter(&cpuStart);
+
+#ifdef WITH_EDITOR
+        if (Input::Get().WasKeyPressed(VK_F11))
+            m_viewportFullscreen = !m_viewportFullscreen;
+#endif
+
+        UpdateViewportSize(ctx, backend);
+
+#ifdef WITH_EDITOR
+        ctx.viewportRightMouseHeld = m_editorLayer.IsViewportRightDragging();
+        m_editorLayer.GetViewportMouseDelta(ctx.mouseViewportDX, ctx.mouseViewportDY);
+#else
+        ctx.viewportRightMouseHeld = false;
+        ctx.mouseViewportDX = 0.f;
+        ctx.mouseViewportDY = 0.f;
+#endif
+
+        // Promote async-loaded resources to GPU (2 ms budget) + flush dirty mats.
+        m_resourceMgr.ProcessPendingGPUUploads(2.0f);
+        m_matSys.Tick(m_textureSys, backend);
+
+        ctx.deltaTime = dt;
+
+        RefreshMainCamera();
+        TickCamera(dt, ctx);
+
+        // ---- Editor play/stop/step gate -----------------------------------
+        // Editor: Playing → real dt. Stopped/Paused → skip ticks unless Step
+        // was clicked (one fixed 1/60s frame). Game build: always real dt.
+        float effectiveDt = dt;
+        bool  runUpdate   = true;
+#ifdef WITH_EDITOR
+        {
+            const ViewportPlayState ps = m_editorLayer.GetPlayState();
+            const bool wantsStep       = m_editorLayer.ConsumeWantsStepFrame();
+            const bool isPaused        = (ps == ViewportPlayState::Stopped ||
+                                          ps == ViewportPlayState::Paused);
+            if (isPaused)
+            {
+                if (wantsStep) effectiveDt = 1.0f / 60.0f;
+#ifndef WITH_SHADERLAB
+                // ShaderLab ignores Stopped/Paused — tools-driven animation
+                // (turntable, future timeline scrub) needs to keep ticking.
+                else           runUpdate   = false;
+#endif
+            }
+        }
+#endif
+        // scaledDt feeds gameplay/physics/AI; deltaTime feeds hit-stop / UI.
+        const float scaledDt = effectiveDt * m_scriptSystem.GetTimeScale();
+
+        FrameContext frameCtx;
+        frameCtx.deltaTime        = effectiveDt;
+        frameCtx.scaledDeltaTime  = scaledDt;
+        frameCtx.fixedDeltaTime   = 1.0f / 60.0f;
+        frameCtx.frameIndex       = ctx.frame;
+        frameCtx.isFixedTickPhase = false;
+        frameCtx.runUpdate        = runUpdate;
+        frameCtx.cameraEntity     = static_cast<uint32_t>(m_cameraEntity);
+        frameCtx.commandBuffer    = &m_commandBuffer;
+        frameCtx.jobSystem        = &TaskSystem::Get();
+
+        // ---- Variable-rate simulation phases ------------------------------
+        m_scheduler.RunPhase(TickPhase::Input,             m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::GameplayPreLogic,  m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::GameplayLogic,     m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::GameplayPostLogic, m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::AI,                m_world, frameCtx);
+
+        RunFixedPhysicsLoop(scaledDt, frameCtx);
+
+        // Mode transition drain — kept inline (not a System adapter) because
+        // IGameMode::Init needs the live GameModeContext built from local refs.
+        if (runUpdate && pendingMode)
+        {
+            m_gameModeStack.PopMode();
+            m_gameModeStack.PushMode(std::move(pendingMode), ctx);
+            pendingMode.reset();
+        }
+
+        m_scheduler.RunPhase(TickPhase::PhysicsInterpolation, m_world, frameCtx);
+
+        // Drain the upcoming swap-chain slot's GPU fence BEFORE Animation —
+        // Animation writes per-frame upload-buffer slots the GPU is still
+        // reading from N-FrameCount ago. backend.BeginFrame sees the flag and
+        // skips its own redundant wait.
+        backend.WaitForNextFrameSlot();
+        m_scheduler.RunPhase(TickPhase::Animation,        m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::BoneAttachment,   m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::SecondaryPhysics, m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::PreRender,        m_world, frameCtx);
+
+        // Forward the resolved Live camera to the Renderer. CameraResolveSystem
+        // (PreRender) just blended the stack into LiveCameraComponent on the
+        // Main channel entity. Fall back to the legacy CameraComponent path
+        // if the channel entity doesn't exist yet (first frame before TickCamera
+        // backfilled it, or scenes without any camera).
+        bool sentCamera = false;
+        if (Entity ch = Camera::FindChannelEntity(m_world, Camera::kMainChannel);
+            ch != NullEntity)
+        {
+            if (auto* live = m_world.GetComponent<LiveCameraComponent>(ch))
+            {
+                RenderCamera rc;
+                rc.position = live->position;
+                rc.forward  = live->forward;
+                rc.fov      = live->fov;
+                rc.nearZ    = live->nearZ;
+                rc.farZ     = live->farZ;
+                rc.historyValid = live->historyValid;
+                renderer.SetCamera(rc);
+                sentCamera = true;
+            }
+        }
+        if (!sentCamera)
+        if (CameraComponent* cam = m_world.GetComponent<CameraComponent>(m_cameraEntity))
+        {
+            if (const GlobalTransform* gt =
+                    m_world.GetComponent<GlobalTransform>(m_cameraEntity))
+            {
+                const DirectX::XMMATRIX world = DirectX::XMLoadFloat4x4(&gt->matrix);
+                RenderCamera rc;
+                DirectX::XMStoreFloat3(&rc.position, world.r[3]);
+                DirectX::XMStoreFloat3(&rc.forward,
+                                       DirectX::XMVector3Normalize(world.r[2]));
+                rc.fov   = cam->fov;
+                rc.nearZ = cam->nearZ;
+                rc.farZ  = cam->farZ;
+                renderer.SetCamera(rc);
+            }
+        }
+
+        m_scheduler.RunPhase(TickPhase::Render,     m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::PostRender, m_world, frameCtx);
+
+        QueryPerformanceCounter(&cpuEnd);
+        QueryPerformanceFrequency(&cpuFreq);
+#ifdef WITH_EDITOR
+        m_editorLayer.SetCPUFrameTime(
+            static_cast<float>(cpuEnd.QuadPart - cpuStart.QuadPart) * 1000.0f
+            / static_cast<float>(cpuFreq.QuadPart));
+
+        Entity pickedEntity;
+        if (renderer.ResolvePick(pickedEntity))
+            m_editorLayer.SetPickResult(pickedEntity);
+#else
+        (void)cpuEnd; (void)cpuFreq;
+#endif
+
+        ++ctx.frame;
+    }
+}
+
+// ===========================================================================
+// Run() helpers — initialisation
+// ===========================================================================
+
+void App::RegisterResourceLoaders(IGraphicsDevice& backend)
+{
+    // Internal format → Resource object.
+    m_resourceMgr.RegisterLoader(std::make_shared<Resource::TextureLoader>());
+    m_resourceMgr.RegisterLoader(std::make_shared<Resource::ShaderLoader>(&backend));
+    m_resourceMgr.RegisterLoader(std::make_shared<Resource::MaterialLoader>());
+    m_resourceMgr.RegisterLoader(std::make_shared<Resource::AnimationLoader>());
+    m_resourceMgr.RegisterLoader(std::make_shared<Audio::AudioClipLoader>());
+
+#ifdef WITH_EDITOR
+    // External source → internal blob.
+    m_resourceMgr.RegisterImporter(std::make_shared<Resource::TextureImporter>());
+    m_resourceMgr.RegisterImporter(std::make_shared<Resource::ShaderImporter>());
+    m_resourceMgr.RegisterImporter(std::make_shared<Resource::MaterialImporter>());
+    m_resourceMgr.RegisterImporter(std::make_shared<Resource::AnimationImporter>());
+    m_resourceMgr.RegisterImporter(std::make_shared<Resource::VmdImporter>());
+    m_resourceMgr.RegisterImporter(std::make_shared<Audio::AudioImporter>());
+#endif
+}
+
+void App::InitUIFont(IGraphicsDevice& backend)
+{
+    // FGMiraiRen ships with the engine. Falls back silently to a no-op text
+    // path if the TTF isn't on disk.
+    constexpr const char* kDefaultTTF = "asset/font/FGMiraiRen.ttf";
+    if (UI::DefaultFont().Init(backend, kDefaultTTF, /*pixelSize*/ 24.f))
+        UI::DefaultFont().InstallAsGlobal();
+    else
+        LOG_WARNING("UI font init failed — text rendering disabled");
+}
+
+void App::InitLuaBindings(Renderer& renderer)
+{
+    sol::state* lua = m_scriptSystem.GetLua();
+    if (!lua) return;
+
+    AI::RegisterLuaBTBindings(*lua);
+    UI::RegisterLuaUIBindings(*lua, m_world);
+    Nav::RegisterLuaNavBindings(*lua, m_navSystem, m_world);
+    Intent::RegisterLuaIntentBindings(*lua, m_world);
+    Intent::RegisterLuaAIBindings(*lua, m_world);
+    DX12Physics::RegisterLuaPhysicsBindings(*lua, m_physicsSystem);
+    RegisterLuaCharacterStateBindings(*lua, m_world);
+    RegisterLuaPlayerBindings(*lua, m_world);
+    m_aiSystem.Init(lua);
+
+    // VFX.SpawnAfterimage(entity, lifetime, r, g, b) — pushes a skinned-pose
+    // ghost-trail snapshot into the renderer's afterimage pool (HDR colour).
+    {
+        sol::table vfx = lua->create_named_table("VFX");
+        vfx.set_function("SpawnAfterimage",
+            [&renderer](uint32_t entity, float lifetime, float r, float g, float b)
+            {
+                if (auto* sys = renderer.GetAfterimageSystem())
+                    sys->Spawn(static_cast<Entity>(entity), lifetime,
+                               DirectX::XMFLOAT4{ r, g, b, 1.0f });
+            });
+    }
+
+    // BT Actions / Conditions — must run AFTER RegisterLuaBTBindings and
+    // RegisterLuaNavBindings so the script can append to those tables.
+    // Order matters: base actions.lua first, then any extension scripts
+    // that depend on Actions / Conditions / BT / Character / Nav already
+    // being populated.
+    constexpr const char* kBTScripts[] = {
+        "asset/ai/actions.lua",
+        "asset/ai/enemy_actions.lua",
+    };
+    for (const char* path : kBTScripts)
+    {
+        auto r = lua->safe_script_file(path, sol::script_pass_on_error);
+        if (!r.valid())
+        {
+            sol::error err = r;
+            LOG_ERROR("App: failed to load '%s': %s", path, err.what());
+        }
+        else
+        {
+            LOG_INFO("App: loaded BT actions from '%s'", path);
+        }
+    }
+}
+
+void App::InitAudio()
+{
+    // AudioSystem installs an entity-destroy listener so component teardown
+    // stops live voices and releases clip refcounts.
     m_audioClipSys.Init(m_resourceMgr);
     if (m_audioEngine.Initialize())
     {
@@ -182,55 +473,32 @@ int App::Run()
         m_audioSystem.BindWorld(m_world);
         m_audio3DSystem.BindEngine(m_audioEngine);
     }
-
-    // ---- Build SceneContext with all systems --------------------------------
-    SceneContext ctx{ backend, renderer };
-    ctx.resourceMgr = &m_resourceMgr;
-    ctx.textureSys  = &m_textureSys;
-    ctx.meshSys     = &m_meshSys;
-    ctx.meshLib     = &m_meshLib;
-    ctx.matSys      = &m_matSys;
-    ctx.assetMgr    = &m_assetMgr;
-    ctx.world       = &m_world;   // permanent — IScenes operate on this World
-
-    // Scene transition queue — drained after SceneManager.Update each frame.
-    std::unique_ptr<IScene> pendingScene;
-    ctx.requestReplaceScene = [&pendingScene](std::unique_ptr<IScene> next) {
-        pendingScene = std::move(next);
-    };
-
-    // Initial scene differs by build:
-    //   ShaderLab → ShaderLabScene (sphere + 3-point lights + IBL; tool-only)
-    //   Editor    → TestScene (default editing target; no state machine needed)
-    //   Game      → TitleScene (full Title→Game→End flow; GameScene loads game.json)
-#ifdef WITH_SHADERLAB
-    m_sceneManager.PushScene(std::make_unique<ShaderLabScene>(), ctx);
-#elif defined(WITH_EDITOR)
-    m_sceneManager.PushScene(std::make_unique<TestScene>(), ctx);
-#else
-    m_sceneManager.PushScene(std::make_unique<TitleScene>(), ctx);
-#endif
-
-    // (game.json startup-world loading moved into GameScene::Init.)
+}
 
 #ifdef WITH_EDITOR
-    // ---- Wire EditorLayer --------------------------------------------------
+void App::WireEditor(IGraphicsDevice& backend, Renderer& renderer, GameModeContext& ctx)
+{
     m_editorLayer.SetGraphicsDevice(&backend);
     m_editorLayer.SetResourceSystems(&m_textureSys, &m_resourceMgr);
     m_editorLayer.SetAssetManager(&m_assetMgr);
     m_editorLayer.SetRenderer(&renderer);
     m_editorLayer.SetAnimationClipSystem(&m_animClipSys);
     m_editorLayer.SetAnimationSystem(renderer.GetAnimationSystem());
-    m_editorLayer.RegisterDefaultEditors(); // must be after SetRenderer()
+    m_editorLayer.SetPhysicsSystem(&m_physicsSystem);
+    // FootIKTargetSystem raycasts via physics for ground-aware foot IK;
+    // ClipLibrary lazy-acquires state clips through CharacterStateSystem.
+    renderer.SetPhysicsSystem(&m_physicsSystem);
+    renderer.SetAnimationClipSystem(&m_animClipSys);
+    m_editorLayer.SetNavMeshSystem(&m_navSystem);
+    m_editorLayer.SetAISystem(&m_aiSystem);
+    m_editorLayer.SetScriptSystem(&m_scriptSystem);   // exposed-var inspector
+    m_editorLayer.RegisterDefaultEditors();   // must be after SetRenderer()
     m_editorLayer.SetAssetDirectory("asset/");
     m_editorLayer.SetGPUProfiler(&static_cast<GraphicsDX12&>(backend).GetGPUProfiler());
-    m_editorLayer.InitImGuiBackends(); // must be after SetGraphicsDevice
+    m_editorLayer.InitImGuiBackends();        // must be after SetGraphicsDevice
 
-    // EditorLayer installed an ImGui-only mouse-capture hook above. Replace
-    // it with a combined predicate so Window also suppresses input when the
-    // game-layer UI wants the cursor (button hover, etc.). Header note:
-    // ImGui's WantCaptureMouse already covers editor chrome — the OR here
-    // adds runtime UI on top.
+    // Combine ImGui's capture predicate with the game-layer UI so Window
+    // suppresses input when either layer wants the cursor/keys.
     Window::SetWantCaptureMouse([]() -> bool {
         return ImGui::GetIO().WantCaptureMouse
             || UI::UISystem::GlobalWantsCaptureMouse();
@@ -247,265 +515,140 @@ int App::Run()
 
     m_editorLayer.SetPickCallback([&renderer, &ctx](float px, float py) {
         if (ctx.viewportW == 0 || ctx.viewportH == 0) return;
-        // px/py are already in viewport-panel space; PickingPass renders at the same render dims.
         renderer.RequestPick(static_cast<int>(px), static_cast<int>(py));
     });
+}
+#else
+void App::WireEditor(IGraphicsDevice&, Renderer&, GameModeContext&) {}
 #endif
 
-    Timer timer;
+void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
+                               GameModeContext& ctx)
+{
+    // Single source of tick order for the ECS scheduler (see
+    // DesignMd/System_Scheduler_Architecture.md). Order INSIDE a phase is
+    // registration order; phases run sequentially per kPhaseDescriptors.
+    auto& reg = m_systemRegistry;
 
-    // ---- Shader hot-reload ------------------------------------------------
-    // Watch shaders/ for .hlsl/.hlsli writes; when something changes, drop
-    // the in-memory shader+PSO caches and have every reload-aware pass
-    // re-fetch its PSOs. No-op in shipping builds — the watcher is
-    // dev-friendly only, but it's cheap enough to leave on always.
-    HotReload::FileWatcher shaderWatcher;
-    shaderWatcher.Init("shaders");
+    // GameplayPreLogic — LifetimeSystem first so expired VFX die before
+    // scripts / AI iterate. Notify-spawned emitters from the previous
+    // frame's TimelineSystem all expire here.
+    reg.Add<LifetimeSystem>();
+    reg.Add<ScriptTimerSystem>(m_scriptSystem);
 
-    while (true)
+    // Video decode — submits on the dedicated D3D12 video queue; runs early
+    // so the GPU can overlap decode with the graphics pipeline. Renderer
+    // calls IVideoDecoderBackend::AddDecodeDependency before sampling the
+    // NV12 output, so by the time the PS reads it the frame is retired.
+    reg.Add<VideoSystem>(backend);
+
+    // GameplayLogic
+    reg.Add<ScriptLogicSystem>(m_scriptSystem);
+
+    // AI — LOD → BT → AITactical → NavAgent → Player. Layered movement
+    // model (DesignMd/character_movement_architecture.md §3.1):
+    //   * BT writes AIIntentComponent (strategic goal) and may also
+    //     directly write NavAgentComponent fields via `Intent.MoveTo`.
+    //   * AITacticalSystem translates AIIntent → NavAgent.destination +
+    //     facingMode + facingTarget. Skipped for goal=Idle so direct
+    //     Intent.MoveTo writes survive.
+    //   * NavAgentSystem reads NavAgent.destination, queries NavMesh for
+    //     a path, writes CharacterController.desiredHorizontalVelocity
+    //     and LocalTransform.rotation.
+    //   * PlayerController writes the same desiredHorizontalVelocity for
+    //     the player (camera-relative WASD).
+    //   * KCC step inside PhysicsStepSystem (next phase) does the
+    //     actual sweep-and-slide via Jolt CharacterVirtual.
+    reg.Add<AILODTickSystem>(m_aiLODSystem);
+    reg.Add<AIBTTickSystem>(m_aiSystem);
+    reg.Add<AITacticalTickSystem>();
+    reg.Add<NavAgentTickSystem>(m_navSystem);
+    reg.Add<PlayerControlTickSystem>(m_playerCtrl);
+
+    // GameplayPostLogic — GameModeStack only (pending mode drained inline).
+    reg.Add<GameModeStackTickSystem>(m_gameModeStack);
+
+    // FixedPhysics — single adapter; PhysicsSystem owns its 60 Hz accumulator.
+    reg.Add<PhysicsStepSystem>(m_physicsSystem);
+
+    // PhysicsInterpolation — Propagate (always-on so gizmo drags fan out
+    // even when paused) → PhysicsInterp apply → CameraFollow resolve.
+    reg.Add<TransformPropagateSystem>();
+    reg.Add<PhysicsInterpApplySystem>(m_physicsSystem);
+    reg.Add<CameraFollowResolveSystem>(m_physicsSystem);
+    // Camera-stack behavior systems — order is Follow then Aim, matching
+    // the design doc rationale (Follow is the baseline; Aim layers on as a
+    // higher-priority VCam during combat/aim states). Both write
+    // CameraPoseComponent on their VCam entities; CameraStack / CameraResolve
+    // (PreRender phase) read these.
+    reg.Add<FollowCameraTickSystem>();
+    reg.Add<AimCameraTickSystem>(&m_physicsSystem);
+
+    // PreRender — Audio sits here so collision SFX fire same frame as the
+    // collision (audio runs after PhysicsInterpolation, before Render).
+    reg.Add<AudioTickSystem>(m_audioClipSys, m_audioSystem,
+                              m_audio3DSystem, m_audioEngine);
+
+    // Animation — wraps the chain (character state → AnimSystem sample → IK
+    // → ChainPhys → L2W → Socket/Follow → bone AABB merge → SkinMatrix →
+    // BuildSkinJobs). Must run BEFORE Render so SkinningPass sees the offsets.
+    reg.Add<RendererAnimationChainSystem>(renderer);
+
+    // TimelineSystem must run AFTER the animation chain so the prev→curr
+    // time window tests against the latest sampled primaryTime. It reads
+    // clip-authored notify tracks via the ClipLibrary (Path A) plus any
+    // per-entity TimelineComponent overrides (Path B).
+    reg.Add<TimelineSystem>(renderer.GetClipLibrary());
+
+    // BoneAttachment — Notify consumers drain the mailboxes TimelineSystem
+    // wrote in the previous phase, same render frame. Order is arbitrary
+    // (distinct mailbox types) but fixed for stable profiler output.
+    reg.Add<HitboxSystem>();
+    reg.Add<VFXSpawnSystem>();
+    reg.Add<CameraEffectSystem>();
+    reg.Add<AudioPlaySystem>();
+    reg.Add<StateToggleSystem>();
+    reg.Add<GenericNotifyDispatcher>();
+
+    // Camera stack pipeline — must run in PreRender, AFTER all behavior
+    // systems (PhysicsInterpolation) finished writing CameraPoseComponent
+    // and BEFORE Render. Stack tick advances blend state machine; Resolve
+    // produces LiveCameraComponent the Renderer reads; Shake layers
+    // additive trauma noise on top.
+    reg.Add<CameraStackTickSystem>();
+    reg.Add<CameraResolveTickSystem>();
+    reg.Add<CameraShakeTickSystem>();
+
+    // Render — the GPU recording block (backend.BeginFrame → Renderer →
+    // backend.EndFrame, with UI pump + EditorLayer ImGui chrome) runs as a
+    // lambda because it captures ~15 outer refs; wrapping in a services
+    // struct would be more boilerplate than abstraction value.
+    reg.Add<RenderSystem>("RenderSystem",
+        [&, this](World& world, const FrameContext& frameCtx)
     {
-        // Hot-reload check: drain the file-change queue first thing each
-        // frame. Doing it BEFORE BeginFrame means we haven't started
-        // recording commands yet — FlushAndWait is the easy hammer to
-        // ensure no in-flight CL still references the old PSOs we're
-        // about to drop. v1 leans on the stall; if it ever shows up in
-        // a profile, we'll switch to fence-tagged deferred deletion.
-        {
-            const auto changed = shaderWatcher.PollChanges();
-            if (!changed.empty())
-            {
-                LOG_INFO("Hot-reload: %zu shader file(s) changed", changed.size());
-                backend.FlushAndWait();
-                renderer.ReloadShaders();
-            }
-        }
-
-
-        if (auto ecode = Window::ProcessMessage())
-        {
-            m_sceneManager.PopScene();
-
-            // Physics shutdown happens here (used to be in TestScene::Shutdown
-            // but PhysicsSystem now lives in App).
-            m_physicsSystem.Shutdown();
-
-            // Audio: detach event subscribers + entity-destroy listener
-            // before the World tears itself down, then destroy XAudio2
-            // voices. Shutdown the clip system AFTER the engine releases
-            // its voices — the engine's VoiceRecord still borrows
-            // AudioClipResource pointers until DestroyVoice flushes.
-            m_audioSystem.Unbind();
-            m_audioEngine.Shutdown();
-            m_audioClipSys.Shutdown();
-
-            // Explicit GPU-resource release while device is still alive.
-            m_animClipSys.Shutdown();
-            m_assetMgr.Shutdown();
-            m_matSys.Shutdown(m_textureSys, backend);
-            m_meshLib.Shutdown(backend);
-            m_meshSys.Shutdown(backend);
-            m_textureSys.Shutdown(backend);
-            m_resourceMgr.Shutdown();
-            Resource::BCCompressor::Get().Shutdown();
-
-            backend.SavePSOLibrary("pso_cache.bin");
-            return *ecode;
-        }
-
-        const float dt = timer.Mark();
-
-        // CPU frame timing (for profiler panel).
-        LARGE_INTEGER cpuStart, cpuEnd, cpuFreq;
-        QueryPerformanceCounter(&cpuStart);
-
-#ifdef WITH_EDITOR
-        if (GetAsyncKeyState(VK_F11) & 1)
-            m_viewportFullscreen = !m_viewportFullscreen;
-#endif
-
-        // Resolve viewport size.
-        if (m_viewportFullscreen)
-        {
-            ctx.viewportW = backend.GetWidth();
-            ctx.viewportH = backend.GetHeight();
-        }
-        else
-        {
-#ifdef WITH_EDITOR
-            unsigned int vpW = 0, vpH = 0;
-            m_editorLayer.GetViewportSize(vpW, vpH);
-            ctx.viewportW = vpW ? vpW : backend.GetWidth();
-            ctx.viewportH = vpH ? vpH : backend.GetHeight();
-#else
-            ctx.viewportW = backend.GetWidth();
-            ctx.viewportH = backend.GetHeight();
-#endif
-        }
-
-#ifdef WITH_EDITOR
-        // Forward camera-drag input from the previous frame's ImGui state.
-        ctx.viewportRightMouseHeld = m_editorLayer.IsViewportRightDragging();
-        m_editorLayer.GetViewportMouseDelta(ctx.mouseViewportDX, ctx.mouseViewportDY);
-#else
-        // Game build: no editor viewport; consume raw mouse state elsewhere if needed.
-        ctx.viewportRightMouseHeld = false;
-        ctx.mouseViewportDX = 0.f;
-        ctx.mouseViewportDY = 0.f;
-#endif
-
-        // ---- Per-frame system pumps ----------------------------------------
-        // Promote any async-loaded resources to GPU (budget: 2 ms per frame).
-        m_resourceMgr.ProcessPendingGPUUploads(2.0f);
-        // Upload dirty material CBVs.
-        m_matSys.Tick(m_textureSys, backend);
-
-        // Forward delta-time so renderer passes can scale temporal blending.
-        ctx.deltaTime = dt;
-
-        // ---- Camera (always — input feels broken if frozen during pause) ---
-        // Refresh the "main camera" hint if it's stale (entity destroyed by
-        // a scene pop, never set, or LoadWorld replaced everything).
-        if (m_cameraEntity == NullEntity || !m_world.IsAlive(m_cameraEntity)
-            || !m_world.HasComponent<CameraComponent>(m_cameraEntity))
-        {
-            m_cameraEntity = NullEntity;
-            for (Entity e : m_world.GetEntities())
-            {
-                if (m_world.IsAlive(e) && m_world.HasComponent<CameraComponent>(e))
-                { m_cameraEntity = e; break; }
-            }
-        }
-        if (CameraComponent* cam = m_world.GetComponent<CameraComponent>(m_cameraEntity))
-        {
-            if (ctx.viewportRightMouseHeld)
-                m_cameraSystem.Update(*cam, ctx.mouseViewportDX,
-                                            ctx.mouseViewportDY, dt);
-
-            RenderCamera rc;
-            rc.position = cam->position;
-            rc.yaw      = cam->yaw;
-            rc.pitch    = cam->pitch;
-            rc.fov      = cam->fov;
-            rc.nearZ    = cam->nearZ;
-            rc.farZ     = cam->farZ;
-            renderer.SetCamera(rc);
-        }
-
-        // ---- Engine system ticks (gated by editor play/stop/step) ----------
-        // Editor: Playing → real dt. Stopped/Paused → skip ticks unless the
-        // user just clicked Step (one fixed 1/60s frame, deterministic).
-        // Game build: no UI gate — always tick at real dt.
-        float effectiveDt = dt;
-        bool  runUpdate   = true;
-#ifdef WITH_EDITOR
-        {
-            const ViewportPlayState ps = m_editorLayer.GetPlayState();
-            const bool wantsStep       = m_editorLayer.ConsumeWantsStepFrame();
-            const bool isPaused        = (ps == ViewportPlayState::Stopped ||
-                                          ps == ViewportPlayState::Paused);
-            if (isPaused)
-            {
-                if (wantsStep) effectiveDt = 1.0f / 60.0f;
-#ifndef WITH_SHADERLAB
-                // ShaderLab.exe ignores the editor's Stopped/Paused state —
-                // there's no gameplay to pause, but tools-driven animation
-                // (turntable, future timeline scrub, etc.) needs to keep
-                // ticking. Editor.exe / Game.exe behaviour unchanged.
-                else           runUpdate   = false;
-#endif
-            }
-        }
-#endif
-        if (runUpdate)
-        {
-            // AfterDelay timers — REAL dt so hit-stop callbacks expire even
-            // when m_timeScale is near zero.
-            m_scriptSystem.TickTimers(effectiveDt);
-
-            // Game time scale (Lua: Engine.SetTimeScale). 1=normal, 0=freeze.
-            const float scaledDt = effectiveDt * m_scriptSystem.GetTimeScale();
-
-            // Lua scripts (run before TransformSystem so script-driven transform
-            // mutations propagate this same frame).
-            m_scriptSystem.Update(m_world, scaledDt);
-            m_scriptSystem.CheckHotReload(m_world);
-
-            // BT AI runs after scripts (so scripts can stage perception data
-            // into the blackboard) and before physics (so MoveDestination
-            // entries written by BT actions are consumed the same frame).
-            m_aiLODSystem.SetCameraEntity(m_cameraEntity);
-            m_aiLODSystem.Update(m_world);
-            m_aiSystem.CheckHotReload(m_world);
-            m_aiSystem.Update(m_world, scaledDt);
-
-            // Physics: reads LocalTransform, steps Jolt at fixed 60Hz, writes back.
-            m_physicsSystem.Update(m_world, scaledDt);
-
-            // Audio. AudioSystem first to drain queued PlaySound events and
-            // sweep finished voices; Audio3DSystem then walks live 3D sources
-            // with up-to-date GlobalTransform and pushes DSP into the engine.
-            // Engine.Update reclaims voice slots flagged finished by the
-            // XAudio2 worker thread.
-            // Promote any RM-loaded .aclip resources to local Ready first so
-            // events / playOnEnable that landed this frame can resolve.
-            m_audioClipSys.Tick();
-            EventBus::Get().DispatchOne<Audio::PlaySoundEvent>();
-            EventBus::Get().DispatchOne<Audio::StopSoundEvent>();
-            EventBus::Get().DispatchOne<Audio::SetAudioParamEvent>();
-            EventBus::Get().DispatchOne<Audio::BusVolumeChangedEvent>();
-            m_audioSystem  .Update(m_world, scaledDt);
-            m_audio3DSystem.Update(m_world, scaledDt);
-            m_audioEngine  .Update(scaledDt);
-
-            // Per-scene gameplay hook — typically empty for the default level.
-            m_sceneManager.Update(scaledDt);
-
-            // Drain a scene transition request, if any. Doing this AFTER
-            // Update guarantees we never mutate the stack while iterating it.
-            if (pendingScene)
-            {
-                m_sceneManager.PopScene();
-                m_sceneManager.PushScene(std::move(pendingScene), ctx);
-                pendingScene.reset();
-            }
-        }
-
-        // Propagate LocalTransform → GlobalTransform for every hierarchy entity.
-        // Runs UNCONDITIONALLY (outside the play-state gate). The editor gizmo
-        // writes to a single entity's LocalTransform and immediately patches
-        // ITS own GlobalTransform; descendants only get refreshed by this
-        // pass. Skipping it while paused leaves children visually pinned to
-        // their old world positions when the user moves a parent — that was
-        // why "moving the model root didn't move the bones / meshes".
-        // Cost is trivial — pure derived-data math, no game state mutation.
-        TransformSystem::Propagate(m_world);
-
-        // Open the primary command list. BeginFrame does a pipelined wait (on
-        // the fence from FrameCount frames ago) and drains that backbuffer's
-        // deferred-release slot. Calls to Destroy{Buffer,Texture} /
-        // ReleaseHdrRenderTarget / FreeDescriptorTable after this point queue
-        // work for a future BeginFrame — always safe regardless of in-flight GPU.
+        // BeginFrame does a pipelined wait + drains this backbuffer's
+        // deferred-release slot. Any Destroy/Release after this point queues
+        // for a future BeginFrame and is safe regardless of in-flight GPU.
         RHI::CommandList primaryCL = backend.BeginFrame();
         backend.SetViewportSize(ctx.viewportW, ctx.viewportH);
 
-        // TextureSystem::Tick MUST come after BeginFrame (WaitForPreviousFrame):
-        //   1. Flushes m_pendingDestroy — safe because previous frame is GPU-complete.
-        //   2. Promotes RM-ready textures to GPU via CreateTexture/FlushUploadAndWait.
+#ifdef WITH_EDITOR
+        // Drain queued editor actions (Load World, ...) after BeginFrame
+        // sync, before any new GPU recording. Inline-in-handler tears down
+        // descriptor slots that earlier ImGui::Image calls captured → UAF.
+        m_editorLayer.ProcessPendingActions();
+#endif
+
+        // TextureSystem::Tick MUST come after BeginFrame: flushes pending
+        // destroys (previous frame is GPU-complete) + promotes RM-ready
+        // textures to GPU.
         m_textureSys.Tick(m_resourceMgr, backend);
         m_animClipSys.Tick();
-        m_animClipSys.ResolvePendingBinds(m_world, renderer);
+        m_animClipSys.ResolvePendingBinds(world, renderer);
 
-        // ---- UI tick — populates UIPass's drawlist before Render() ---------
-        // Runs AFTER renderer.BeginFrame so world-space anchors project with
-        // THIS frame's view-projection (no 1-frame lag when the camera moves).
-        // Order: BeginFrame builds RenderView → UI Tick reads it → Render
-        // consumes the drawlist inside UIPass.
-        // Mouse position arrives in window-space from the engine input
-        // singleton. In editor builds we offset by the viewport-panel top-left
-        // so widgets hit-test against panel-relative pixels (matches where
-        // they actually render inside the LDR target shown in the panel).
-        // In game / fullscreen-viewport builds the panel min is (0,0) so the
-        // translation is a no-op.
+        // UI tick runs AFTER renderer.BeginFrame so world-space anchors
+        // project with THIS frame's view-projection. Mouse arrives in
+        // window-space; editor builds offset by the viewport panel min.
         auto pumpUIInput = [&]()
         {
             Mouse& ms = Mouse::GetInstance();
@@ -519,12 +662,10 @@ int App::Run()
                                       static_cast<float>(mp.second) - vpMinY };
             m_uiInput.mouseLeft   = ms.LeftIsPressed();
             m_uiInput.mouseRight  = ms.RightIsPressed();
-            m_uiInput.mouseMiddle = false; // engine Mouse has no middle bit yet
+            m_uiInput.mouseMiddle = false;   // engine Mouse has no middle bit yet
 
-            // Drain typed text + key events so UI text fields receive input.
-            // Skip when ImGui already grabbed the keyboard (its own widgets
-            // are foreground); UI is one layer above the world, one below
-            // the editor chrome, so we yield to ImGui first.
+            // Skip text/key drain when ImGui has the keyboard — UI is one
+            // layer above the world, one below the editor chrome.
             Keyboard& kb = Keyboard::GetInstance();
             const bool imguiKB =
 #ifdef WITH_EDITOR
@@ -544,28 +685,25 @@ int App::Run()
                     m_uiInput.keysThisFrame.push_back(k);
                 }
             }
-            m_uiInput.shift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
-            m_uiInput.ctrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-            m_uiInput.alt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+            const Input& kbIn = Input::Get();
+            m_uiInput.shift = kbIn.IsKeyDown(VK_SHIFT);
+            m_uiInput.ctrl  = kbIn.IsKeyDown(VK_CONTROL);
+            m_uiInput.alt   = kbIn.IsKeyDown(VK_MENU);
 
             UI::UICanvas canvas;
             canvas.size = { static_cast<float>(ctx.viewportW),
                             static_cast<float>(ctx.viewportH) };
 
-            // Screen-space UI tick.
             if (UIPass* uip = renderer.GetUIPass())
-                m_uiSystem.Tick(m_world, m_uiInput, canvas,
-                                uip->GetDrawList(), dt);
+                m_uiSystem.Tick(world, m_uiInput, canvas,
+                                uip->GetDrawList(), frameCtx.deltaTime);
 
-            // World-space UI tick — feeds per-frame fade/scale/cull into
-            // WorldSpaceUIComponent and advances DamageNumber lifetimes.
-            // WorldUIBillboardPass reads the same components later in the
-            // graph using its own viewProj.
+            // World-space UI: per-frame fade/scale/cull + DamageNumber lifetimes.
+            // WorldUIBillboardPass reads the same components using its own viewProj.
             UI::WorldSpaceUIView wsView;
             const RenderView&    rv = renderer.GetView();
             wsView.viewProjMatrix = rv.viewProjMatrixNoJitter;
-            // Camera right / up extracted from the row-major view matrix —
-            // first 3 elements of columns 0 (right) and 1 (up).
+            // Camera right / up = first 3 elements of view-matrix cols 0 / 1.
             wsView.cameraRightWS = { rv.viewMatrix.m[0][0],
                                       rv.viewMatrix.m[1][0],
                                       rv.viewMatrix.m[2][0] };
@@ -574,23 +712,44 @@ int App::Run()
                                       rv.viewMatrix.m[2][1] };
             wsView.canvasSize = { canvas.size.x, canvas.size.y };
             wsView.valid      = true;
-            m_worldSpaceUISystem.Tick(m_world, wsView, dt);
+            m_worldSpaceUISystem.Tick(world, wsView, frameCtx.deltaTime);
         };
 
-        // Render — always runs, regardless of pause state. ECS → DrawPackets,
-        // then RenderGraph passes each emit their own command list.
-        renderer.BeginFrame(m_world, ctx.frame, ctx.deltaTime,
+#ifdef WITH_EDITOR
+        renderer.SetPickingOutlineEntity(m_editorLayer.GetSelectedEntity());
+#endif
+        renderer.BeginFrame(world, ctx.frame, ctx.deltaTime,
                             ctx.viewportW, ctx.viewportH);
-        // UI tick runs HERE (after BeginFrame so RenderView is current) but
-        // BEFORE Render so UIPass picks up the freshly-populated drawlist.
+
+        // Debug wireframe — must run AFTER Renderer::BeginFrame (DebugWirePass::Clear)
+        // and BEFORE renderer.Render (submits the wire buffer). Toggled per-branch.
+        if (auto* dbg = renderer.GetDebugWirePass(); dbg && dbg->enabled)
+        {
+            if (m_navSystem.debugDraw)
+                m_navSystem.EmitDebugLines(*dbg);
+
+            if (dbg->showCollision)
+            {
+                // `collisionMaxDistance <= 0` = unlimited; Debug menu dials it down.
+                const Entity camEnt = static_cast<Entity>(frameCtx.cameraEntity);
+                if (auto* gt = world.GetComponent<GlobalTransform>(camEnt))
+                {
+                    const DirectX::XMFLOAT3 camPos{
+                        gt->matrix._41, gt->matrix._42, gt->matrix._43 };
+                    Tools::CollisionMesh::EmitDebugWireframe(
+                        world, camPos, dbg->collisionMaxDistance,
+                        *dbg, m_physicsSystem);
+                }
+            }
+        }
+
         pumpUIInput();
         RHI::CommandList lastPassCL = renderer.Render();
         if (lastPassCL.IsValid())
             backend.AddCommandListDependency(primaryCL, lastPassCL);
 
         // Post-graph: composite to swap chain + ImGui.
-        backend.SetRenderTargetToSwapChain(clearColor, primaryCL);
-        // Use the tone-mapped final output when available; fall back to raw HDR.
+        backend.SetRenderTargetToSwapChain(kClearColor, primaryCL);
         const uint64_t sceneTexId = renderer.GetFinalOutputSrvHandle()
                                     ? renderer.GetFinalOutputSrvHandle()
                                     : backend.GetHdrSceneSrvGpuHandle();
@@ -601,38 +760,262 @@ int App::Run()
         m_editorLayer.SetRenderView(renderer.GetView());
         m_editorLayer.BeginImGuiFrame();
         m_editorLayer.OnUIRender();
-        // Active scene gets its own ImGui hook — used by ShaderLabScene to
-        // render mesh / lights / HDRI / turntable controls without polluting
-        // EditorLayer with tool-specific code (design doc §6.3).
-        m_sceneManager.OnUIRender(ctx);
+        // Active mode's own ImGui hook (ShaderLab tool controls etc.).
+        m_gameModeStack.OnUIRender(ctx);
+
+        // Phase Debug — last-frame ms per system + per phase. App-side so
+        // EngineCore stays ImGui-free. Toggled from Debug → Phase Debug.
+        if (m_editorLayer.GetShowPhaseDebug())
+        {
+            bool open = true;
+            if (ImGui::Begin("Phase Debug", &open))
+            {
+                const auto debugInfo = m_scheduler.GetDebugInfo();
+                float totalMs = 0.f;
+                for (const auto& p : debugInfo) totalMs += p.lastFrameMs;
+                ImGui::Text("Scheduler total: %.3f ms", totalMs);
+                ImGui::Separator();
+                for (const auto& p : debugInfo)
+                {
+                    if (p.systems.empty()) continue;
+                    const auto flags = ImGuiTreeNodeFlags_DefaultOpen
+                                     | ImGuiTreeNodeFlags_SpanAvailWidth;
+                    if (ImGui::TreeNodeEx(p.name, flags,
+                                          "%-22s  %6.3f ms",
+                                          p.name, p.lastFrameMs))
+                    {
+                        for (const auto& s : p.systems)
+                            ImGui::Text("    %-30s  %6.3f ms",
+                                        s.name, s.lastFrameMs);
+                        ImGui::TreePop();
+                    }
+                }
+            }
+            ImGui::End();
+            // Window X button → flip the menu toggle off so state stays synced.
+            if (!open) m_editorLayer.SetShowPhaseDebug(false);
+        }
+
         m_editorLayer.EndImGuiFrame(primaryCL);
 #else
-        // Game build: no editor UI, no ImGui — backend's own shader path does
-        // the fullscreen scene blit directly to the swap-chain RTV that
-        // SetRenderTargetToSwapChain just bound.
+        // Game build: no ImGui — backend blits HDR scene to swap-chain RTV.
         backend.CompositeTextureToSwapChain(sceneTexId, primaryCL);
 #endif
 
         backend.EndFrame();
+    });
 
-        // Update CPU frame time for profiler.
-        QueryPerformanceCounter(&cpuEnd);
-        QueryPerformanceFrequency(&cpuFreq);
-#ifdef WITH_EDITOR
-        m_editorLayer.SetCPUFrameTime(
-            static_cast<float>(cpuEnd.QuadPart - cpuStart.QuadPart) * 1000.0f
-            / static_cast<float>(cpuFreq.QuadPart));
+    m_scheduler.SetRegistry(&reg);
+    reg.Initialize(m_world);
+}
 
-        // Resolve any pending GPU pick (1-frame delay).
+// ===========================================================================
+// Run() helpers — per-frame
+// ===========================================================================
+
+void App::RefreshMainCamera()
+{
+    // Resolution order:
+    //   1. The entity carrying ActiveCameraTag (set by Camera.SetActive),
+    //      provided it's still alive and still has a CameraComponent.
+    //   2. The previously-cached entity, if still valid.
+    //   3. First-found-with-CameraComponent fallback (covers initial boot,
+    //      world load before any Camera.SetActive is issued, and the case
+    //      where the active camera entity was destroyed).
+    Entity taggedActive = NullEntity;
+    m_world.ForEach<ActiveCameraTag>([&](Entity e, ActiveCameraTag&)
+    {
+        if (taggedActive == NullEntity
+            && m_world.IsAlive(e)
+            && m_world.HasComponent<CameraComponent>(e))
         {
-            Entity pickedEntity;
-            if (renderer.ResolvePick(pickedEntity))
-                m_editorLayer.SetPickResult(pickedEntity);
+            taggedActive = e;
         }
-#else
-        (void)cpuEnd; (void)cpuFreq;
-#endif
-
-        ++ctx.frame;
+    });
+    if (taggedActive != NullEntity)
+    {
+        m_cameraEntity = taggedActive;
     }
+    else if (m_cameraEntity == NullEntity
+             || !m_world.IsAlive(m_cameraEntity)
+             || !m_world.HasComponent<CameraComponent>(m_cameraEntity))
+    {
+        // Fallback: pick whichever camera-bearing entity comes first.
+        m_cameraEntity = NullEntity;
+        for (Entity e : m_world.GetEntities())
+        {
+            if (m_world.IsAlive(e) && m_world.HasComponent<CameraComponent>(e))
+            { m_cameraEntity = e; break; }
+        }
+    }
+    // Expose to Lua so BT/Logic scripts can read ctx:GetEntityPosition(CameraEntity).
+    if (sol::state* lua = m_scriptSystem.GetLua())
+        (*lua)["CameraEntity"] = static_cast<uint32_t>(m_cameraEntity);
+}
+
+void App::TickCamera(float dt, const GameModeContext& ctx)
+{
+    if (!m_world.GetComponent<CameraComponent>(m_cameraEntity)) return;
+
+    // The camera is an ordinary ECS entity: pose on LocalTransform/GlobalTransform,
+    // FPS state on CameraControllerComponent. Backfill anything missing.
+    if (!m_world.HasComponent<LocalTransform>(m_cameraEntity))
+        m_world.AddComponent<LocalTransform>(m_cameraEntity, LocalTransform{});
+    if (!m_world.HasComponent<GlobalTransform>(m_cameraEntity))
+        m_world.AddComponent<GlobalTransform>(m_cameraEntity, GlobalTransform{});
+    if (!m_world.HasComponent<CameraControllerComponent>(m_cameraEntity))
+        m_world.AddComponent<CameraControllerComponent>(m_cameraEntity, CameraControllerComponent{});
+
+    // Backfill into the new VCam stack pipeline. Copies the legacy lens
+    // params on first touch; subsequent edits via the Camera Controller
+    // inspector / serialization still drive CameraComponent so the bridge
+    // re-syncs each frame below.
+    if (!m_world.HasComponent<VirtualCameraComponent>(m_cameraEntity))
+    {
+        VirtualCameraComponent vc{};
+        if (auto* cam = m_world.GetComponent<CameraComponent>(m_cameraEntity))
+        {
+            vc.fov   = cam->fov;
+            vc.nearZ = cam->nearZ;
+            vc.farZ  = cam->farZ;
+        }
+        m_world.AddComponent<VirtualCameraComponent>(m_cameraEntity, vc);
+    }
+    if (!m_world.HasComponent<CameraPoseComponent>(m_cameraEntity))
+        m_world.AddComponent<CameraPoseComponent>(m_cameraEntity, CameraPoseComponent{});
+    if (!m_world.HasComponent<VCamPriorityComponent>(m_cameraEntity))
+    {
+        VCamPriorityComponent prio{};
+        prio.priority = 0;       // baseline — gameplay VCams push at higher prio
+        prio.weight   = 1.f;
+        prio.enabled  = true;
+        m_world.AddComponent<VCamPriorityComponent>(m_cameraEntity, std::move(prio));
+    }
+    if (!m_world.HasComponent<VCamBlendComponent>(m_cameraEntity))
+    {
+        VCamBlendComponent blend{};
+        // Baseline starts already Active so first-frame resolve finds a winner.
+        blend.currentBlend     = 1.f;
+        blend.state            = BlendState::Active;
+        blend.blendInDuration  = 0.f;
+        blend.blendOutDuration = 0.25f;
+        m_world.AddComponent<VCamBlendComponent>(m_cameraEntity, std::move(blend));
+    }
+    // Mirror legacy lens edits → VCam each frame so the inspector still
+    // works as users expect. Cheap (3 float copies).
+    if (auto* cam = m_world.GetComponent<CameraComponent>(m_cameraEntity))
+    if (auto* vc  = m_world.GetComponent<VirtualCameraComponent>(m_cameraEntity))
+    {
+        vc->fov   = cam->fov;
+        vc->nearZ = cam->nearZ;
+        vc->farZ  = cam->farZ;
+    }
+    // Ensure the Main channel entity exists.
+    Camera::GetOrCreateChannelEntity(m_world, Camera::kMainChannel);
+
+    auto* ctrl = m_world.GetComponent<CameraControllerComponent>(m_cameraEntity);
+    auto* lt   = m_world.GetComponent<LocalTransform>(m_cameraEntity);
+    if (!ctrl || !lt) return;
+
+    if (ctx.viewportRightMouseHeld)
+    {
+        m_cameraSystem.Update(*ctrl, *lt, ctx.mouseViewportDX,
+                              ctx.mouseViewportDY, dt);
+    }
+    else
+    {
+        // Idle: script/turntable/gizmo/world-load may own the pose — keep
+        // yaw/pitch tracking it so re-grabbing the camera doesn't snap.
+        CameraSystem::SyncControllerFromTransform(*ctrl, *lt);
+    }
+
+    // Camera is a root entity — patch its GlobalTransform now so systems that
+    // run before TransformSystem::Propagate (AI LOD, collision viz) see it.
+    if (auto* gt = m_world.GetComponent<GlobalTransform>(m_cameraEntity))
+        DirectX::XMStoreFloat4x4(&gt->matrix, lt->ToMatrix());
+}
+
+void App::UpdateViewportSize(GameModeContext& ctx, IGraphicsDevice& backend)
+{
+    if (m_viewportFullscreen)
+    {
+        ctx.viewportW = backend.GetWidth();
+        ctx.viewportH = backend.GetHeight();
+        return;
+    }
+#ifdef WITH_EDITOR
+    unsigned int vpW = 0, vpH = 0;
+    m_editorLayer.GetViewportSize(vpW, vpH);
+    ctx.viewportW = vpW ? vpW : backend.GetWidth();
+    ctx.viewportH = vpH ? vpH : backend.GetHeight();
+#else
+    ctx.viewportW = backend.GetWidth();
+    ctx.viewportH = backend.GetHeight();
+#endif
+}
+
+void App::RunFixedPhysicsLoop(float scaledDt, FrameContext& frameCtx)
+{
+    // T2: App owns the accumulator. PreAllSteps runs once for body create/
+    // teleport detection, the Pre/Step/Post triplet N times (spiral-of-death
+    // capped at 5 steps + 0.25s clamp), then PostAllSteps drains contacts.
+    // physicsAlpha = leftover fraction for PhysicsInterpApplySystem's slerp.
+    if (!frameCtx.runUpdate)
+    {
+        // Paused: zero the accumulator so resuming doesn't burn catch-up steps.
+        m_physicsAccumulator = 0.f;
+        frameCtx.physicsAlpha = 0.f;
+        return;
+    }
+
+    m_physicsSystem.PreAllSteps(m_world);
+
+    m_physicsAccumulator += scaledDt;
+    constexpr float kMaxAccum = 0.25f;
+    if (m_physicsAccumulator > kMaxAccum) m_physicsAccumulator = kMaxAccum;
+
+    const float kFixedDt = DX12Physics::PhysicsSystem::GetFixedDt();
+    int safety = 5;
+    frameCtx.isFixedTickPhase = true;
+    while (m_physicsAccumulator >= kFixedDt && safety-- > 0)
+    {
+        m_scheduler.RunPhase(TickPhase::FixedPhysicsPre,  m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::FixedPhysics,     m_world, frameCtx);
+        m_scheduler.RunPhase(TickPhase::FixedPhysicsPost, m_world, frameCtx);
+        m_physicsAccumulator -= kFixedDt;
+        frameCtx.physicsStepIndex++;
+    }
+    frameCtx.isFixedTickPhase = false;
+
+    m_physicsSystem.PostAllSteps(m_world);
+
+    frameCtx.physicsAlpha = m_physicsAccumulator / kFixedDt;
+    if (frameCtx.physicsAlpha < 0.f) frameCtx.physicsAlpha = 0.f;
+    if (frameCtx.physicsAlpha > 1.f) frameCtx.physicsAlpha = 1.f;
+}
+
+void App::ShutdownAllSystems(IGraphicsDevice& backend)
+{
+    // Tear down ISystem adapters BEFORE the concrete singletons they wrap so
+    // OnUnregister can still detach event listeners against live targets.
+    m_systemRegistry.Shutdown(m_world);
+
+    m_physicsSystem.Shutdown();
+
+    // Audio: detach subscribers / entity-destroy listener before World tears
+    // down; shutdown the clip system AFTER the engine releases voices because
+    // VoiceRecord borrows AudioClipResource pointers until DestroyVoice flushes.
+    m_audioSystem.Unbind();
+    m_audioEngine.Shutdown();
+    m_audioClipSys.Shutdown();
+
+    // Explicit GPU-resource release while device is still alive.
+    m_animClipSys.Shutdown();
+    m_assetMgr.Shutdown();
+    m_matSys.Shutdown(m_textureSys, backend);
+    m_meshLib.Shutdown(backend);
+    m_meshSys.Shutdown(backend);
+    m_textureSys.Shutdown(backend);
+    m_resourceMgr.Shutdown();
+    Resource::BCCompressor::Get().Shutdown();
 }

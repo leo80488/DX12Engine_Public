@@ -9,6 +9,7 @@
 
 #include "Graphics/GraphicsStruct.h"
 #include "Graphics/ShaderLibrary.h"
+#include "Graphics/FrameCB.h"
 
 class IGraphicsDevice;
 
@@ -41,9 +42,8 @@ private:
     uint32_t     m_hiZHeight = 0;
     uint32_t     m_mipCount  = 0;
 
-    // CB for per-mip dispatch
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
-
     struct HiZCB { uint32_t srcW, srcH, dstW, dstH; };
+
+    // CB for per-mip dispatch.
+    FrameCB<HiZCB> m_cb;
 };

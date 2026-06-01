@@ -9,6 +9,7 @@
 #include "ECS/FollowEvents.h"
 #include "ECS/EquipmentEvents.h"
 #include "Physics/PhysicsEvents.h"
+#include "Input/InputSystem.h"
 #include "System/EventBus.h"
 #include "System/Log.h"
 
@@ -17,11 +18,13 @@
 
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <algorithm>
 
 using namespace DirectX;
+namespace fs = std::filesystem;
 
 // ===========================================================================
-// ---------------------------------------------------------------------------
 // LuaBus (pImpl) — string-keyed Lua event queue.
 //
 // Split out so the header stays free of sol:: types. Subscribers are marked
@@ -145,6 +148,10 @@ ScriptSystem::~ScriptSystem()
     // on the still-alive World after ScriptSystem is gone would crash.
     UnbindWorld();
 
+    // Fire OnShutdown on each system before tearing down state.
+    for (auto& sys : m_systems) TeardownSystem(sys);
+    m_systems.clear();
+
     // Unsubscribe our bridge lambdas BEFORE the Lua state goes away — they
     // capture `this` and m_lua, so a post-destruction dispatch would blow up.
     for (auto& unsub : m_cppBridgeUnsubscribers) unsub();
@@ -152,11 +159,8 @@ ScriptSystem::~ScriptSystem()
 
     // Drop every container that may hold sol::function / sol::object refs
     // BEFORE deleting m_lua — otherwise their destructors run *after*
-    // `delete m_lua` (as members destruct in reverse declaration order)
-    // and call luaL_unref on a freed lua_State.  Reproducing crash:
-    //   sol::basic_reference::~basic_reference → deref → luaL_unref → ASAN/UAF
-    // ClearAll() empties state pools without touching m_lua so bindings
-    // stay valid until we actually delete it on the next line.
+    // `delete m_lua` (members destruct in reverse declaration order) and
+    // call luaL_unref on a freed lua_State.
     ClearAll();
 
     delete m_lua;
@@ -165,7 +169,12 @@ ScriptSystem::~ScriptSystem()
 void ScriptSystem::ClearAll()
 {
     m_states.clear();
-    m_globalStates.clear();
+    m_logicTemplates.clear();
+    m_services.clear();
+    m_uiScripts.clear();
+    // m_systems intentionally NOT cleared here — destructor calls TeardownSystem
+    // first (needs OnShutdown), then clears. Live ClearAll callers that want
+    // shutdown semantics should iterate TeardownSystem manually.
     if (m_luaBus) { m_luaBus->subs.clear(); m_luaBus->pending.clear(); }
     if (m_timers) m_timers->entries.clear();
     m_timeScale = 1.f;
@@ -200,7 +209,6 @@ void ScriptSystem::TickTimers(float realDt)
         }
     }
 
-    // Compact when more than half of entries are dead.
     std::size_t dead = 0;
     for (const auto& e : m_timers->entries) if (!e.active) ++dead;
     if (dead * 2 > m_timers->entries.size() && !m_timers->entries.empty())
@@ -265,7 +273,6 @@ void ScriptSystem::RegisterBindings()
     );
 
     // ---- LightData ----
-    // type is LightType enum: 0=Directional, 1=Point, 2=Spot (stored as int in Lua)
     lua.new_usertype<LightData>("Light",
         "radius",      &LightData::radius,
         "intensity",   &LightData::intensity,
@@ -282,22 +289,24 @@ void ScriptSystem::RegisterBindings()
             [](LightData& l, LuaVec3 v) { l.direction = {v.x, v.y, v.z}; })
     );
 
-    // LightType constants (mirrors the C++ enum ordering).
     lua["LightType"] = lua.create_table_with(
         "Directional", 0, "Point", 1, "Spot", 2);
 
-    // ---- CameraComponent ----
+    // ---- CameraComponent (lens / view-projection) ----
+    // The camera pose is on LocalTransform — move the camera via
+    // GetLocalTransform(id).position / .rotation, not through this usertype.
     lua.new_usertype<CameraComponent>("Camera",
-        "yaw",              &CameraComponent::yaw,
-        "pitch",            &CameraComponent::pitch,
-        "fov",              &CameraComponent::fov,
-        "nearZ",            &CameraComponent::nearZ,
-        "farZ",             &CameraComponent::farZ,
-        "mouseSensitivity", &CameraComponent::mouseSensitivity,
-        "moveSpeed",        &CameraComponent::moveSpeed,
-        "position", sol::property(
-            [](CameraComponent& c) -> LuaVec3 { return {c.position.x, c.position.y, c.position.z}; },
-            [](CameraComponent& c, LuaVec3 v) { c.position = {v.x, v.y, v.z}; })
+        "fov",   &CameraComponent::fov,
+        "nearZ", &CameraComponent::nearZ,
+        "farZ",  &CameraComponent::farZ
+    );
+
+    // ---- CameraControllerComponent (FPS controller state) ----
+    lua.new_usertype<CameraControllerComponent>("CameraController",
+        "yaw",              &CameraControllerComponent::yaw,
+        "pitch",            &CameraControllerComponent::pitch,
+        "mouseSensitivity", &CameraControllerComponent::mouseSensitivity,
+        "moveSpeed",        &CameraControllerComponent::moveSpeed
     );
 
     // ---- AnimationComponent ----
@@ -313,17 +322,27 @@ void ScriptSystem::RegisterBindings()
     );
 
     // ---- Input ----
+    // Routes through the shared Input snapshot so Lua sees the same edge
+    // state as native systems within a frame. Mouse buttons go through the
+    // same VK_*BUTTON path because we don't have a separate per-frame mouse
+    // button snapshot yet — Mouse.h is event-driven, which doesn't give us
+    // edge queries cheap. WasKeyPressed / WasKeyReleased are exposed too so
+    // Lua Logic scripts can detect single-frame transitions without manual
+    // edge tracking.
     auto input = lua.create_table();
     input.set_function("IsKeyDown", [](int key) -> bool {
-        return (GetAsyncKeyState(key) & 0x8000) != 0;
+        return Input::Get().IsKeyDown(key);
+    });
+    input.set_function("WasKeyPressed", [](int key) -> bool {
+        return Input::Get().WasKeyPressed(key);
+    });
+    input.set_function("WasKeyReleased", [](int key) -> bool {
+        return Input::Get().WasKeyReleased(key);
     });
     input.set_function("IsMouseDown", [](int button) -> bool {
-        // button: 0=Left, 1=Right, 2=Middle
         int vk = (button == 1) ? VK_RBUTTON : (button == 2) ? VK_MBUTTON : VK_LBUTTON;
-        return (GetAsyncKeyState(vk) & 0x8000) != 0;
+        return Input::Get().IsKeyDown(vk);
     });
-    // Screen-space cursor position (window-relative when the game owns the
-    // foreground window). Returns (x, y) as two floats.
     input.set_function("GetMousePos", []() -> std::tuple<float,float> {
         POINT p; GetCursorPos(&p);
         if (HWND hwnd = GetForegroundWindow())
@@ -334,7 +353,6 @@ void ScriptSystem::RegisterBindings()
 
     lua["Mouse"] = lua.create_table_with("Left", 0, "Right", 1, "Middle", 2);
 
-    // ---- Key constants ----
     auto keys = lua.create_table();
     keys["W"] = 0x57; keys["A"] = 0x41; keys["S"] = 0x53; keys["D"] = 0x44;
     keys["Q"] = 0x51; keys["E"] = 0x45;
@@ -354,12 +372,10 @@ void ScriptSystem::RegisterBindings()
     // ---- Time (updated each frame in Update) ----
     lua["Time"] = lua.create_table_with("dt", 0.f, "elapsed", 0.f);
 
-    // ---- Engine.* Command API (see include/ECS/CommandAPI.h) ----------------
-    // These are the only sanctioned way for Lua to mutate equipment / follow
-    // bindings. Lambdas capture `this` and reach the current frame's World
-    // via m_world, which Update() sets before running scripts.
+    // ---- Engine.* Command API ------------------------------------------------
     auto engine = lua.create_table();
 
+    // ---- Equipment / Follow Commands ----
     engine.set_function("EquipToSocket",
         [this](uint32_t charId, uint32_t itemId, const std::string& socketName) -> bool
         {
@@ -430,8 +446,6 @@ void ScriptSystem::RegisterBindings()
             return m_world->GetName(static_cast<Entity>(id));
         });
 
-    // Adds a ScriptComponent so the entity gets its own Lua environment in
-    // future frames (the path is loaded lazily in Update's per-entity loop).
     engine.set_function("AttachScript",
         [this](uint32_t id, const std::string& path) -> bool
         {
@@ -445,11 +459,6 @@ void ScriptSystem::RegisterBindings()
         });
 
     // ---- Component access ---------------------------------------------------
-    // Return raw pointers to components. sol binds them as the registered
-    // usertype, so Lua can read/write fields directly. Returns nil if the
-    // entity is dead or lacks the component — Lua-side idiom:
-    //     local cam = Engine.GetCamera(id)
-    //     if cam then cam.fov = 1.2 end
     engine.set_function("GetLocalTransform",
         [this](uint32_t id) -> LocalTransform*
         {
@@ -471,6 +480,13 @@ void ScriptSystem::RegisterBindings()
             return m_world->GetComponent<CameraComponent>(static_cast<Entity>(id));
         });
 
+    engine.set_function("GetCameraController",
+        [this](uint32_t id) -> CameraControllerComponent*
+        {
+            if (!m_world) return nullptr;
+            return m_world->GetComponent<CameraControllerComponent>(static_cast<Entity>(id));
+        });
+
     engine.set_function("GetAnimation",
         [this](uint32_t id) -> AnimationComponent*
         {
@@ -478,8 +494,45 @@ void ScriptSystem::RegisterBindings()
             return m_world->GetComponent<AnimationComponent>(static_cast<Entity>(id));
         });
 
-    // Name-keyed existence check for components currently exposed to Lua.
-    // Keep the list in sync with the Get* functions above.
+    // BFS the hierarchy under `id` and return the first descendant that owns
+    // an AnimationComponent (or `id` itself if it qualifies). Returns 0 when
+    // nothing in the subtree is animated.
+    //
+    // Use case: a character split as
+    //   root  (collider / rigidbody / AI / script)
+    //     └── meshNode (skinned mesh + AnimationComponent)
+    // — the BT runs on root but FSM / clip transitions need to be issued
+    // against the meshNode. Logic scripts call this once on OnSpawn and
+    // cache the result.
+    engine.set_function("FindAnimatedDescendant",
+        [this](uint32_t id) -> uint32_t
+        {
+            if (!m_world) return 0u;
+            const Entity start = static_cast<Entity>(id);
+            if (!m_world->IsAlive(start)) return 0u;
+
+            std::vector<Entity> stack;
+            stack.push_back(start);
+            while (!stack.empty())
+            {
+                const Entity e = stack.back();
+                stack.pop_back();
+                if (m_world->GetComponent<AnimationComponent>(e))
+                    return static_cast<uint32_t>(e);
+                if (const auto* kids = m_world->GetComponent<Children>(e))
+                {
+                    // Reverse-push to preserve a depth-first walk that
+                    // visits earlier children first.
+                    for (auto it = kids->entities.rbegin();
+                         it != kids->entities.rend(); ++it)
+                    {
+                        stack.push_back(*it);
+                    }
+                }
+            }
+            return 0u;
+        });
+
     engine.set_function("HasComponent",
         [this](uint32_t id, const std::string& name) -> bool
         {
@@ -488,6 +541,7 @@ void ScriptSystem::RegisterBindings()
             if      (name == "LocalTransform")    return m_world->HasComponent<LocalTransform>(e);
             else if (name == "Light")             return m_world->HasComponent<LightData>(e);
             else if (name == "Camera")            return m_world->HasComponent<CameraComponent>(e);
+            else if (name == "CameraController")  return m_world->HasComponent<CameraControllerComponent>(e);
             else if (name == "Animation")         return m_world->HasComponent<AnimationComponent>(e);
             else if (name == "Script")            return m_world->HasComponent<ScriptComponent>(e);
             else if (name == "Tag")               return m_world->HasComponent<TagComponent>(e);
@@ -496,15 +550,12 @@ void ScriptSystem::RegisterBindings()
         });
 
     // ---- Tags ---------------------------------------------------------------
-    // TagComponent is lazily added on first AddTag call so entities stay
-    // slim until they actually need a tag list.
     engine.set_function("AddTag",
         [this](uint32_t id, const std::string& tag) -> bool
         {
             if (!m_world || tag.empty()) return false;
             const Entity e = static_cast<Entity>(id);
             if (!m_world->IsAlive(e)) return false;
-
             TagComponent* tc = m_world->GetComponent<TagComponent>(e);
             if (!tc) { m_world->AddComponent<TagComponent>(e, {}); tc = m_world->GetComponent<TagComponent>(e); }
             return tc && tc->Add(tag.c_str());
@@ -526,17 +577,13 @@ void ScriptSystem::RegisterBindings()
             return tc && tc->Remove(tag.c_str());
         });
 
-    // ---- Game time scale (hit-stop / bullet-time) ---------------------------
-    // SetTimeScale clamps to >= 0; 0 == full freeze.
+    // ---- Game time scale ----------------------------------------------------
     engine.set_function("SetTimeScale",
         [this](float s) { SetTimeScale(s); });
     engine.set_function("GetTimeScale",
         [this]() -> float { return GetTimeScale(); });
 
-    // ---- AfterDelay — schedule a Lua callback after N real seconds ----------
-    // Real-time delay (NOT affected by time scale) so hit-stop expirations
-    // actually fire while the world is frozen at scale ~= 0. Returns a handle
-    // usable with CancelDelay; 0 on bad input.
+    // ---- AfterDelay ---------------------------------------------------------
     engine.set_function("AfterDelay",
         [this](float seconds, sol::protected_function fn) -> uint64_t
         {
@@ -550,9 +597,6 @@ void ScriptSystem::RegisterBindings()
         [this](uint64_t id) -> bool { return m_timers->Cancel(id); });
 
     // ---- Lua event bus ------------------------------------------------------
-    // Queued: Publish enqueues, subscribers run on next Dispatch (top of
-    // ScriptSystem::Update). Events published inside a handler land in the
-    // following dispatch — same no-reentrancy contract as the C++ bus.
     engine.set_function("Subscribe",
         [this](const std::string& name, sol::protected_function fn) -> uint64_t
         {
@@ -573,192 +617,726 @@ void ScriptSystem::RegisterBindings()
             if (payload.is<sol::table>())
                 t = payload.as<sol::table>();
             else
-                t = m_lua->create_table();   // allow Publish("Name") with no payload
+                t = m_lua->create_table();
             m_luaBus->Publish(name, std::move(t));
+        });
+
+    // ---- Logic-instance baseline access (entity ID required) ---------------
+    // Exposes the per-entity baseline transform captured the first time the
+    // script ran. Logic scripts can reach this via:
+    //     local base = Engine.GetBasePosition(self.entity)
+    engine.set_function("GetBasePosition",
+        [this](uint32_t id) -> sol::table
+        {
+            sol::table t = m_lua->create_table();
+            const auto it = m_states.find(static_cast<Entity>(id));
+            if (it != m_states.end() && it->second.baseCaptured) {
+                const auto& p = it->second.baseTransform.translation;
+                t["x"] = p.x; t["y"] = p.y; t["z"] = p.z;
+            } else {
+                t["x"] = 0.f; t["y"] = 0.f; t["z"] = 0.f;
+            }
+            return t;
+        });
+    engine.set_function("GetBaseRotation",
+        [this](uint32_t id) -> sol::table
+        {
+            sol::table t = m_lua->create_table();
+            const auto it = m_states.find(static_cast<Entity>(id));
+            if (it != m_states.end() && it->second.baseCaptured) {
+                const auto& r = it->second.baseTransform.rotation;
+                t["x"] = r.x; t["y"] = r.y; t["z"] = r.z; t["w"] = r.w;
+            } else {
+                t["x"] = 0.f; t["y"] = 0.f; t["z"] = 0.f; t["w"] = 1.f;
+            }
+            return t;
+        });
+    engine.set_function("GetBaseScale",
+        [this](uint32_t id) -> sol::table
+        {
+            sol::table t = m_lua->create_table();
+            const auto it = m_states.find(static_cast<Entity>(id));
+            if (it != m_states.end() && it->second.baseCaptured) {
+                const auto& s = it->second.baseTransform.scale;
+                t["x"] = s.x; t["y"] = s.y; t["z"] = s.z;
+            } else {
+                t["x"] = 1.f; t["y"] = 1.f; t["z"] = 1.f;
+            }
+            return t;
+        });
+    engine.set_function("ResetBase",
+        [this](uint32_t id)
+        {
+            if (!m_world) return;
+            auto it = m_states.find(static_cast<Entity>(id));
+            if (it == m_states.end()) return;
+            if (const LocalTransform* lt =
+                m_world->GetComponent<LocalTransform>(static_cast<Entity>(id)))
+            {
+                it->second.baseTransform = *lt;
+                it->second.baseCaptured  = true;
+            }
+        });
+
+    // ---- System / Service / UI / Config access (doc §8.3) ------------------
+    // Returns the registered system/service/ui table, or nil. Lua side typical:
+    //     local Damage = Engine.GetService("Damage")
+    //     local quest  = Engine.GetSystem("QuestSystem")
+    //     local hud    = Engine.GetUIScript("HUD")
+    engine.set_function("GetService",
+        [this](const std::string& name) -> sol::object
+        {
+            auto it = m_services.find(name);
+            if (it == m_services.end() || !it->second.loaded)
+                return sol::lua_nil;
+            return (*m_lua)["__services"][name];
+        });
+
+    engine.set_function("GetSystem",
+        [this](const std::string& name) -> sol::object
+        {
+            for (const auto& sys : m_systems)
+                if (sys.name == name && sys.loaded)
+                    return (*m_lua)["__systems"][name];
+            return sol::lua_nil;
+        });
+
+    engine.set_function("GetUIScript",
+        [this](const std::string& name) -> sol::object
+        {
+            auto it = m_uiScripts.find(name);
+            if (it == m_uiScripts.end() || !it->second.loaded)
+                return sol::lua_nil;
+            return (*m_lua)["__ui_scripts"][name];
+        });
+
+    // Pure data loader: runs the file and returns its return value as-is.
+    // Caller decides whether to cache.
+    engine.set_function("LoadConfig",
+        [this](const std::string& path) -> sol::object
+        {
+            auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+            if (!result.valid()) {
+                sol::error err = result;
+                LOG_ERROR("Engine.LoadConfig [%s]: %s", path.c_str(), err.what());
+                return sol::lua_nil;
+            }
+            sol::object ret = result;
+            return ret;
+        });
+
+    // ---- Trigger / Animation manual fire ------------------------------------
+    // Lua-side equivalents to the C++ event bridges. PublishTrigger is for
+    // non-physics overlap detection (custom AABB queries, etc.); PublishAnimEvent
+    // lets gameplay or future state machines fire OnAnimEvent on a Logic instance.
+    engine.set_function("PublishTrigger",
+        [this](uint32_t selfId, uint32_t otherId)
+        {
+            auto sIt = m_states.find(static_cast<Entity>(selfId));
+            if (sIt == m_states.end() || !sIt->second.initCalled) return;
+            sol::table inst = (*m_lua)["__logic_instances"][selfId];
+            if (!inst.valid()) return;
+            sol::protected_function fn = inst["OnEnter"];
+            if (!fn.valid()) return;
+            // No point/normal for manual triggers — pass nil so scripts can
+            // distinguish (or just ignore). Same arg shape as the physics path.
+            auto res = fn(inst, otherId, sol::lua_nil, sol::lua_nil);
+            if (!res.valid()) {
+                sol::error err = res;
+                LOG_ERROR("Lua OnEnter error [%s] entity %u: %s",
+                          sIt->second.path.c_str(), selfId, err.what());
+            }
+        });
+
+    engine.set_function("PublishAnimEvent",
+        [this](uint32_t entityId, const std::string& name, sol::object payload)
+        {
+            auto sIt = m_states.find(static_cast<Entity>(entityId));
+            if (sIt == m_states.end() || !sIt->second.initCalled) return;
+            sol::table inst = (*m_lua)["__logic_instances"][entityId];
+            if (!inst.valid()) return;
+            sol::protected_function fn = inst["OnAnimEvent"];
+            if (!fn.valid()) return;
+            // Forward payload as-is (table, number, string, nil — script's
+            // contract). Engine doesn't synthesize an empty table here.
+            auto res = fn(inst, name, payload);
+            if (!res.valid()) {
+                sol::error err = res;
+                LOG_ERROR("Lua OnAnimEvent error [%s] entity %u name=%s: %s",
+                          sIt->second.path.c_str(), entityId,
+                          name.c_str(), err.what());
+            }
         });
 
     lua["Engine"] = engine;
 
-    // ---- Per-entity environment storage (used by LoadScript) ----
-    lua["__entity_envs"] = lua.create_table();
-    // ---- Per-path storage for global scripts (used by LoadGlobalScript) ----
-    lua["__global_envs"] = lua.create_table();
+    // ---- Registry-style storage tables (per script category) ---------------
+    // Templates and instances for Logic scripts.
+    lua["__logic_templates"] = lua.create_table();
+    lua["__logic_instances"] = lua.create_table();
+    // Singleton instance tables for systems / services / ui scripts.
+    lua["__systems"]         = lua.create_table();
+    lua["__services"]        = lua.create_table();
+    lua["__ui_scripts"]      = lua.create_table();
+}
+
+// ---------------------------------------------------------------------------
+// Exposed-variable parsing helpers (file-local). Read a script's `exposed`
+// table into the C++ ScriptVarDesc schema. Kept in an anonymous namespace so
+// the sol-typed reading logic stays out of the header.
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Read a 3-float vector from a Lua value shaped as an array {x,y,z}, a
+    // keyed {x=,y=,z=}, or a color {r=,g=,b=}. Returns false if not vec-shaped.
+    bool ReadExposedVec3(const sol::object& o, float out[3])
+    {
+        if (o.get_type() != sol::type::table) return false;
+        sol::table t = o.as<sol::table>();
+        sol::optional<float> a1 = t[1], a2 = t[2], a3 = t[3];
+        if (a1 && a2 && a3) { out[0]=*a1; out[1]=*a2; out[2]=*a3; return true; }
+        sol::optional<float> x = t["x"], y = t["y"], z = t["z"];
+        if (x && y && z) { out[0]=*x; out[1]=*y; out[2]=*z; return true; }
+        sol::optional<float> r = t["r"], g = t["g"], b = t["b"];
+        if (r && g && b) { out[0]=*r; out[1]=*g; out[2]=*b; return true; }
+        return false;
+    }
+
+    // Build a default ScriptVarValue of `type` from a Lua `default` object
+    // (which may be nil → a type-appropriate zero/empty default).
+    ScriptVarValue ReadExposedDefault(ScriptVarType type, const sol::object& def)
+    {
+        switch (type)
+        {
+        case ScriptVarType::Float:
+            return ScriptVarValue::MakeFloat(def.is<double>() ? (float)def.as<double>() : 0.f);
+        case ScriptVarType::Int:
+            return ScriptVarValue::MakeInt(def.is<double>() ? (int32_t)def.as<double>() : 0);
+        case ScriptVarType::Bool:
+            return ScriptVarValue::MakeBool(def.is<bool>() ? def.as<bool>() : false);
+        case ScriptVarType::Float3:
+        case ScriptVarType::Color:
+        {
+            float v[3] = { 0.f, 0.f, 0.f };
+            ReadExposedVec3(def, v);
+            return type == ScriptVarType::Color
+                ? ScriptVarValue::MakeColor (v[0], v[1], v[2])
+                : ScriptVarValue::MakeFloat3(v[0], v[1], v[2]);
+        }
+        case ScriptVarType::Entity:
+            return ScriptVarValue::MakeEntity(def.is<double>() ? (uint32_t)def.as<double>() : 0u);
+        case ScriptVarType::String:
+            return ScriptVarValue::MakeString(def.is<std::string>() ? def.as<std::string>() : std::string());
+        case ScriptVarType::Asset:
+            return ScriptVarValue::MakeAsset(def.is<std::string>() ? def.as<std::string>() : std::string());
+        }
+        return ScriptVarValue::MakeFloat(0.f);
+    }
 }
 
 // ===========================================================================
-void ScriptSystem::LoadScript(Entity e, const std::string& path, World& world)
+// LoadLogicTemplate — load a .lua file as a Logic prototype. Expects the file
+// to `return T` where T is a table containing OnSpawn/OnUpdate/OnDestroy
+// methods (any subset). Subsequent entities sharing this path get instances
+// via metatable __index inheritance.
+// ---------------------------------------------------------------------------
+bool ScriptSystem::LoadLogicTemplate(const std::string& path)
 {
-    auto& st = m_states[e];
-    st.path = path;
-    st.loaded = false;
-    st.hasInit = false;
-    st.hasUpdate = false;
-    st.initCalled = false;
-    st.lastError.clear();
+    auto& tmpl = m_logicTemplates[path];
+    tmpl.path = path;
+    tmpl.lastError.clear();
+    tmpl.hasSpawn = tmpl.hasUpdate = tmpl.hasDestroy = false;
 
-    // Create per-entity environment (sandbox).
-    sol::environment env(*m_lua, sol::create, m_lua->globals());
-
-    // Inject entity helpers.
-    env.set_function("GetLocalTransform", [&world, e]() -> LocalTransform* {
-        return world.GetComponent<LocalTransform>(e);
-    });
-    env.set_function("GetName", [&world, e]() -> std::string {
-        return world.GetName(e);
-    });
-    env.set_function("GetEntityID", [e]() -> uint32_t { return e; });
-
-    // ---- Baseline helpers — see ScriptState::baseTransform for rationale. --
-    // Positions / rotations / scales are returned as fresh tables so scripts
-    // can mutate the local copy without affecting the stored baseline.
-    env.set_function("GetBasePosition", [this, e]() -> sol::table {
-        sol::table t = m_lua->create_table();
-        const auto it = m_states.find(e);
-        if (it != m_states.end() && it->second.baseCaptured) {
-            const auto& p = it->second.baseTransform.translation;
-            t["x"] = p.x; t["y"] = p.y; t["z"] = p.z;
-        } else {
-            t["x"] = 0.f; t["y"] = 0.f; t["z"] = 0.f;
-        }
-        return t;
-    });
-    env.set_function("GetBaseRotation", [this, e]() -> sol::table {
-        sol::table t = m_lua->create_table();
-        const auto it = m_states.find(e);
-        if (it != m_states.end() && it->second.baseCaptured) {
-            const auto& r = it->second.baseTransform.rotation;
-            t["x"] = r.x; t["y"] = r.y; t["z"] = r.z; t["w"] = r.w;
-        } else {
-            t["x"] = 0.f; t["y"] = 0.f; t["z"] = 0.f; t["w"] = 1.f;
-        }
-        return t;
-    });
-    env.set_function("GetBaseScale", [this, e]() -> sol::table {
-        sol::table t = m_lua->create_table();
-        const auto it = m_states.find(e);
-        if (it != m_states.end() && it->second.baseCaptured) {
-            const auto& s = it->second.baseTransform.scale;
-            t["x"] = s.x; t["y"] = s.y; t["z"] = s.z;
-        } else {
-            t["x"] = 1.f; t["y"] = 1.f; t["z"] = 1.f;
-        }
-        return t;
-    });
-    // Explicit rebase — typical use: script wants "current pose is now the
-    // rest pose" after warping the entity (teleport, cutscene end).
-    env.set_function("ResetBase", [this, e, &world]() {
-        auto it = m_states.find(e);
-        if (it == m_states.end()) return;
-        if (const LocalTransform* lt = world.GetComponent<LocalTransform>(e)) {
-            it->second.baseTransform = *lt;
-            it->second.baseCaptured  = true;
-        }
-    });
-
-    auto result = m_lua->script_file(path, env);
+    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
     if (!result.valid())
     {
         sol::error err = result;
-        st.lastError = err.what();
-        LOG_ERROR("ScriptSystem: load error [%s]: %s", path.c_str(), err.what());
-        return;
+        tmpl.lastError = err.what();
+        LOG_ERROR("ScriptSystem: logic load error [%s]: %s", path.c_str(), err.what());
+        return false;
     }
 
-    // Store the environment in the Lua registry keyed by entity ID.
-    (*m_lua)["__entity_envs"][e] = env;
-
-    st.loaded     = true;
-    st.hasInit    = env["Init"].valid();
-    st.hasUpdate  = env["Update"].valid();
-    st.hasDestroy = env["OnDestroy"].valid();
-
-    // Track file timestamp for hot reload.
-    try {
-        m_fileTimestamps[path] = std::filesystem::last_write_time(path);
-    } catch (...) {}
-
-    LOG_INFO("ScriptSystem: loaded [%s] for entity %u (Init=%d Update=%d OnDestroy=%d)",
-             path.c_str(), e, st.hasInit, st.hasUpdate, st.hasDestroy);
-}
-
-// ===========================================================================
-// Global scripts — game-logic owners (InputHandler, AbilitySystem, …). Stored
-// in __global_envs[path] so Update can pick each one back up; otherwise the
-// lifecycle mirrors entity scripts.
-void ScriptSystem::AddGlobalScript(const std::string& path)
-{
-    if (m_globalStates.count(path)) return;            // idempotent
-    m_globalStates[path] = {};                          // reserve slot; LoadGlobalScript fills
-    LoadGlobalScript(path);
-}
-
-void ScriptSystem::RemoveGlobalScript(const std::string& path)
-{
-    auto it = m_globalStates.find(path);
-    if (it == m_globalStates.end()) return;
-
-    // Fire OnDestroy (if present) before we drop the env.
-    if (it->second.loaded && it->second.hasDestroy)
+    sol::object ret = result;
+    if (ret.get_type() != sol::type::table)
     {
-        sol::environment env = (*m_lua)["__global_envs"][path];
-        if (env.valid())
+        tmpl.lastError = "Logic script must `return T` where T is a table.";
+        LOG_ERROR("ScriptSystem: logic [%s] did not return a table", path.c_str());
+        return false;
+    }
+
+    sol::table t = ret.as<sol::table>();
+    (*m_lua)["__logic_templates"][path] = t;
+
+    tmpl.hasSpawn   = t["OnSpawn"].valid();
+    tmpl.hasUpdate  = t["OnUpdate"].valid();
+    tmpl.hasDestroy = t["OnDestroy"].valid();
+
+    // Parse the editor-exposed variable schema (`T.exposed`), if any.
+    ParseExposedSchema(path, tmpl.exposed);
+
+    try { m_fileTimestamps[path] = fs::last_write_time(path); } catch (...) {}
+
+    LOG_INFO("ScriptSystem: loaded logic template [%s] (OnSpawn=%d OnUpdate=%d OnDestroy=%d)",
+             path.c_str(), tmpl.hasSpawn, tmpl.hasUpdate, tmpl.hasDestroy);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// EnsureLogicInstance — create a per-entity instance from the template,
+// install metatable inheritance, and fire OnSpawn(self, entity).
+// ---------------------------------------------------------------------------
+bool ScriptSystem::EnsureLogicInstance(Entity e, const std::string& path,
+                                       const std::unordered_map<std::string, ScriptVarValue>* overrides)
+{
+    auto tmplIt = m_logicTemplates.find(path);
+    if (tmplIt == m_logicTemplates.end()) return false;
+
+    sol::table tmpl = (*m_lua)["__logic_templates"][path];
+    if (!tmpl.valid()) return false;
+
+    sol::table inst = m_lua->create_table();
+    sol::table mt   = m_lua->create_table();
+    mt["__index"]   = tmpl;
+    inst[sol::metatable_key] = mt;
+
+    // Convenience: every instance has self.entity pre-set.
+    inst["entity"] = static_cast<uint32_t>(e);
+
+    (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)] = inst;
+
+    // Inject editor-exposed variables (schema defaults + per-entity overrides)
+    // onto the instance table BEFORE OnSpawn so the script reads them as
+    // self.<name> on its very first tick.
+    InjectExposedVars(e, path, overrides);
+
+    if (tmplIt->second.hasSpawn)
+    {
+        sol::protected_function fn = tmpl["OnSpawn"];
+        auto res = fn(inst, static_cast<uint32_t>(e));
+        if (!res.valid()) {
+            sol::error err = res;
+            LOG_ERROR("Lua OnSpawn error [%s] entity %u: %s",
+                      path.c_str(), e, err.what());
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// DestroyLogicInstance — fire OnDestroy(self) and drop the instance table.
+// ---------------------------------------------------------------------------
+void ScriptSystem::DestroyLogicInstance(Entity e)
+{
+    auto sIt = m_states.find(e);
+    if (sIt == m_states.end()) return;
+
+    auto tmplIt = m_logicTemplates.find(sIt->second.path);
+    if (tmplIt != m_logicTemplates.end() &&
+        tmplIt->second.hasDestroy &&
+        sIt->second.initCalled)
+    {
+        sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
+        if (inst.valid())
         {
-            sol::protected_function fn = env["OnDestroy"];
+            sol::protected_function fn = inst["OnDestroy"];
             if (fn.valid())
             {
-                auto res = fn();
+                auto res = fn(inst);
                 if (!res.valid()) {
                     sol::error err = res;
-                    LOG_ERROR("Lua OnDestroy error [%s]: %s", path.c_str(), err.what());
+                    LOG_ERROR("Lua OnDestroy error [%s] entity %u: %s",
+                              sIt->second.path.c_str(), e, err.what());
                 }
             }
         }
     }
-
-    (*m_lua)["__global_envs"][path] = sol::lua_nil;
-    m_globalStates.erase(it);
-}
-
-void ScriptSystem::LoadGlobalScript(const std::string& path)
-{
-    auto& st = m_globalStates[path];
-    st.path = path;
-    st.loaded = false;
-    st.hasInit = false;
-    st.hasUpdate = false;
-    st.hasDestroy = false;
-    st.initCalled = false;
-    st.lastError.clear();
-
-    sol::environment env(*m_lua, sol::create, m_lua->globals());
-    // No entity helpers — global scripts operate on the world via Engine.*
-
-    auto result = m_lua->script_file(path, env);
-    if (!result.valid())
-    {
-        sol::error err = result;
-        st.lastError = err.what();
-        LOG_ERROR("ScriptSystem: global load error [%s]: %s", path.c_str(), err.what());
-        return;
-    }
-
-    (*m_lua)["__global_envs"][path] = env;
-
-    st.loaded     = true;
-    st.hasInit    = env["Init"].valid();
-    st.hasUpdate  = env["Update"].valid();
-    st.hasDestroy = env["OnDestroy"].valid();
-
-    try { m_fileTimestamps[path] = std::filesystem::last_write_time(path); } catch (...) {}
-
-    LOG_INFO("ScriptSystem: loaded global [%s] (Init=%d Update=%d OnDestroy=%d)",
-             path.c_str(), st.hasInit, st.hasUpdate, st.hasDestroy);
+    (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)] = sol::lua_nil;
 }
 
 // ---------------------------------------------------------------------------
-// SweepDestroyed — run OnDestroy for entities whose ScriptComponent went away
-// (either the entity was destroyed, or the component was removed). Called at
-// the top of Update so the rest of the frame works with a clean state set.
+// ParseExposedSchema — read a template's `exposed` table into ScriptVarDesc.
+// Accepts both the explicit-descriptor form ({type='float',default=,min=,...})
+// and bare-literal shorthands (a number/bool/string/3-array infers its type).
+// Output is sorted by name for a stable inspector layout.
+// ---------------------------------------------------------------------------
+void ScriptSystem::ParseExposedSchema(const std::string& path, std::vector<ScriptVarDesc>& out)
+{
+    out.clear();
+    if (!m_lua) return;
+
+    sol::table tmpl = (*m_lua)["__logic_templates"][path];
+    if (!tmpl.valid()) return;
+
+    sol::object exposedObj = tmpl["exposed"];
+    if (exposedObj.get_type() != sol::type::table) return;
+    sol::table exposed = exposedObj.as<sol::table>();
+
+    for (auto& kv : exposed)
+    {
+        if (kv.first.get_type() != sol::type::string) continue;  // skip array part
+        const std::string name = kv.first.as<std::string>();
+        const sol::object  val  = kv.second;
+
+        ScriptVarDesc d;
+        d.name = name;
+
+        switch (val.get_type())
+        {
+        case sol::type::number:
+            d.type   = ScriptVarType::Float;
+            d.defVal = ScriptVarValue::MakeFloat((float)val.as<double>());
+            break;
+        case sol::type::boolean:
+            d.type   = ScriptVarType::Bool;
+            d.defVal = ScriptVarValue::MakeBool(val.as<bool>());
+            break;
+        case sol::type::string:
+            d.type   = ScriptVarType::String;
+            d.defVal = ScriptVarValue::MakeString(val.as<std::string>());
+            break;
+        case sol::type::table:
+        {
+            sol::table desc = val.as<sol::table>();
+            sol::optional<std::string> typeStr = desc["type"];
+            if (typeStr && ScriptVarTypeFromString(*typeStr, d.type))
+            {
+                d.defVal = ReadExposedDefault(d.type, desc["default"]);
+                if (sol::optional<float>       mn  = desc["min"])     { d.minVal = *mn;  d.hasMin = true; }
+                if (sol::optional<float>       mx  = desc["max"])     { d.maxVal = *mx;  d.hasMax = true; }
+                if (sol::optional<float>       sp  = desc["step"])      d.speed   = *sp;
+                if (sol::optional<float>       sp2 = desc["speed"])     d.speed   = *sp2;
+                if (sol::optional<std::string> tip = desc["tooltip"])   d.tooltip = *tip;
+                if (sol::optional<std::string> lbl = desc["label"])     d.label   = *lbl;
+                if (sol::optional<std::string> ext = desc["ext"])       d.assetExt= *ext;
+                if (sol::optional<bool>        hdr = desc["hdr"])       d.hdr     = *hdr;
+            }
+            else
+            {
+                // Bare 3-number array shorthand → Float3 (no explicit type).
+                float v[3] = { 0.f, 0.f, 0.f };
+                if (ReadExposedVec3(val, v))
+                {
+                    d.type   = ScriptVarType::Float3;
+                    d.defVal = ScriptVarValue::MakeFloat3(v[0], v[1], v[2]);
+                }
+                else
+                {
+                    continue;  // unrecognised table → skip
+                }
+            }
+        } break;
+        default:
+            continue;  // function / userdata / nil → not an exposed variable
+        }
+
+        out.push_back(std::move(d));
+    }
+
+    std::sort(out.begin(), out.end(),
+        [](const ScriptVarDesc& a, const ScriptVarDesc& b) { return a.name < b.name; });
+}
+
+// ---------------------------------------------------------------------------
+// GetExposedSchema — lazily load the template so the inspector can show
+// variables before the script first ticks; returns its parsed schema.
+// ---------------------------------------------------------------------------
+const std::vector<ScriptVarDesc>& ScriptSystem::GetExposedSchema(const std::string& path)
+{
+    static const std::vector<ScriptVarDesc> kEmpty;
+    if (path.empty() || !m_lua) return kEmpty;
+
+    auto it = m_logicTemplates.find(path);
+    if (it == m_logicTemplates.end())
+    {
+        if (!LoadLogicTemplate(path)) return kEmpty;
+        it = m_logicTemplates.find(path);
+        if (it == m_logicTemplates.end()) return kEmpty;
+    }
+    return it->second.exposed;
+}
+
+// ---------------------------------------------------------------------------
+// InjectExposedVars — write each schema variable's resolved value (override if
+// present, else default) onto the entity's live instance table. Float3/Color
+// land as Vec3 userdata (self.v.x/.y/.z); strings/assets as plain strings.
+// ---------------------------------------------------------------------------
+void ScriptSystem::InjectExposedVars(Entity e, const std::string& path,
+                                     const std::unordered_map<std::string, ScriptVarValue>* overrides)
+{
+    auto it = m_logicTemplates.find(path);
+    if (it == m_logicTemplates.end()) return;
+    const std::vector<ScriptVarDesc>& schema = it->second.exposed;
+    if (schema.empty()) return;
+
+    sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
+    if (!inst.valid()) return;
+
+    static const std::unordered_map<std::string, ScriptVarValue> kEmpty;
+    const std::unordered_map<std::string, ScriptVarValue>& ovr = overrides ? *overrides : kEmpty;
+
+    for (const ScriptVarDesc& d : schema)
+    {
+        const ScriptVarValue v = ResolveScriptVar(d, ovr);
+        switch (v.type)
+        {
+        case ScriptVarType::Float:  inst[d.name] = (double)v.data.f;            break;
+        case ScriptVarType::Int:    inst[d.name] = (int64_t)v.data.i;           break;
+        case ScriptVarType::Bool:   inst[d.name] = v.data.b;                    break;
+        case ScriptVarType::Float3:
+        case ScriptVarType::Color:  inst[d.name] = LuaVec3{ v.data.v3[0], v.data.v3[1], v.data.v3[2] }; break;
+        case ScriptVarType::String:
+        case ScriptVarType::Asset:  inst[d.name] = v.str;                       break;
+        case ScriptVarType::Entity: inst[d.name] = (uint32_t)v.data.entity;     break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ApplyExposedVars — push the component's current var values onto the live
+// instance (editor calls this during Play so slider drags show immediately).
+// ---------------------------------------------------------------------------
+void ScriptSystem::ApplyExposedVars(Entity e,
+                                    const std::unordered_map<std::string, ScriptVarValue>& overrides)
+{
+    if (!m_lua) return;
+    auto sIt = m_states.find(e);
+    if (sIt == m_states.end() || sIt->second.path.empty()) return;
+    InjectExposedVars(e, sIt->second.path, &overrides);
+}
+
+// ===========================================================================
+// LoadSystem — singleton script with OnInit/OnUpdate/OnShutdown (doc §3.3).
+// Re-loading the same path tears down the old instance and replaces it.
+// ---------------------------------------------------------------------------
+bool ScriptSystem::LoadSystem(const std::string& path)
+{
+    const std::string name = fs::path(path).stem().string();
+
+    // Tear down existing entry with the same name (hot-reload path).
+    for (auto& sys : m_systems)
+    {
+        if (sys.name == name) { TeardownSystem(sys); }
+    }
+
+    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        LOG_ERROR("ScriptSystem: system load error [%s]: %s", path.c_str(), err.what());
+        return false;
+    }
+
+    sol::object ret = result;
+    if (ret.get_type() != sol::type::table)
+    {
+        LOG_ERROR("ScriptSystem: system [%s] did not return a table", path.c_str());
+        return false;
+    }
+
+    sol::table t = ret.as<sol::table>();
+    (*m_lua)["__systems"][name] = t;
+
+    // Find or insert. Insertion preserves order; replacement keeps slot.
+    SystemEntry* slot = nullptr;
+    for (auto& sys : m_systems)
+        if (sys.name == name) { slot = &sys; break; }
+    if (!slot)
+    {
+        m_systems.push_back({});
+        slot = &m_systems.back();
+    }
+
+    slot->name        = name;
+    slot->path        = path;
+    slot->loaded      = true;
+    slot->initCalled  = false;          // OnInit fires on next Update
+    slot->hasUpdate   = t["OnUpdate"].valid();
+    slot->hasShutdown = t["OnShutdown"].valid();
+    slot->lastError.clear();
+
+    try { m_fileTimestamps[path] = fs::last_write_time(path); } catch (...) {}
+
+    LOG_INFO("ScriptSystem: loaded system [%s] from %s (OnInit=%d OnUpdate=%d OnShutdown=%d)",
+             name.c_str(), path.c_str(),
+             t["OnInit"].valid(), slot->hasUpdate, slot->hasShutdown);
+    return true;
+}
+
+bool ScriptSystem::RemoveSystem(const std::string& name)
+{
+    for (auto it = m_systems.begin(); it != m_systems.end(); ++it)
+    {
+        if (it->name != name) continue;
+        TeardownSystem(*it);
+        m_systems.erase(it);
+        return true;
+    }
+    return false;
+}
+
+void ScriptSystem::TeardownSystem(SystemEntry& sys)
+{
+    if (sys.loaded && sys.hasShutdown && sys.initCalled)
+    {
+        sol::table inst = (*m_lua)["__systems"][sys.name];
+        if (inst.valid())
+        {
+            sol::protected_function fn = inst["OnShutdown"];
+            if (fn.valid())
+            {
+                auto res = fn(inst);
+                if (!res.valid()) {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnShutdown error [%s]: %s",
+                              sys.name.c_str(), err.what());
+                }
+            }
+        }
+    }
+    (*m_lua)["__systems"][sys.name] = sol::lua_nil;
+    sys.loaded = false;
+    sys.initCalled = false;
+}
+
+// ===========================================================================
+// LoadService — singleton stateless table (doc §3.4). No callbacks fired —
+// the table is just stored under __services[name] for GetService lookups.
+// ---------------------------------------------------------------------------
+bool ScriptSystem::LoadService(const std::string& path)
+{
+    const std::string name = fs::path(path).stem().string();
+
+    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        LOG_ERROR("ScriptSystem: service load error [%s]: %s", path.c_str(), err.what());
+        return false;
+    }
+
+    sol::object ret = result;
+    if (ret.get_type() != sol::type::table)
+    {
+        LOG_ERROR("ScriptSystem: service [%s] did not return a table", path.c_str());
+        return false;
+    }
+
+    (*m_lua)["__services"][name] = ret.as<sol::table>();
+
+    auto& svc = m_services[name];
+    svc.name = name;
+    svc.path = path;
+    svc.loaded = true;
+    svc.lastError.clear();
+
+    try { m_fileTimestamps[path] = fs::last_write_time(path); } catch (...) {}
+
+    LOG_INFO("ScriptSystem: loaded service [%s] from %s", name.c_str(), path.c_str());
+    return true;
+}
+
+// ===========================================================================
+// LoadUIScript — singleton table loaded from asset/scripts/ui/*.lua. Same
+// shape as Service (no engine-driven callbacks); convention is that the
+// returned table exposes :Open(...) / :Close() that the caller drives via
+// Engine.GetUIScript(name).
+// ---------------------------------------------------------------------------
+bool ScriptSystem::LoadUIScript(const std::string& path)
+{
+    const std::string name = fs::path(path).stem().string();
+
+    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        LOG_ERROR("ScriptSystem: ui-script load error [%s]: %s", path.c_str(), err.what());
+        return false;
+    }
+
+    sol::object ret = result;
+    if (ret.get_type() != sol::type::table)
+    {
+        LOG_ERROR("ScriptSystem: ui-script [%s] did not return a table", path.c_str());
+        return false;
+    }
+
+    (*m_lua)["__ui_scripts"][name] = ret.as<sol::table>();
+
+    auto& ui = m_uiScripts[name];
+    ui.name = name;
+    ui.path = path;
+    ui.loaded = true;
+    ui.lastError.clear();
+
+    try { m_fileTimestamps[path] = fs::last_write_time(path); } catch (...) {}
+
+    LOG_INFO("ScriptSystem: loaded ui-script [%s] from %s", name.c_str(), path.c_str());
+    return true;
+}
+
+// ===========================================================================
+// DispatchAnimEvent — fire OnAnimEvent(self, name) on the entity's Logic
+// instance. Engine code (e.g. AnimationSystem when a clip event fires) can
+// call this directly; Lua side has the equivalent Engine.PublishAnimEvent.
+// Payload-less form — engine-side anim events rarely carry structured data;
+// scripts that need a payload should use Engine.PublishAnimEvent from Lua.
+// ---------------------------------------------------------------------------
+void ScriptSystem::DispatchAnimEvent(Entity e, const std::string& name)
+{
+    auto sIt = m_states.find(e);
+    if (sIt == m_states.end() || !sIt->second.initCalled) return;
+    sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
+    if (!inst.valid()) return;
+    sol::protected_function fn = inst["OnAnimEvent"];
+    if (!fn.valid()) return;
+    auto res = fn(inst, name, sol::lua_nil);
+    if (!res.valid()) {
+        sol::error err = res;
+        LOG_ERROR("Lua OnAnimEvent error [%s] entity %u name=%s: %s",
+                  sIt->second.path.c_str(), e, name.c_str(), err.what());
+    }
+}
+
+// ===========================================================================
+// ScanScriptDirectory — walk root/{services,systems,ui}/*.lua.
+// Logic templates are skipped here (they load on first ScriptComponent sight).
+// ---------------------------------------------------------------------------
+void ScriptSystem::ScanScriptDirectory(const std::string& root)
+{
+    enum class Kind { Service, System, UI };
+    auto scan = [this](const fs::path& dir, Kind kind)
+    {
+        std::error_code ec;
+        if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+
+        // Sort alphabetically so load order is deterministic across runs.
+        std::vector<fs::path> files;
+        for (auto& entry : fs::directory_iterator(dir, ec))
+        {
+            if (entry.path().extension() == ".lua")
+                files.push_back(entry.path());
+        }
+        std::sort(files.begin(), files.end());
+
+        for (const auto& f : files)
+        {
+            switch (kind)
+            {
+                case Kind::Service: LoadService (f.string()); break;
+                case Kind::System:  LoadSystem  (f.string()); break;
+                case Kind::UI:      LoadUIScript(f.string()); break;
+            }
+        }
+    };
+
+    scan(fs::path(root) / "services", Kind::Service);
+    scan(fs::path(root) / "systems",  Kind::System);
+    scan(fs::path(root) / "ui",       Kind::UI);
+}
+
+// ===========================================================================
+// Reactive per-entity cleanup hookup.
+// ---------------------------------------------------------------------------
 void ScriptSystem::BindWorld(World& world)
 {
     if (m_boundWorld == &world) return;
@@ -780,30 +1358,7 @@ void ScriptSystem::OnEntityDestroyed(World& /*world*/, Entity e)
 {
     auto it = m_states.find(e);
     if (it == m_states.end()) return;
-
-    // Fire OnDestroy before we drop the Lua env so script authors observe
-    // a still-valid entity during teardown. Same logic as SweepDestroyed,
-    // lifted here so it runs SYNCHRONOUSLY with World::DestroyEntity instead
-    // of on the next Update tick.
-    if (it->second.loaded && it->second.hasDestroy && it->second.initCalled)
-    {
-        sol::environment env = (*m_lua)["__entity_envs"][e];
-        if (env.valid())
-        {
-            sol::protected_function fn = env["OnDestroy"];
-            if (fn.valid())
-            {
-                auto res = fn();
-                if (!res.valid())
-                {
-                    sol::error err = res;
-                    LOG_ERROR("Lua OnDestroy error [%s] entity %u: %s",
-                              it->second.path.c_str(), e, err.what());
-                }
-            }
-        }
-    }
-    (*m_lua)["__entity_envs"][e] = sol::lua_nil;
+    DestroyLogicInstance(e);
     m_states.erase(it);
 }
 
@@ -814,33 +1369,12 @@ void ScriptSystem::SweepDestroyed(World& world)
         const Entity e = it->first;
         const bool gone = !world.IsAlive(e) || !world.HasComponent<ScriptComponent>(e);
         if (!gone) { ++it; continue; }
-
-        if (it->second.loaded && it->second.hasDestroy && it->second.initCalled)
-        {
-            sol::environment env = (*m_lua)["__entity_envs"][e];
-            if (env.valid())
-            {
-                sol::protected_function fn = env["OnDestroy"];
-                if (fn.valid())
-                {
-                    auto res = fn();
-                    if (!res.valid()) {
-                        sol::error err = res;
-                        LOG_ERROR("Lua OnDestroy error [%s] entity %u: %s",
-                                  it->second.path.c_str(), e, err.what());
-                    }
-                }
-            }
-        }
-
-        (*m_lua)["__entity_envs"][e] = sol::lua_nil;
+        DestroyLogicInstance(e);
         it = m_states.erase(it);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Drain the Lua event queue once. Called at the top of Update so handlers
-// see a consistent pre-frame state before any scripts run this frame.
 void ScriptSystem::DispatchLuaEvents()
 {
     m_luaBus->Dispatch(*m_lua);
@@ -854,11 +1388,11 @@ void ScriptSystem::DispatchLuaEvents()
 //
 // Entity handles collapse to uint32_t in the Lua payload because Lua isn't
 // generation-aware; scripts should still gate on Engine.IsAlive before acting.
+// ---------------------------------------------------------------------------
 void ScriptSystem::RegisterCppEventBridges()
 {
     auto& bus = EventBus::Get();
 
-    // FollowTargetLost
     {
         const auto sub = bus.Subscribe<FollowTargetLostEvent>(
             [this](const FollowTargetLostEvent& e)
@@ -872,7 +1406,6 @@ void ScriptSystem::RegisterCppEventBridges()
             [sub] { EventBus::Get().Unsubscribe<FollowTargetLostEvent>(sub); });
     }
 
-    // WeaponEquipped
     {
         const auto sub = bus.Subscribe<WeaponEquippedEvent>(
             [this](const WeaponEquippedEvent& e)
@@ -887,7 +1420,6 @@ void ScriptSystem::RegisterCppEventBridges()
             [sub] { EventBus::Get().Unsubscribe<WeaponEquippedEvent>(sub); });
     }
 
-    // WeaponUnequipped
     {
         const auto sub = bus.Subscribe<WeaponUnequippedEvent>(
             [this](const WeaponUnequippedEvent& e)
@@ -901,21 +1433,46 @@ void ScriptSystem::RegisterCppEventBridges()
             [sub] { EventBus::Get().Unsubscribe<WeaponUnequippedEvent>(sub); });
     }
 
-    // ContactBegan (physics)
     {
         const auto sub = bus.Subscribe<ContactBeganEvent>(
             [this](const ContactBeganEvent& e)
             {
-                sol::table t = m_lua->create_table();
-                t["bodyA"]  = static_cast<uint32_t>(e.bodyA.entity);
-                t["bodyB"]  = static_cast<uint32_t>(e.bodyB.entity);
                 sol::table point  = m_lua->create_table();
                 point["x"] = e.point.x; point["y"] = e.point.y; point["z"] = e.point.z;
                 sol::table normal = m_lua->create_table();
                 normal["x"] = e.normal.x; normal["y"] = e.normal.y; normal["z"] = e.normal.z;
+
+                // 1) Generic broadcast on the Lua bus (anyone can subscribe).
+                sol::table t = m_lua->create_table();
+                t["bodyA"]  = static_cast<uint32_t>(e.bodyA.entity);
+                t["bodyB"]  = static_cast<uint32_t>(e.bodyB.entity);
                 t["point"]  = point;
                 t["normal"] = normal;
                 m_luaBus->Publish("ContactBegan", std::move(t));
+
+                // 2) Targeted Trigger dispatch — fire OnEnter(self, other,
+                //    point, normal) on each body's own Logic instance if its
+                //    template defined OnEnter. This is what makes any Logic
+                //    script that defines OnEnter behave as a Trigger volume
+                //    without needing a separate component category.
+                auto fire = [&](Entity self, Entity other)
+                {
+                    auto sIt = m_states.find(self);
+                    if (sIt == m_states.end() || !sIt->second.initCalled) return;
+                    sol::table inst = (*m_lua)["__logic_instances"]
+                        [static_cast<uint32_t>(self)];
+                    if (!inst.valid()) return;
+                    sol::protected_function fn = inst["OnEnter"];
+                    if (!fn.valid()) return;
+                    auto res = fn(inst, static_cast<uint32_t>(other), point, normal);
+                    if (!res.valid()) {
+                        sol::error err = res;
+                        LOG_ERROR("Lua OnEnter error [%s] entity %u: %s",
+                                  sIt->second.path.c_str(), self, err.what());
+                    }
+                };
+                fire(e.bodyA.entity, e.bodyB.entity);
+                fire(e.bodyB.entity, e.bodyA.entity);
             });
         m_cppBridgeUnsubscribers.push_back(
             [sub] { EventBus::Get().Unsubscribe<ContactBeganEvent>(sub); });
@@ -926,76 +1483,86 @@ void ScriptSystem::RegisterCppEventBridges()
 void ScriptSystem::Update(World& world, float dt)
 {
     m_elapsed += dt;
-
-    // Publish the current frame's world to Engine.* Lua bindings. Stored for
-    // the duration of this call; cleared at the bottom so any Lua invocation
-    // happening outside Update (which shouldn't happen in normal flow) sees
-    // a null world rather than a dangling pointer.
     m_world = &world;
 
-    // Update Time table.
     (*m_lua)["Time"]["dt"]      = dt;
     (*m_lua)["Time"]["elapsed"] = m_elapsed;
 
-    // Fire OnDestroy for any entity that lost its ScriptComponent between the
-    // previous frame and this one, then drop its env. Done first so later
-    // stages work with a pruned state map.
     SweepDestroyed(world);
-
-    // Deliver events queued by C++ systems last frame (and any Lua publishes
-    // from the previous frame that missed the window). Subscribers may
-    // Publish new events; those land in next frame's dispatch.
     DispatchLuaEvents();
 
-    // ---- Global scripts: Init once, Update every frame ---------------------
-    for (auto& [path, st] : m_globalStates)
+    // ---- Systems: OnInit once, OnUpdate every frame -----------------------
+    for (auto& sys : m_systems)
     {
-        if (!st.loaded) continue;
-        sol::environment env = (*m_lua)["__global_envs"][path];
-        if (!env.valid()) continue;
+        if (!sys.loaded) continue;
+        sol::table inst = (*m_lua)["__systems"][sys.name];
+        if (!inst.valid()) continue;
 
-        if (st.hasInit && !st.initCalled)
+        if (!sys.initCalled)
         {
-            sol::protected_function fn = env["Init"];
-            auto res = fn();
-            if (!res.valid()) {
-                sol::error err = res;
-                LOG_ERROR("Lua Init error [%s]: %s", path.c_str(), err.what());
+            sol::protected_function init = inst["OnInit"];
+            if (init.valid())
+            {
+                auto res = init(inst);
+                if (!res.valid()) {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnInit error [%s]: %s", sys.name.c_str(), err.what());
+                }
             }
-            st.initCalled = true;
+            sys.initCalled = true;
         }
-        if (st.hasUpdate)
+
+        if (sys.hasUpdate)
         {
-            sol::protected_function fn = env["Update"];
-            auto res = fn(dt);
+            sol::protected_function upd = inst["OnUpdate"];
+            auto res = upd(inst, dt);
             if (!res.valid()) {
                 sol::error err = res;
-                LOG_ERROR("Lua Update error [%s]: %s", path.c_str(), err.what());
-                st.hasUpdate = false;
+                LOG_ERROR("Lua OnUpdate error [%s]: %s", sys.name.c_str(), err.what());
+                sys.hasUpdate = false; // stop calling broken update
             }
         }
     }
 
-    for (Entity e : world.GetEntities())
+    // ---- Logic: per-entity instances ---------------------------------------
+    // Iterate the ScriptComponent pool directly (not world.GetEntities() —
+    // that walks ALL entities and HasComponent-filters, which is the documented
+    // ECS anti-pattern). Snapshot the entity list because OnSpawn callbacks may
+    // call Engine.AttachScript on other entities, which would push into the
+    // pool's dense vector mid-iteration; new attachments are picked up next
+    // frame.
+    auto* scPool = world.GetPool<ScriptComponent>();
+    if (!scPool || scPool->Entities().empty()) { m_world = nullptr; return; }
+
+    const std::vector<Entity> entitiesSnapshot(
+        scPool->Entities().begin(), scPool->Entities().end());
+
+    for (Entity e : entitiesSnapshot)
     {
         if (!world.IsAlive(e)) continue;
-        auto* sc = world.GetComponent<ScriptComponent>(e);
+        auto* sc = scPool->Get(e);
         if (!sc || sc->scriptPath.empty() || !sc->enabled) continue;
 
         auto& st = m_states[e];
 
-        // Lazy load / reload on path change.
-        if (!st.loaded || st.path != sc->scriptPath)
-            LoadScript(e, sc->scriptPath, world);
-        if (!st.loaded) continue;
+        // Lazy load template / re-load on path change.
+        if (st.path != sc->scriptPath)
+        {
+            // Path changed (or first sight). Tear down old instance if any.
+            if (!st.path.empty()) DestroyLogicInstance(e);
+            st = {};                           // reset metadata
+            st.path = sc->scriptPath;
+        }
 
-        sol::environment env = (*m_lua)["__entity_envs"][e];
+        // Ensure template loaded.
+        if (m_logicTemplates.find(sc->scriptPath) == m_logicTemplates.end())
+        {
+            if (!LoadLogicTemplate(sc->scriptPath)) continue;
+        }
+        st.loaded = true;
 
-        // Snapshot the entity's LocalTransform the first time the script
-        // sees it so Init (and Update) can read GetBasePosition etc. If the
-        // entity has no LocalTransform yet, fall through with default-
-        // constructed zeros — the user can call ResetBase later once a
-        // transform is attached. Preserved across hot reloads.
+        // Snapshot baseline LocalTransform once. Done BEFORE OnSpawn so the
+        // script can read GetBasePosition() inside OnSpawn.
         if (!st.baseCaptured)
         {
             if (const LocalTransform* lt = world.GetComponent<LocalTransform>(e))
@@ -1003,27 +1570,30 @@ void ScriptSystem::Update(World& world, float dt)
             st.baseCaptured = true;
         }
 
-        // One-shot Init().
-        if (st.hasInit && !st.initCalled)
+        // Ensure instance + fire OnSpawn once.
+        if (!st.initCalled)
         {
-            sol::protected_function fn = env["Init"];
-            auto res = fn();
-            if (!res.valid()) {
-                sol::error err = res;
-                LOG_ERROR("Lua Init error [%s]: %s", st.path.c_str(), err.what());
-            }
+            if (!EnsureLogicInstance(e, sc->scriptPath, &sc->vars)) continue;
             st.initCalled = true;
         }
 
-        // Per-frame Update(dt).
-        if (st.hasUpdate)
+        // Per-frame OnUpdate(self, dt).
+        const auto& tmpl = m_logicTemplates[sc->scriptPath];
+        if (tmpl.hasUpdate)
         {
-            sol::protected_function fn = env["Update"];
-            auto res = fn(dt);
+            sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
+            if (!inst.valid()) continue;
+
+            sol::protected_function fn = inst["OnUpdate"];
+            auto res = fn(inst, dt);
             if (!res.valid()) {
                 sol::error err = res;
-                LOG_ERROR("Lua Update error [%s]: %s", st.path.c_str(), err.what());
-                st.hasUpdate = false; // stop calling broken script
+                LOG_ERROR("Lua OnUpdate error [%s] entity %u: %s",
+                          st.path.c_str(), e, err.what());
+                // Disable this entity's update to stop spamming. Mark template
+                // hasUpdate = false would disable for ALL entities — wrong.
+                // Cheap workaround: clear path so next frame skips load.
+                sc->enabled = false;
             }
         }
     }
@@ -1032,24 +1602,74 @@ void ScriptSystem::Update(World& world, float dt)
 }
 
 // ===========================================================================
-void ScriptSystem::CheckHotReload(World& world)
+// CheckHotReload — for each tracked file, if mtime changed:
+//   - Logic template: re-load template; live instances re-bind to the new
+//     template via metatable __index (their per-entity state is preserved).
+//   - System: tear down (OnShutdown) + LoadSystem (OnInit fires next Update).
+//   - Service: re-load — Lua callers caching the table see the old one until
+//     they re-fetch via Engine.GetService.
+// ---------------------------------------------------------------------------
+void ScriptSystem::CheckHotReload(World& /*world*/)
 {
     for (auto& [path, oldTime] : m_fileTimestamps)
     {
         try {
-            auto newTime = std::filesystem::last_write_time(path);
-            if (newTime != oldTime)
+            auto newTime = fs::last_write_time(path);
+            if (newTime == oldTime) continue;
+            oldTime = newTime;
+
+            // Logic template?
+            if (m_logicTemplates.find(path) != m_logicTemplates.end())
             {
-                oldTime = newTime;
-                // Reload all entities using this script.
+                LOG_INFO("ScriptSystem: hot-reload logic template [%s]", path.c_str());
+                if (!LoadLogicTemplate(path)) continue;
+                // Re-point every live instance's metatable.__index at the
+                // freshly loaded template. Per-entity self.entity / cached
+                // fields survive untouched.
+                sol::table newTmpl = (*m_lua)["__logic_templates"][path];
                 for (auto& [entity, st] : m_states)
                 {
-                    if (st.path == path)
-                    {
-                        st.loaded = false; // triggers reload next Update
-                        LOG_INFO("ScriptSystem: hot-reload detected for [%s]", path.c_str());
-                    }
+                    if (st.path != path) continue;
+                    sol::table inst = (*m_lua)["__logic_instances"]
+                        [static_cast<uint32_t>(entity)];
+                    if (!inst.valid()) continue;
+                    sol::table mt = m_lua->create_table();
+                    mt["__index"] = newTmpl;
+                    inst[sol::metatable_key] = mt;
                 }
+                continue;
+            }
+
+            // System?
+            bool isSystem = false;
+            for (const auto& sys : m_systems)
+                if (sys.path == path) { isSystem = true; break; }
+            if (isSystem)
+            {
+                LOG_INFO("ScriptSystem: hot-reload system [%s]", path.c_str());
+                LoadSystem(path);
+                continue;
+            }
+
+            // Service?
+            bool wasService = false;
+            for (const auto& [name, svc] : m_services)
+            {
+                if (svc.path != path) continue;
+                wasService = true;
+                LOG_INFO("ScriptSystem: hot-reload service [%s]", path.c_str());
+                LoadService(path);
+                break;
+            }
+            if (wasService) continue;
+
+            // UI script?
+            for (const auto& [name, ui] : m_uiScripts)
+            {
+                if (ui.path != path) continue;
+                LOG_INFO("ScriptSystem: hot-reload ui-script [%s]", path.c_str());
+                LoadUIScript(path);
+                break;
             }
         } catch (...) {}
     }

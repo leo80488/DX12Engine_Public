@@ -1,10 +1,12 @@
 #include "Scene/EndScene.h"
 #include "Scene/TitleScene.h"
 #include "ECS/Components.h"
-#include "Resource/WorldSerializer.h"
+#include "ECS/CameraSystem.h"
+#include "Resource/SceneSerializer.h"
 #include "Resource/AssetManager.h"
 #include "Resource/AssetFS.h"
 #include "Graphics/Renderer.h"
+#include "Input/InputSystem.h"
 #include "System/Log.h"
 
 #include <fstream>
@@ -16,16 +18,16 @@
 
 namespace
 {
-    constexpr const char* kEndWorldPath = "asset/scenes/end.iworld";
+    constexpr const char* kEndScenePath = "asset/scenes/end.iscene";
 
-    bool TryLoadWorld(SceneContext& ctx, const char* path)
+    bool TryLoadScene(GameModeContext& ctx, const char* path)
     {
         if (!::Resource::AssetFS::Get().HasInPak(path)
             && !std::ifstream(path).good())
             return false;
         if (!ctx.assetMgr) return false;
         std::string ppc;
-        return ::Resource::LoadWorld(
+        return ::Resource::LoadScene(
             path, *ctx.world, *ctx.assetMgr,
             &ctx.renderer, /*animClipSys=*/nullptr,
             /*outName=*/nullptr, &ppc);
@@ -35,17 +37,21 @@ namespace
     {
         Entity cam = world.CreateEntity();
         world.SetName(cam, "End Camera");
+        CameraControllerComponent camCtrl{};
         world.AddComponent<CameraComponent>(cam, CameraComponent{});
+        world.AddComponent<CameraControllerComponent>(cam, camCtrl);
+        world.AddComponent<LocalTransform>(cam, CameraSystem::MakeTransform(camCtrl, { 4.f, 3.f, 5.f }));
+        world.AddComponent<GlobalTransform>(cam, GlobalTransform{});
         tracked.push_back(cam);
     }
 }
 
-void EndScene::Init(SceneContext* ctx)
+void EndScene::Init(GameModeContext* ctx)
 {
     m_ctx = ctx;
     if (!m_ctx || !m_ctx->world)
     {
-        LOG_ERROR("EndScene: Init received null SceneContext / World");
+        LOG_ERROR("EndScene: Init received null GameModeContext / World");
         return;
     }
     LOG_INFO("=== END === press ENTER to return to title");
@@ -53,10 +59,10 @@ void EndScene::Init(SceneContext* ctx)
     World& world = *m_ctx->world;
     world.Clear();
 
-    if (!TryLoadWorld(*m_ctx, kEndWorldPath))
+    if (!TryLoadScene(*m_ctx, kEndScenePath))
     {
-        LOG_INFO("EndScene: '%s' missing — using built-in fallback (Save World "
-                 "from Editor to author it)", kEndWorldPath);
+        LOG_INFO("EndScene: '%s' missing — using built-in fallback (Save Scene "
+                 "from Editor to author it)", kEndScenePath);
         SpawnFallback(world, m_spawnedEntities);
     }
 }
@@ -65,10 +71,10 @@ void EndScene::Update(float /*dt*/)
 {
     if (!m_ctx) return;
 
-    if ((GetAsyncKeyState(VK_RETURN) & 1) && m_ctx->requestReplaceScene)
+    if (Input::Get().WasKeyPressed(VK_RETURN) && m_ctx->requestReplaceMode)
     {
         LOG_INFO("EndScene: -> TitleScene");
-        m_ctx->requestReplaceScene(std::make_unique<TitleScene>());
+        m_ctx->requestReplaceMode(std::make_unique<TitleScene>());
     }
 }
 

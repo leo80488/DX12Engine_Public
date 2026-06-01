@@ -2,11 +2,13 @@
 #include "Scene/EndScene.h"
 #include "Scene/MeshSpawner.h"
 #include "ECS/Components.h"
+#include "ECS/CameraSystem.h"
 #include "ECS/SkyboxComponent.h"
-#include "Resource/WorldSerializer.h"
+#include "Resource/SceneSerializer.h"
 #include "Resource/AssetManager.h"
 #include "Resource/AnimationClipSystem.h"
 #include "Graphics/Renderer.h"
+#include "Input/InputSystem.h"
 #include "System/Log.h"
 
 #include "Resource/AssetFS.h"
@@ -22,11 +24,11 @@
 namespace
 {
     // Built-in default if neither game.json nor a manifest override applies.
-    // Author this in Editor (File → Save World) to get a data-driven default
+    // Author this in Editor (File → Save Scene) to get a data-driven default
     // GameScene without needing a game.json.
-    constexpr const char* kDefaultGameWorld = "asset/scenes/game.iworld";
+    constexpr const char* kDefaultGameScene = "asset/scenes/game.iscene";
 
-    bool WorldExists(const std::string& path)
+    bool SceneExists(const std::string& path)
     {
         if (path.empty()) return false;
         if (::Resource::AssetFS::Get().HasInPak(path)) return true;
@@ -34,9 +36,9 @@ namespace
         return f.good();
     }
 
-    // Read game.json's "startup_world" string. Returns "" if file missing,
+    // Read game.json's "startup_scene" string. Returns "" if file missing,
     // not parseable, or field absent / empty.
-    std::string ReadStartupWorld(const char* manifestPath)
+    std::string ReadStartupScene(const char* manifestPath)
     {
         std::ifstream f(manifestPath);
         if (!f) return {};
@@ -44,8 +46,8 @@ namespace
         {
             nlohmann::json j;
             f >> j;
-            if (j.contains("startup_world") && j["startup_world"].is_string())
-                return j["startup_world"].get<std::string>();
+            if (j.contains("startup_scene") && j["startup_scene"].is_string())
+                return j["startup_scene"].get<std::string>();
         }
         catch (const std::exception& e)
         {
@@ -60,7 +62,11 @@ namespace
     {
         Entity cam = world.CreateEntity();
         world.SetName(cam, "Main Camera");
+        CameraControllerComponent camCtrl{};
         world.AddComponent<CameraComponent>(cam, CameraComponent{});
+        world.AddComponent<CameraControllerComponent>(cam, camCtrl);
+        world.AddComponent<LocalTransform>(cam, CameraSystem::MakeTransform(camCtrl, { 4.f, 3.f, 5.f }));
+        world.AddComponent<GlobalTransform>(cam, GlobalTransform{});
         tracked.push_back(cam);
 
         Entity light = world.CreateEntity();
@@ -90,12 +96,12 @@ namespace
     }
 }
 
-void GameScene::Init(SceneContext* ctx)
+void GameScene::Init(GameModeContext* ctx)
 {
     m_ctx = ctx;
     if (!m_ctx || !m_ctx->world)
     {
-        LOG_ERROR("GameScene: Init received null SceneContext / World");
+        LOG_ERROR("GameScene: Init received null GameModeContext / World");
         return;
     }
     LOG_INFO("=== GAME === press Q to end");
@@ -105,26 +111,26 @@ void GameScene::Init(SceneContext* ctx)
     // Fresh slate — Title's entities (or the previous game's) get wiped.
     world.Clear();
 
-    // Resolve the world to load, in priority order:
-    //   1. game.json "startup_world"
-    //   2. asset/scenes/game.iworld (engine convention)
+    // Resolve the scene to load, in priority order:
+    //   1. game.json "startup_scene"
+    //   2. asset/scenes/game.iscene (engine convention)
     //   3. built-in hardcoded defaults
-    std::string worldPath = ReadStartupWorld("game.json");
-    if (worldPath.empty() && WorldExists(kDefaultGameWorld))
-        worldPath = kDefaultGameWorld;
+    std::string scenePath = ReadStartupScene("game.json");
+    if (scenePath.empty() && SceneExists(kDefaultGameScene))
+        scenePath = kDefaultGameScene;
 
-    if (!worldPath.empty() && m_ctx->assetMgr != nullptr)
+    if (!scenePath.empty() && m_ctx->assetMgr != nullptr)
     {
-        LOG_INFO("GameScene: loading world '%s'", worldPath.c_str());
+        LOG_INFO("GameScene: loading scene '%s'", scenePath.c_str());
         std::string ppcPath;
-        const bool ok = Resource::LoadWorld(
-            worldPath, world, *m_ctx->assetMgr,
+        const bool ok = Resource::LoadScene(
+            scenePath, world, *m_ctx->assetMgr,
             &m_ctx->renderer, /*animClipSys=*/nullptr,
             /*outName=*/nullptr, &ppcPath);
         if (!ok)
         {
-            LOG_ERROR("GameScene: LoadWorld('%s') failed — falling back to defaults",
-                      worldPath.c_str());
+            LOG_ERROR("GameScene: LoadScene('%s') failed — falling back to defaults",
+                      scenePath.c_str());
             SpawnDefaults(world, m_spawnedEntities);
         }
         else
@@ -134,7 +140,7 @@ void GameScene::Init(SceneContext* ctx)
     }
     else
     {
-        LOG_INFO("GameScene: no startup_world / asset/scenes/game.iworld — using defaults");
+        LOG_INFO("GameScene: no startup_scene / asset/scenes/game.iscene — using defaults");
         SpawnDefaults(world, m_spawnedEntities);
     }
 }
@@ -145,10 +151,10 @@ void GameScene::Update(float /*dt*/)
 
     // Placeholder game-over trigger: press Q. Replace with real win/lose
     // detection (player HP <= 0, boss defeated, timer expired, …).
-    if ((GetAsyncKeyState('Q') & 1) && m_ctx->requestReplaceScene)
+    if (Input::Get().WasKeyPressed('Q') && m_ctx->requestReplaceMode)
     {
         LOG_INFO("GameScene: -> EndScene");
-        m_ctx->requestReplaceScene(std::make_unique<EndScene>());
+        m_ctx->requestReplaceMode(std::make_unique<EndScene>());
     }
 }
 
@@ -159,8 +165,8 @@ void GameScene::Shutdown()
 
     if (m_loadedFromManifest)
     {
-        // World was rebuilt by LoadWorld — easiest is to wipe it; the next
-        // scene starts clean and its Init populates as it sees fit.
+        // World was rebuilt by LoadScene — easiest is to wipe it; the next
+        // mode starts clean and its Init populates as it sees fit.
         world.Clear();
     }
     else

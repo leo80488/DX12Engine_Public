@@ -13,6 +13,7 @@ struct GPUInstanceData
     uint32_t            materialIdx;    //  4 bytes
     uint32_t            lodLevel;       //  4 bytes
     uint32_t            pad;            //  4 bytes
-};                                       // total: 80 bytes
+    DirectX::XMFLOAT4X4 prevWorld;      // 64 bytes — prev-frame world (for TAA velocity)
+};                                       // total: 144 bytes
 
-static_assert(sizeof(GPUInstanceData) == 80, "GPUInstanceData must be 80 bytes");
+static_assert(sizeof(GPUInstanceData) == 144, "GPUInstanceData must be 144 bytes");

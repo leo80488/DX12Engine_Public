@@ -56,9 +56,9 @@ void TrailUpdatePass::Execute(RHI::CommandList cl)
                                         m_sys->GetRequestCount());
 
     gfx.BindComputePipelineState(m_pso, cl);
-    gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(), 0, cl);
+    gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(*m_gfx), 0, cl);
 
-    const uint64_t reqSrv = m_gfx->GetBufferSRVGpuHandle(m_sys->GetRequestBuffer());
+    const uint64_t reqSrv = m_gfx->GetBufferSRVGpuHandle(m_sys->GetRequestBuffer(*m_gfx));
     gfx.SetComputeDescriptorTable(kCSRequestSRV, reqSrv, cl);
     gfx.SetComputeDescriptorTable(kCSSegmentUAV, m_sys->GetSegmentUAVHandle(), cl);
     gfx.SetComputeDescriptorTable(kCSHeaderUAV,  m_sys->GetHeaderUAVHandle(),  cl);
@@ -141,35 +141,32 @@ void TrailRenderPass::Init(IGraphicsDevice& gfx)
         return;
     }
 
-    RHI::GPUBufferDesc cbd{};
-    cbd.size       = 256;
-    cbd.usage      = RHI::Usage::UPLOAD;
-    cbd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(cbd, m_renderCB))
-        m_renderCBMapped = gfx.MapBuffer(m_renderCB);
-    if (!m_renderCBMapped)
-        LOG_ERROR("TrailRenderPass: render CB map failed");
+    if (!m_renderCB.Create(gfx, "TrailRenderPass.RenderCB"))
+        LOG_ERROR("TrailRenderPass: render CB create failed");
 
     LOG_SUCCESS("TrailRenderPass: initialised");
 }
 
 RHI::CommandList TrailRenderPass::Execute(RHI::CommandList cl)
 {
-    if (!m_sys || !m_pso.IsValid() || !m_renderCBMapped) return cl;
+    if (!m_sys || !m_pso.IsValid() || !m_renderCB.IsValid()) return cl;
     if (m_sys->GetMaxActiveSlot() == 0) return cl;   // nothing to draw
 
-    using namespace DirectX;
-    RenderCB cb{};
-    XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
-    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
-                    XMMatrixTranspose(vp));
-    cb.camForward[0] = m_camForward.x;
-    cb.camForward[1] = m_camForward.y;
-    cb.camForward[2] = m_camForward.z;
-    cb.maxSegments   = TrailSystem::kMaxSegmentsPerTrail;
-    std::memcpy(m_renderCBMapped, &cb, sizeof(cb));
-
     auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
+
+    using namespace DirectX;
+    if (auto* slot = m_renderCB.Current(gfx))
+    {
+        RenderCB cb{};
+        XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
+        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
+                        XMMatrixTranspose(vp));
+        cb.camForward[0] = m_camForward.x;
+        cb.camForward[1] = m_camForward.y;
+        cb.camForward[2] = m_camForward.z;
+        cb.maxSegments   = TrailSystem::kMaxSegmentsPerTrail;
+        *slot = cb;
+    }
 
     const RHI::Texture* depthTex = cl.GetContext().GetTexture(m_depth);
     gfx.SetRenderTargetToHdrWithDepth(depthTex, cl);
@@ -179,7 +176,7 @@ RHI::CommandList TrailRenderPass::Execute(RHI::CommandList cl)
     cl.SetPipelineState(m_pso);
     cl.SetPrimitiveTopology(RHI::PrimitiveTopology::TRIANGLELIST);
 
-    gfx.BindConstantBuffer(m_renderCB, /*slot=*/1, cl);
+    gfx.BindConstantBuffer(m_renderCB.CurrentBuffer(gfx), /*slot=*/1, cl);
     cl.BindDescriptorTableHandle(kGfxSegmentSRVSlot, m_sys->GetSegmentSRVHandle());
     cl.BindDescriptorTableHandle(kGfxHeaderSRVSlot,  m_sys->GetHeaderSRVHandle());
 

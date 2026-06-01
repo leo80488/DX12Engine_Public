@@ -256,6 +256,65 @@ void AnimationSystem::Update(World& world, float dt,
         const MorphClipAsset& mc = m_morphClips.Get(morphComp->primaryMorphClip);
         SampleMorphClip(mc, morphComp->time, morphComp);
     }
+
+    // ---- Third pass: rest-pose fallback for skeletons without a clip --------
+    // Keeps the GPU skinning pipeline running on un-animated characters so
+    // MorphComponent weights (authored in the editor or by scripts) still
+    // deform the mesh. Without this, LocalToWorldSystem skips → poseByteOffset
+    // stays ~0u → SkinningPass + morph compute never run.
+    auto* pSkelAll = world.GetPool<SkeletonComponent>();
+    const size_t skelAllN = pSkelAll ? pSkelAll->Data().size() : 0;
+    const auto&  skelAllEnts = pSkelAll ? pSkelAll->Entities() : std::vector<Entity>{};
+    for (size_t si = 0; si < skelAllN; ++si)
+    {
+        const Entity e = skelAllEnts[si];
+        if (activeSet && activeSet->find(e) == activeSet->end()) continue;
+        auto* skel = &pSkelAll->Data()[si];
+        if (skel->assetIndex == kInvalidAnimHandle || skel->boneCount == 0) continue;
+
+        // Skip if a clip already wrote a fresh pose in pass 1.
+        auto* anim = pAnim ? pAnim->Get(e) : nullptr;
+        if (anim && anim->primaryClip != kInvalidAnimHandle &&
+            anim->primaryClip < m_clips.Count()) continue;
+
+        EnsureCacheSize(e);
+        std::vector<LocalPose>& poseVec = m_localPoseCache[e];
+        if (poseVec.size() == skel->boneCount && m_lastClipCache[e] == kInvalidAnimHandle - 1u)
+            continue; // already initialized to rest pose previously, no clip churn
+
+        const SkeletonAsset& skelAsset = m_skeletons.Get(skel->assetIndex);
+        poseVec.resize(skel->boneCount);
+        for (uint32_t b = 0; b < skel->boneCount; ++b)
+        {
+            XMVECTOR sc, rot, tr;
+            // Check the return value: XMMatrixDecompose leaves sc/rot/tr
+            // UNSPECIFIED on failure (typically NaN). If we store those
+            // unchecked, LocalToWorld propagates NaN into the skin matrix,
+            // processAABB reads it, vmin/vmax become NaN/Inf, that lands
+            // in WorldAabb and SceneBVH::BuildRecursive AVs at bins[b]
+            // (Center() = NaN → (int)NaN = INT_MIN, out-of-range write).
+            // Fall back to translation-only on failure — preserves bone
+            // position so the chain still places skinned vertices roughly
+            // right and stops the NaN propagation cold.
+            if (XMMatrixDecompose(&sc, &rot, &tr,
+                                  XMLoadFloat4x4(&skelAsset.restPoseLocal[b])))
+            {
+                XMStoreFloat3(&poseVec[b].pos, tr);
+                XMStoreFloat4(&poseVec[b].rot, rot);
+                XMStoreFloat3(&poseVec[b].scl, sc);
+            }
+            else
+            {
+                const XMFLOAT4X4& m = skelAsset.restPoseLocal[b];
+                poseVec[b].pos = { m._41, m._42, m._43 };
+                poseVec[b].rot = { 0.f, 0.f, 0.f, 1.f };
+                poseVec[b].scl = { 1.f, 1.f, 1.f };
+            }
+        }
+        // Sentinel: rest-pose state. Re-bind the clip later → first pass sees
+        // lastClip != primaryClip and re-inits properly.
+        m_lastClipCache[e] = kInvalidAnimHandle - 1u;
+    }
 }
 
 // ---------------------------------------------------------------------------

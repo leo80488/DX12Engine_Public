@@ -2,25 +2,32 @@
 #include "Resource/AssetHeader.h"
 #include "Resource/AssetFS.h"
 #include "Resource/AssetManager.h"
+#include "Resource/ResourceManager.h"
+#include "Resource/ResourceHandle.h"
 #include "Resource/AnimationClipSystem.h"
 #include "Resource/ComponentSerializers.h"
 #include "Resource/MaterialSerializer.h"
 #include "Resource/PostProcessConfig.h"
+#include "System/TaskSystem.h"
 #include "ECS/Components.h"
 #include "ECS/HierarchyComponents.h"
 #include "ECS/AnimationComponents.h"
 #include "ECS/BillboardComponent.h"
 #include "ECS/SkyboxComponent.h"
+#include "ECS/PhysicsComponents.h"   // ColliderComponent / RigidBodyComponent (MC override lines)
 #include "Scene/SceneInstanceLoader.h"
 #include "Graphics/Renderer.h"
 #include "System/Log.h"
 
 #include <DirectXMath.h>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <functional>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -198,6 +205,204 @@ bool ParseComponentLine(const std::string& line, int currentNodeIdx, ComponentBl
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 / Phase 2 pre-load helpers (SceneLoading_ResourceManager v2 §5.3, §8.1)
+// ---------------------------------------------------------------------------
+//
+// LoadWorld used to Clear() the world *before* deserialize ran, so any texture
+// or anim shared with the previous world fell out of the system caches and was
+// reloaded from disk during the first frames after load. The new flow kicks
+// off async I/O for every loader-backed path *before* Clear(), waits for the
+// RM slots to reach Ready, then clears + deserializes. Path-hash dedup keeps
+// the common subset warm across the swap; new resources finish loading on
+// worker threads while we're still rendering the old world from the editor
+// UI thread.
+//
+// Only paths whose extension has a registered IResourceLoader can be batched
+// here. Today that's textures (MaterialOverride 't:'-typed values) and anim
+// clips (AnimRef.path). .iscn / .meshlib / .imsh stay on the synchronous
+// path inside SceneInstanceLoader / MeshLibrary — pre-loading those needs
+// loaders to be registered first.
+
+struct PreloadEntry
+{
+    std::string            path;
+    Resource::ResourceType type;
+};
+
+std::vector<PreloadEntry> CollectPreloadPaths(const std::vector<ComponentBlock>& compBlocks)
+{
+    std::vector<PreloadEntry> out;
+    std::unordered_set<uint64_t> seen;
+
+    auto Add = [&](std::string path, Resource::ResourceType type) {
+        if (path.empty()) return;
+        // FNV-1a over normalized-ish path — RM does its own normalization on Load,
+        // we only need dedup within this single LoadWorld call.
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char c : path) { h ^= c; h *= 1099511628211ULL; }
+        if (!seen.insert(h).second) return;
+        out.push_back({ std::move(path), type });
+    };
+
+    for (const auto& cb : compBlocks)
+    {
+        if (cb.tag == "MaterialOverride")
+        {
+            for (const auto& [rawKey, rawVal] : cb.kv)
+            {
+                if (rawVal.size() < 2 || rawVal[0] != 't' || rawVal[1] != ':') continue;
+                Add(PercentDecode(rawVal.substr(2)), Resource::ResourceType::Texture);
+            }
+        }
+        else if (cb.tag == "AnimRef")
+        {
+            auto it = cb.kv.find("path");
+            if (it != cb.kv.end())
+                Add(PercentDecode(it->second), Resource::ResourceType::Animation);
+        }
+    }
+    return out;
+}
+
+// Collect .iscn paths (SceneRef components) for fire-and-forget OS page-cache
+// warmup. SceneInstanceLoader::Load still reads sync after Clear, but the
+// kernel page cache has the .iscn bytes hot from the warmup, so the
+// stdio/AssetFS read inside SceneInstanceLoader returns from RAM instead of
+// disk. No RM integration — these don't have IResourceLoaders registered.
+std::vector<std::string> CollectScenePaths(const std::vector<ComponentBlock>& compBlocks)
+{
+    std::vector<std::string> out;
+    std::unordered_set<uint64_t> seen;
+    for (const auto& cb : compBlocks)
+    {
+        if (cb.tag != "SceneRef") continue;
+        auto it = cb.kv.find("path");
+        if (it == cb.kv.end()) continue;
+        std::string path = PercentDecode(it->second);
+        if (path.empty()) continue;
+        uint64_t h = 14695981039346656037ULL;
+        for (unsigned char c : path) { h ^= c; h *= 1099511628211ULL; }
+        if (!seen.insert(h).second) continue;
+        out.push_back(std::move(path));
+    }
+    return out;
+}
+
+// Recursive page-cache warmup for one .iscn — opens the file on a worker,
+// parses out the sibling references (.meshlib via F file=, .imat via F mat=,
+// .iskel via K file=, .imorph via M file=) and pushes a secondary read job
+// per unique sibling. By the time SceneInstanceLoader's sync read kicks in,
+// every file it touches is sitting in the OS page cache.
+//
+// Why no RM integration: these extensions have no registered IResourceLoader,
+// so rm->Load can't drive them. The bytes here are discarded — sole purpose
+// is hinting the kernel cache. Cost is bounded by .iscn text size (≤ few
+// hundred KB even for Bistro) + N small worker reads.
+void EnqueueIscnRecursiveWarmup(const std::string& scenePath)
+{
+    TaskSystem::Get().Push([scenePath]()
+    {
+        std::vector<uint8_t> blob;
+        if (!::Resource::AssetFS::Get().ReadFile(scenePath, blob)) return;
+        if (blob.empty()) return;
+        if (!::Resource::ValidateHeader(blob.data(), blob.size(),
+                                        ::Resource::MAGIC_SCENE)) return;
+
+        const char* text = reinterpret_cast<const char*>(
+            ::Resource::GetPayload(blob.data()));
+        const std::filesystem::path sceneDir =
+            std::filesystem::path(scenePath).parent_path();
+
+        std::unordered_set<uint64_t> seen;  // dedup per .iscn
+        uint32_t enqueued = 0;
+        auto pushWarmup = [&seen, &sceneDir, &enqueued](std::string filename) {
+            // Trim trailing CR/LF/space (line.find returns up-to-EOL substring).
+            while (!filename.empty() &&
+                   (filename.back() == '\r' || filename.back() == '\n' ||
+                    filename.back() == ' '))
+                filename.pop_back();
+            if (filename.empty()) return;
+
+            std::string absPath = (sceneDir / filename).string();
+            uint64_t h = 14695981039346656037ULL;
+            for (unsigned char c : absPath) { h ^= c; h *= 1099511628211ULL; }
+            if (!seen.insert(h).second) return;
+
+            ++enqueued;
+            TaskSystem::Get().Push([absPath]() {
+                std::vector<uint8_t> b;
+                ::Resource::AssetFS::Get().ReadFile(absPath, b);
+                // bytes discarded — sole purpose is OS page-cache warmup
+            });
+        };
+
+        // Extract a `key=` token's value up to the next space (or EOL).
+        auto extractToken = [](const std::string& line, const char* key) -> std::string {
+            const size_t kpos = line.find(key);
+            if (kpos == std::string::npos) return {};
+            const size_t start = kpos + std::strlen(key);
+            const size_t end   = line.find(' ', start);
+            return (end == std::string::npos)
+                ? line.substr(start)
+                : line.substr(start, end - start);
+        };
+
+        std::istringstream ss(text);
+        std::string line;
+        while (std::getline(ss, line))
+        {
+            if (line.size() < 2 || line[0] == '#') continue;
+
+            // F idx=I file=<name.meshlib|name.imsh> mesh=M [mat=<name.imat>]
+            if (line[0] == 'F' && line[1] == ' ')
+            {
+                pushWarmup(extractToken(line, "file="));
+                pushWarmup(extractToken(line, "mat="));
+            }
+            // K file=<name.iskel>
+            else if (line[0] == 'K' && line[1] == ' ')
+            {
+                pushWarmup(extractToken(line, "file="));
+            }
+            // M idx=I file=<name.imorph>
+            else if (line[0] == 'M' && line[1] == ' ')
+            {
+                pushWarmup(extractToken(line, "file="));
+            }
+        }
+
+        LOG_INFO("WorldSerializer: .iscn warmup '%s' queued %u sibling reads",
+                 scenePath.c_str(), enqueued);
+    });
+}
+
+void WaitForHandlesReady(Resource::ResourceManager& rm,
+                         const std::vector<Resource::Handle>& handles)
+{
+    using namespace std::chrono_literals;
+    if (handles.empty()) return;
+
+    // Main-thread GPU upload pump must run inside the wait — workers can finish
+    // file I/O but the final ID3D12Resource upload happens here, so without a
+    // pump we'd deadlock on textures stuck at Loading.
+    while (true)
+    {
+        bool anyLoading = false;
+        for (Resource::Handle h : handles)
+        {
+            if (rm.GetState(h) == Resource::ResourceState::Loading)
+            {
+                anyLoading = true;
+                break;
+            }
+        }
+        rm.ProcessPendingGPUUploads(2.0f);
+        if (!anyLoading) break;
+        std::this_thread::sleep_for(1ms);
+    }
+}
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -205,7 +410,8 @@ bool ParseComponentLine(const std::string& line, int currentNodeIdx, ComponentBl
 // ===========================================================================
 bool Resource::SaveWorld(World& world, const std::string& path,
                           const std::string& sceneName,
-                          const std::string& postProcessConfigPath)
+                          const std::string& postProcessConfigPath,
+                          const std::string& navMeshPath)
 {
     auto& reg = GetComponentRegistry();
 
@@ -245,6 +451,8 @@ bool Resource::SaveWorld(World& world, const std::string& path,
     ss << "W name=" << PercentEncode(sceneName);
     if (!postProcessConfigPath.empty())
         ss << " postProcessConfig=" << PercentEncode(postProcessConfigPath);
+    if (!navMeshPath.empty())
+        ss << " navMesh=" << PercentEncode(navMeshPath);
     ss << "\n";
 
     char buf[512];
@@ -304,6 +512,62 @@ bool Resource::SaveWorld(World& world, const std::string& path,
         }
     }
 
+    // --- Mesh-collider overrides for skinnedSubtree entities --------------
+    // Scene-tree entities (everything under a SceneSourcePath) are skipped
+    // above because the .iscn re-spawns them on load — we'd duplicate
+    // otherwise. But ColliderComponent/RigidBodyComponent attached via the
+    // editor "Use baked as collision" pass DON'T live in the .iscn. They're
+    // overrides keyed by (sourcePath, sourceMeshId), so save one MC line per
+    // unique key and replay on load.
+    {
+        struct MCEntry { ColliderComponent col; RigidBodyComponent rb; bool hasCol=false; bool hasRb=false; };
+        std::unordered_map<std::string, MCEntry> mc;
+        for (const NodeInfo& ni : nodes)
+        {
+            const Entity e = ni.entity;
+            if (!skinnedSubtree.count(e)) continue;
+
+            const ColliderComponent*  col = world.GetComponent<ColliderComponent>(e);
+            const RigidBodyComponent* rb  = world.GetComponent<RigidBodyComponent>(e);
+            if (!col && !rb) continue;
+
+            const MeshLibRef*      mlr = world.GetComponent<MeshLibRef>(e);
+            const MeshSourcePath*  sp  = world.GetComponent<MeshSourcePath>(e);
+            if (!mlr || !sp || sp->path.empty()) continue;
+
+            const std::string key = sp->path + '#' + std::to_string(mlr->meshId);
+            auto& slot = mc[key];
+            if (col) { slot.col = *col; slot.hasCol = true; }
+            if (rb)  { slot.rb  = *rb;  slot.hasRb  = true; }
+        }
+        for (const auto& [key, entry] : mc)
+        {
+            const size_t hashPos = key.rfind('#');
+            const std::string srcPath = key.substr(0, hashPos);
+            const uint32_t srcMeshId = static_cast<uint32_t>(std::stoul(key.substr(hashPos + 1)));
+
+            const auto& c = entry.col;
+            const auto& r = entry.rb;
+            // Fields default-initialise if a key was absent in source; the
+            // loader's defaults will mirror the deserializer in ComponentSerializers.
+            snprintf(buf, sizeof(buf),
+                "MC src=%s srcMesh=%u hasCol=%u hasRb=%u"
+                " shape=%u halfExtents=%.4f_%.4f_%.4f radius=%.4f halfHeight=%.4f"
+                " meshPath=%s meshId=%u"
+                " mt=%u mass=%.4f linDamp=%.4f angDamp=%.4f"
+                " friction=%.4f restitution=%.4f gravity=%.4f\n",
+                PercentEncode(srcPath).c_str(), srcMeshId,
+                entry.hasCol ? 1u : 0u, entry.hasRb ? 1u : 0u,
+                static_cast<uint32_t>(c.shape),
+                c.halfExtents.x, c.halfExtents.y, c.halfExtents.z, c.radius, c.halfHeight,
+                PercentEncode(c.meshLibPath).c_str(), c.meshLibMeshId,
+                static_cast<uint32_t>(r.motion),
+                r.mass, r.linearDamping, r.angularDamping,
+                r.friction, r.restitution, r.gravityFactor);
+            ss << buf;
+        }
+    }
+
     // --- Write to file ---
     const std::string text = ss.str();
     const uint32_t textLen = static_cast<uint32_t>(text.size());
@@ -341,7 +605,8 @@ bool Resource::SaveWorld(World& world, const std::string& path,
 bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& assetMgr,
                           Renderer* renderer, AnimationClipSystem* animClipSys,
                           std::string* outSceneName,
-                          std::string* outPostProcessConfigPath)
+                          std::string* outPostProcessConfigPath,
+                          std::string* outNavMeshPath)
 {
     auto& reg = GetComponentRegistry();
 
@@ -360,15 +625,29 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
 
     const char* text = reinterpret_cast<const char*>(data.data() + sizeof(AssetHeader) + hdr->metadataSize);
 
-    // 2. Clear existing world
-    world.Clear();
-
-    // 3. Parse text line by line
+    // 2. Parse text line by line — done BEFORE world.Clear() so we can pre-scan
+    //    resource paths and kick off async loads while the old world is still
+    //    rendering (SceneLoading doc v2 §8.1 Load-then-Release).
     std::string sceneName            = "Untitled";
     std::string postProcessConfigPath;
+    std::string navMeshPath;
     std::vector<NodeRecord>     nodes;
     std::vector<ComponentBlock> compBlocks;
     int currentNodeIdx = -1;
+
+    // Mesh-collider overrides for .iscn-spawned entities (see SaveWorld for
+    // why this exists). One MC line per unique (sourcePath, sourceMeshId);
+    // applied AFTER SceneInstanceLoader::Load re-spawns the scene tree.
+    struct MeshColliderOverride
+    {
+        std::string         sourcePath;
+        uint32_t            sourceMeshId = 0;
+        ColliderComponent   collider;
+        RigidBodyComponent  rb;
+        bool                hasCollider  = false;
+        bool                hasRb        = false;
+    };
+    std::vector<MeshColliderOverride> mcOverrides;
 
     std::istringstream stream(std::string(text, hdr->dataSize));
     std::string line;
@@ -389,6 +668,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
                 const std::string val = token.substr(eq + 1);
                 if      (key == "name")              sceneName             = PercentDecode(val);
                 else if (key == "postProcessConfig") postProcessConfigPath = PercentDecode(val);
+                else if (key == "navMesh")           navMeshPath           = PercentDecode(val);
             }
         }
         else if (line[0] == 'N' && line.size() > 1 && line[1] == ' ')
@@ -400,6 +680,44 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
                 nodes.push_back(std::move(nr));
             }
         }
+        else if (line.size() > 3 && line[0] == 'M' && line[1] == 'C' && line[2] == ' ')
+        {
+            // MC src=<path> srcMesh=N hasCol=1 hasRb=1 <collider fields> <rigidbody fields>
+            MeshColliderOverride mco;
+            std::istringstream ls(line.substr(3));
+            std::string token;
+            while (ls >> token)
+            {
+                const auto eq = token.find('=');
+                if (eq == std::string::npos) continue;
+                const std::string k = token.substr(0, eq);
+                const std::string v = token.substr(eq + 1);
+                if      (k == "src")          mco.sourcePath = PercentDecode(v);
+                else if (k == "srcMesh")      mco.sourceMeshId = static_cast<uint32_t>(std::stoul(v));
+                else if (k == "hasCol")       mco.hasCollider = (std::stoi(v) != 0);
+                else if (k == "hasRb")        mco.hasRb       = (std::stoi(v) != 0);
+                else if (k == "shape")        mco.collider.shape = static_cast<ColliderComponent::Shape>(std::stoi(v));
+                else if (k == "halfExtents")
+                {
+                    float x=0,y=0,z=0;
+                    sscanf_s(v.c_str(), "%f_%f_%f", &x, &y, &z);
+                    mco.collider.halfExtents = { x, y, z };
+                }
+                else if (k == "radius")       mco.collider.radius     = std::stof(v);
+                else if (k == "halfHeight")   mco.collider.halfHeight = std::stof(v);
+                else if (k == "meshPath")     mco.collider.meshLibPath   = PercentDecode(v);
+                else if (k == "meshId")       mco.collider.meshLibMeshId = static_cast<uint32_t>(std::stoul(v));
+                else if (k == "mt")           mco.rb.motion          = static_cast<RigidBodyComponent::Motion>(std::stoi(v));
+                else if (k == "mass")         mco.rb.mass            = std::stof(v);
+                else if (k == "linDamp")      mco.rb.linearDamping   = std::stof(v);
+                else if (k == "angDamp")      mco.rb.angularDamping  = std::stof(v);
+                else if (k == "friction")     mco.rb.friction        = std::stof(v);
+                else if (k == "restitution")  mco.rb.restitution     = std::stof(v);
+                else if (k == "gravity")      mco.rb.gravityFactor   = std::stof(v);
+            }
+            mco.rb.bodyId = kInvalidPhysicsBodyId;
+            mcOverrides.push_back(std::move(mco));
+        }
         else if (line.size() > 2 && line[0] == ' ' && line[1] == ' ')
         {
             ComponentBlock cb;
@@ -410,7 +728,59 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
 
     if (outSceneName) *outSceneName = sceneName;
 
-    // 4. Pre-collect skinned node indices (SceneRef components)
+    // 3. Phase 1 / Phase 2 — pre-load loader-backed resources BEFORE Clear().
+    //    Workers run async file I/O; main thread pumps GPU uploads. By the time
+    //    Clear() drops the old world's refs, RM's path-hash cache has every
+    //    shared path warm, so the deserialize loop in step 6 hits cache instead
+    //    of re-reading from disk.
+    //
+    //    SceneRef (.iscn) paths get a separate fire-and-forget warmup pass —
+    //    they have no registered IResourceLoader so we can't route them through
+    //    ResourceManager, but pre-touching the bytes on a worker pulls them
+    //    into the OS page cache before SceneInstanceLoader's sync read in
+    //    step 8. For SceneRef-heavy worlds (Bistro, etc.) this is the biggest
+    //    win; the MaterialOverride/AnimRef path covers VFX/cutscene-style worlds.
+    {
+        auto* rm = assetMgr.GetResourceManager();
+
+        // 3a. Recursive page-cache warmup for .iscn — fire-and-forget; not
+        //     waited on. The outer worker reads the .iscn, parses F/K/M lines,
+        //     and pushes child warmups for every sibling (.meshlib, .imat,
+        //     .iskel, .imorph). SceneInstanceLoader's sync reads in step 8
+        //     then hit a warm kernel page cache instead of cold disk seeks.
+        const std::vector<std::string> scenePaths = CollectScenePaths(compBlocks);
+        for (const std::string& scenePath : scenePaths)
+            EnqueueIscnRecursiveWarmup(scenePath);
+
+        // 3b. RM-backed pre-load for loader-known extensions (textures, anims).
+        if (rm)
+        {
+            const std::vector<PreloadEntry> preloadList = CollectPreloadPaths(compBlocks);
+            std::vector<Handle> preloadHandles;
+            preloadHandles.reserve(preloadList.size());
+            for (const PreloadEntry& pe : preloadList)
+                preloadHandles.push_back(rm->Load(pe.path, pe.type));
+
+            if (!preloadHandles.empty() || !scenePaths.empty())
+            {
+                LOG_INFO("WorldSerializer: pre-loading %zu RM resources + %zu .iscn warmups",
+                         preloadHandles.size(), scenePaths.size());
+            }
+            if (!preloadHandles.empty())
+                WaitForHandlesReady(*rm, preloadHandles);
+            // preloadHandles drop here. RM Handle is a POD — slots stay alive
+            // because nothing explicitly Unloads them; the systems that own
+            // refcounts (TextureSystem / AnimationClipSystem) will Acquire
+            // them in step 6/7 and inherit the warm RM cache.
+        }
+    }
+
+    // 4. Clear the old world. Component destructors release TextureSystem /
+    //    MeshLibrary / AnimationClipSystem refs; underlying RM slots stay
+    //    cached for path-hash hits in the next phase.
+    world.Clear();
+
+    // 5. Pre-collect skinned node indices (SceneRef components)
     struct SkinInfo { int nodeIdx = -1; std::string scenePath, animPath; };
     std::unordered_map<int, SkinInfo> skinInfoMap;
     std::unordered_set<int> skinnedIndices;
@@ -438,7 +808,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
         }
     }
 
-    // 5. Create non-skinned entities (skinned roots are loaded from .iscn in step 7)
+    // 6. Create non-skinned entities (skinned roots are loaded from .iscn in step 8)
     std::unordered_map<int, Entity> entityMap;
     for (const auto& nr : nodes)
     {
@@ -454,7 +824,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
         lt.scale       = { nr.sx, nr.sy, nr.sz };
         world.AddComponent<LocalTransform>(e, lt);
         world.AddComponent<GlobalTransform>(e, GlobalTransform{});
-        world.AddComponent<Visibility>(e, Visibility{});
+        world.AddComponent<VisibilityComponent>(e, VisibilityComponent{});
         world.AddComponent<RenderLayer>(e, RenderLayer{});
         world.AddComponent<Children>(e, Children{});
 
@@ -471,7 +841,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
         }
     }
 
-    // 6. Apply component blocks for non-skinned entities via registry
+    // 7. Apply component blocks for non-skinned entities via registry
     for (const auto& cb : compBlocks)
     {
         if (cb.tag == "SceneRef" || cb.tag == "AnimRef") continue;
@@ -504,7 +874,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
             world.AddComponent<MaterialComponent>(e, MaterialComponent{});
     }
 
-    // 7. Skinned character reconstruction from SceneRef/AnimRef
+    // 8. Skinned character reconstruction from SceneRef/AnimRef
     for (const auto& [idx, info] : skinInfoMap)
     {
         if (info.scenePath.empty()) continue;
@@ -605,6 +975,42 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
         }
     }
 
+    // 8.5: Re-wire Parent / Children for every node based on the saved
+    // parentIdx. Step 6 already wired non-skinned entities, but it could
+    // not see skinned (.iscn) entities since they're only created in
+    // Step 8. This second pass also reconciles the reverse case — an .iscn
+    // root that was reparented under a regular entity in the editor.
+    // Idempotent: skips if the current Parent already matches the saved one.
+    for (const auto& nr : nodes)
+    {
+        if (nr.parent < 0) continue;
+        auto eit = entityMap.find(nr.idx);
+        if (eit == entityMap.end()) continue;
+        auto pit = entityMap.find(nr.parent);
+        if (pit == entityMap.end()) continue;
+
+        const Entity child  = eit->second;
+        const Entity parent = pit->second;
+
+        Parent* p = world.GetComponent<Parent>(child);
+        if (p && p->entity == parent) continue;
+        if (p) p->entity = parent;
+        else   world.AddComponent<Parent>(child, Parent{ parent });
+
+        Children* ch = world.GetComponent<Children>(parent);
+        if (!ch)
+        {
+            Children newCh; newCh.entities.push_back(child);
+            world.AddComponent<Children>(parent, std::move(newCh));
+        }
+        else
+        {
+            auto& v = ch->entities;
+            if (std::find(v.begin(), v.end(), child) == v.end())
+                v.push_back(child);
+        }
+    }
+
     LOG_SUCCESS("WorldSerializer: loaded '%s' — %zu entities, scene='%s'",
                 path.c_str(), nodes.size(), sceneName.c_str());
 
@@ -612,6 +1018,7 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
     //    available). Missing file is non-fatal — worst case the pass keeps
     //    whatever state it was in before the load.
     if (outPostProcessConfigPath) *outPostProcessConfigPath = postProcessConfigPath;
+    if (outNavMeshPath)            *outNavMeshPath           = navMeshPath;
     if (!postProcessConfigPath.empty() && renderer)
     {
         PostProcessConfig cfg;
@@ -621,6 +1028,49 @@ bool Resource::LoadWorld(const std::string& path, World& world, AssetManager& as
             LOG_INFO("WorldSerializer: applied post-process config '%s'",
                      postProcessConfigPath.c_str());
         }
+    }
+
+    // Apply Mesh-collider overrides to every .iscn-spawned mesh entity
+    // whose (sourcePath, sourceMeshId) matches an MC line. Done last so the
+    // SceneInstanceLoader path has fully populated the world. PhysicsSystem's
+    // auto-prewarm picks up the new Mesh ColliderComponents on its next
+    // Update tick — no manual Prewarm call needed here.
+    if (!mcOverrides.empty())
+    {
+        uint32_t applied = 0;
+        for (const auto& mco : mcOverrides)
+        {
+            world.ForEach<MeshLibRef>([&](Entity e, MeshLibRef& ref)
+            {
+                if (ref.meshId != mco.sourceMeshId) return;
+                const MeshSourcePath* sp = world.GetComponent<MeshSourcePath>(e);
+                if (!sp || sp->path != mco.sourcePath) return;
+
+                if (mco.hasCollider)
+                {
+                    if (world.HasComponent<ColliderComponent>(e))
+                        *world.GetComponent<ColliderComponent>(e) = mco.collider;
+                    else
+                        world.AddComponent<ColliderComponent>(e, mco.collider);
+                }
+                if (mco.hasRb)
+                {
+                    if (world.HasComponent<RigidBodyComponent>(e))
+                    {
+                        auto* rb = world.GetComponent<RigidBodyComponent>(e);
+                        *rb = mco.rb;
+                        rb->bodyId = kInvalidPhysicsBodyId; // force re-create on next physics tick
+                    }
+                    else
+                    {
+                        world.AddComponent<RigidBodyComponent>(e, mco.rb);
+                    }
+                }
+                ++applied;
+            });
+        }
+        LOG_INFO("WorldSerializer: applied %u Mesh collider overrides from %zu MC lines",
+                 applied, mcOverrides.size());
     }
 
     return true;

@@ -5,8 +5,11 @@
 //      Picks the foreground silhouette surface's velocity over background
 //      bleed, more robust than longest-magnitude on "fast bg + slow fg".
 //   2. Reproject current pixel using dilated velocity → previous-frame UV.
-//   3. Build 3x3 Karis luma-weighted AABB stats + tent-filtered de-jittered
-//      current sample + Karis 5-tap unsharp (#4) — one combined neighbourhood pass.
+//   3. Build 3x3 Karis luma-weighted AABB stats + Blackman-Harris (Karis 2014)
+//      de-jittered current sample + Karis 5-tap unsharp (#4) — one combined
+//      neighbourhood pass. Reconstruction switched from tent → BH on 2026-05-20
+//      to address static softness (tent's wide separable footprint low-passed
+//      every frame; BH concentrates energy at the centre tap).
 //   4. Disocclusion handling: hard out-of-bounds → spatial-AA fallback
 //      (3x3 box blur of HDR neighbourhood, #11). Soft 1.5px edge inset (#1)
 //      ramps history confidence so Catmull-Rom edge clamp does not ghost.
@@ -16,7 +19,7 @@
 //      freq-static neighbourhoods. In tonemap-blend mode gamma is rescaled
 //      ×1.5 to compensate for tonemap-compressed sigma (#3).
 //   7. Karis tonemap → blend → inverse tonemap; velocity-adaptive alpha plus
-//      bright-peak / outline / high-freq fixes. lumaGain anti-flicker uses
+//      bright-peak / high-freq fixes. lumaGain anti-flicker uses
 //      bidirectional |Δluma| (#6); velFactor band tightened to (0.5, 2.5) (#8);
 //      adaptive firefly ratio scales by neighbourhood mean luma (#9).
 //   8. Output stores prev luma in .a (#10) for downstream AutoExposure use.
@@ -34,21 +37,36 @@
 //   t2 space2 — history (previous resolved frame)
 //   t3 space2 — GBuffer surface (roughness in .r, metallic in .g)
 //   t4 space2 — velocity (NDC units, R16G16_FLOAT)
+//   t6 space2 — prev-frame depth (TAA-owned ping-pong, R32_FLOAT)
+//   t7 space2 — prev-frame velocity (TAA-owned ping-pong, R16G16_FLOAT)
 //   u0 space2 — output UAV (current resolved frame, becomes next history)
+//   u2 space2 — prev-depth out UAV (writes curr depth → next-frame prev)
+//   u3 space2 — prev-velocity out UAV (writes curr velocity → next-frame prev)
+// (slots t6/t7/u2/u3 are reused root params — defined in the global compute
+//  root sig for VolumetricFog and XeGTAO; harmlessly free for TAA's own use.)
 
 #include "TAA_Common.hlsli"
 #include "TAA_Reproject.hlsli"
 #include "TAA_History.hlsli"
 #include "TAA_Neighbourhood.hlsli"
 
-Texture2D<float4>   gCurrHDR  : register(t0, space2);
-Texture2D<float>    gDepth    : register(t1, space2);
-Texture2D<float4>   gHistory  : register(t2, space2);
-Texture2D<float4>   gGBuffer  : register(t3, space2);
-Texture2D<float2>   gVelocity : register(t4, space2);
-RWTexture2D<float4> gOutput   : register(u0, space2);
+Texture2D<float4>   gCurrHDR       : register(t0, space2);
+Texture2D<float>    gDepth         : register(t1, space2);
+Texture2D<float4>   gHistory       : register(t2, space2);
+Texture2D<float4>   gGBuffer       : register(t3, space2);
+Texture2D<float2>   gVelocity      : register(t4, space2);
+// Stencil-plane view of the depth buffer (X24_TYPELESS_G8_UINT). .y holds the
+// stencil byte; we test against outlineStencilBit (set by OutlinePass on the
+// rim pixels written by the inverted-hull sub-pass). 0 if the SRV isn't bound
+// — guarded by outlineStencilBit==0 from the CB so the load is skipped.
+Texture2D<uint2>    gOutlineStencil: register(t5, space2);
+Texture2D<float>    gPrevDepth     : register(t6, space2);
+Texture2D<float2>   gPrevVelocity  : register(t7, space2);
+RWTexture2D<float4> gOutput        : register(u0, space2);
+RWTexture2D<float>  gPrevDepthOut  : register(u2, space2);
+RWTexture2D<float2> gPrevVelOut    : register(u3, space2);
 
-SamplerState        gLinear   : register(s0, space2);
+SamplerState        gLinear        : register(s0, space2);
 
 // ---------------------------------------------------------------------------
 [numthreads(8, 8, 1)]
@@ -69,6 +87,15 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float3 currRaw = nh.centerHDR;          // raw jittered centre tap (Fix G path)
     float3 currBox = nh.meanRGB_HDR_unweighted;  // 3x3 box-blurred HDR (spatial-AA fallback)
 
+    // Compute velocity early so we can write prev-depth/prev-velocity snapshots
+    // to UAVs BEFORE any early-return path. Otherwise the first frame after
+    // resize / teleport leaves prev buffers uninitialised → next frame's
+    // disocclusion detector reads garbage and false-fires.
+    float  currDepthVal = gDepth.Load(int3(id, 0)).r;
+    float2 velocity     = DilateVelocity(gVelocity, gDepth, int2(id), dim);
+    gPrevDepthOut[id] = currDepthVal;
+    gPrevVelOut[id]   = velocity;
+
     // ---- No history (first frame or resize) -> spatial-AA fallback ----------
     // Previously passthrough raw aliased curr; now use the box-blurred 3x3 mean
     // so the first frame after a teleport / scene cut isn't visibly jagged.
@@ -85,13 +112,7 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float isSpecular = 1.0 - smoothstep(0.0, specularRoughnessMax, roughness);
 
     // ---- Reprojection via depth-aware velocity dilation ---------------------
-    // Karis 2014: pick the velocity from the 3x3 neighbour with smallest depth
-    // (nearest to camera under reversed-Z, that means the LARGEST .r value).
-    // Better than longest-magnitude on "fast bg + slow fg" silhouettes — the
-    // foreground edge always wins, so we never reproject foreground pixels
-    // along background motion.
-    float2 velocity = DilateVelocity(gVelocity, gDepth, int2(id), dim);
-
+    // velocity computed above the hasHistory early-return so prev-vel UAV stays valid.
     float2 prevUV = ReprojectUV(uv, velocity);
 
     // ---- Disocclusion: hard out-of-bounds → spatial-AA fallback (#11) -------
@@ -115,14 +136,27 @@ void CSMain(uint2 id : SV_DispatchThreadID)
 
     float3 m1    = nh.m1;
     float3 sigma = nh.sigma;
-    float3 curr  = nh.currFilt;   // tent-de-jittered current
+    float3 curr  = nh.currFilt;   // Blackman-Harris de-jittered current (Karis 2014)
+
+    // Hoisted velPx/velFactor — needed by isNoisySpecular's motion gate below.
+    // Tightened smoothstep band (0.5, 2.5) — see comment block further down for
+    // the historical reasoning (UE5/Frostbite parity, sub-pixel micro-motion).
+    float  velPx     = length(velocity * res * 0.5);
+    float  velFactor = smoothstep(0.5, 2.5, velPx);
 
     // ---- Noise-adaptive AABB gamma ------------------------------------------
     // isSpecular (from roughness) captures smooth/mirror specular well, but
     // rough specular (roughness 0.3-0.5) has isSpecular ≈ 0.1-0.35 even though
     // its per-pixel noise is just as severe.  Use the neighbourhood Y-channel
     // variance as a secondary indicator: high sigma.x → noisy specular region.
-    float isNoisySpecular = smoothstep(0.02, 0.2, sigma.x);
+    //
+    // Motion gate (1 - velFactor): during motion, sigma is artificially
+    // elevated by jitter+motion-induced sub-pixel sample variation, NOT by
+    // genuine noisy-specular. Without this gate, motion makes isNoisySpecular
+    // fire → isSpecularFull spikes → sharpKill kills the Karis sharpen →
+    // visible motion blur. The gate keeps sharpen alive during motion so
+    // moving content stays sharp.
+    float isNoisySpecular = smoothstep(0.02, 0.2, sigma.x) * (1.0 - velFactor);
     float isSpecularFull  = saturate(isSpecular + isNoisySpecular * (1.0 - isSpecular));
 
     // (#3) Tonemap-blend mode rescale: σ is collected in tonemapped YCoCg
@@ -143,52 +177,51 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float isLowVariance = 1.0 - smoothstep(0.01, 0.05, sigma.x);
     effectiveGamma      = lerp(effectiveGamma, effectiveGamma * 1.5, isLowVariance);
 
-    // Velocity → pixel magnitude. Hoisted up from the blend block below because
-    // the high-frequency-static widener (Fix E) below needs it before the clip.
-    //
-    // (#8) smoothstep band tightened from (1.0, 4.0) to (0.5, 2.5). The old
-    // 1 px dead-zone failed to detect sub-pixel camera micro-motion on
-    // hi-DPI displays — stationary-but-actually-drifting pixels got no
-    // velocity-boosted alpha and showed faint ghost trails. (0.5, 2.5)
-    // matches modern AAA practice (UE5 reference is (0.0, 1.5), Frostbite
-    // ~(0.5, 2.0)); the upper bound 2.5 prevents 8-px overshoot from
-    // saturating alpha and creating ghost trails on slow-moving objects.
-    float  velPx     = length(velocity * res * 0.5);
-    float  velFactor = smoothstep(0.5, 2.5, velPx);
+    // velPx / velFactor hoisted earlier (above the noise-adaptive gamma block).
+    // Smoothstep band (0.5, 2.5) matches UE5 (0.0, 1.5) / Frostbite ~(0.5, 2.0);
+    // upper bound 2.5 prevents 8-px overshoot from saturating alpha and
+    // creating ghost trails on slow-moving objects.
 
-    // Fix E v2: distant thin sub-pixel geometry anti-aliasing (fences, wires,
-    // foliage) — bimodal classifier.
+    // High-freq-static detector for fences / wires / foliage / lamp boundaries.
     //
-    // The original v1 keyed off `smoothstep(0.03, 0.12, sigma.x)`, which fired
-    // on TWO different signals that look identical in σ alone:
-    //   (a) sub-pixel fence: 3×3 has roughly half slat / half background;
-    //       centre tap is one of the two modes (high-contrast bimodal dist).
-    //   (b) smooth contrast gradient (e.g. a chair-leg shadow boundary):
-    //       3×3 is a linear ramp; centre tap sits midway through the ramp
-    //       i.e. close to the mean (unimodal distribution).
-    // (a) needs the wide-AABB / raw-centre-tap path; (b) absolutely does not
-    // — relaxing its clip introduces visible ghosting along shadow edges
-    // (the user's "chair-leg false-positive").
-    //
-    // The discriminator: how far the centre tap sits from the neighbourhood
-    // mean, normalised by σ. For a Gaussian distribution only ~13% of pixels
-    // exceed 1.5σ; fence/edge pixels are bimodal (≈ half-and-half), so by
-    // construction the centre tap lands at roughly ±2σ from the mean of the
-    // half-and-half distribution. Gradient pixels are unimodal and the centre
-    // rarely exceeds ~0.7σ.
-    //
-    // Smoothstep window (1.2σ → 2.0σ) keeps the transition gentle; below 1.2σ
-    // we definitely have a gradient, above 2.0σ we definitely have a bimodal
-    // pattern, in between is fence-with-noise.
-    //
-    // sigma threshold tightened from (0.03, 0.12) to (0.05, 0.15): now that
-    // bimodal does the main discrimination, σ only needs to gate out very-
-    // low-variance noise — the loose floor was over-firing.
-    float bimodalDist = abs(nh.centerY - nh.m1.x) / max(nh.sigma.x, 1e-3);
-    float bimodal     = smoothstep(1.2, 2.0, bimodalDist);
+    // Symmetric bimodal: centre tap close to either extreme of unweighted
+    // yMin/yMax (Karis-weighted m1 is biased dim, so previous |center-m1|/σ
+    // only fired for bright-centre patterns and missed dark-centre).
+    //   binary {A,B} 50/50 → bimodalRef=0, bimodal=1 (both centres) ✓
+    //   linear gradient {-1,0,+1} (center=0) → bimodalRef≈σ, bimodal=0 ✓
+    float bimodalRef  = min(abs(nh.centerY - nh.yMin),
+                             abs(nh.centerY - nh.yMax));
+    float bimodalDist = bimodalRef / max(nh.sigma.x, 1e-3);
+    float bimodal     = 1.0 - smoothstep(0.4, 1.0, bimodalDist);
 
-    float isHighFreqStatic = smoothstep(0.05, 0.15, sigma.x)
-                           * bimodal
+    // Contrast gate in HDR-LINEAR space, NOT tonemapped σ. Tonemap c/(1+max)
+    // collapses HDR-bright bimodal (lamp HDR 5 vs 100 → tonemapped 0.83 vs 0.99
+    // → σ ≈ 0.08) below the σ-gate's mid-band. (max-min)/mid in HDR linear
+    // stays large for HDR-bright sources and matches the LDR σ gate for
+    // LDR-only fences.
+    float hdrRange     = nh.lumaMaxHDR - nh.lumaMinHDR;
+    float hdrMid       = max(0.5 * (nh.lumaMaxHDR + nh.lumaMinHDR), 1e-3);
+    float hdrContrast  = hdrRange / hdrMid;
+    float contrastGate = smoothstep(0.2, 0.6, hdrContrast);
+
+    // HDR-bright bypass for the bimodal centre check. For HDR sources (lamps,
+    // fireworks, glints) sub-pixel jitter often lands the centre tap on a
+    // partial-coverage aliased value mid-way between the two modes — bimodal
+    // centre check misses it. HDR contrast alone is signal enough; smooth
+    // LDR gradients don't reach HDR brightness so no false-positive risk.
+    float isHDRBright = smoothstep(2.0, 8.0, nh.lumaMaxHDR);
+    float bimodalEffective = lerp(bimodal, 1.0, isHDRBright);
+
+    // Motion gate uses (1 - velFactor) — smoothstep(0.5, 2.5, velPx). Restored
+    // from a previously-tightened (0.3, 1.0) experiment: jitter alone produces
+    // a sub-pixel velocity component (~0.4-0.7 px/frame from per-frame jitter
+    // delta), and the tight gate let it partially-shut the damp in static
+    // scenes → spec edge flicker returned. The (0.5, 2.5) gate ignores jitter
+    // entirely. Slow-motion disocclusion no longer relies on this gate to
+    // release the damp — disoccBoost (depth/vel/clip detector below) does
+    // that job by force-raising α.
+    float isHighFreqStatic = contrastGate
+                           * bimodalEffective
                            * (1.0 - velFactor);
     effectiveGamma         = lerp(effectiveGamma, 4.0, isHighFreqStatic);
 
@@ -210,11 +243,25 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     // Gated by (1 - isHighFreqStatic) because Fix E above ALREADY pushed
     // gamma to 4.0 on fence pixels via lerp; multiplying by (1+vel*widen) on
     // top of that compounds and produces a >5σ box that defeats the variance
-    // clip entirely. By construction Fix E's path also sets velFactor≈0 (the
-    // path only fires on near-static pixels), so this gate is a defence in
-    // depth — under transient motion onto/off-of fence pixels, both could
-    // be partially active simultaneously and the compounding shows up.
-    effectiveGamma *= 1.0 + velFactor * velocityWiden * (1.0 - isHighFreqStatic);
+    // clip entirely.
+    //
+    // Density-aware widen / shrink for the AABB during motion.
+    //
+    // - Dense LDR neighbourhoods (tile / foliage / brick) under motion: CR
+    //   sub-pixel sampling pulls in colour from the foreground's previous
+    //   pixel; that contaminated hist easily fits inside any motion-widened
+    //   box and survives variance clip → motion ghost. Counter by:
+    //     a. Killing widen entirely for LDR dense (1 - density when LDR).
+    //     b. Actively SHRINKING effectiveGamma by up to 50% for LDR dense
+    //        motion → tighter clip catches the sub-pixel contamination.
+    // - HDR-bright neighbourhoods (lamps / stars / glints): keep the full
+    //   widen so jitter+motion-displaced bright peaks stay inside AABB and
+    //   reprojected bright history isn't crushed.
+    float neighbourhoodDensity = smoothstep(0.05, 0.15, sigma.x);
+    float ldrDenseMotion       = neighbourhoodDensity * velFactor * (1.0 - isHDRBright);
+    float effectiveWiden       = velocityWiden * (1.0 - neighbourhoodDensity * (1.0 - isHDRBright));
+    effectiveGamma *= 1.0 + velFactor * effectiveWiden * (1.0 - isHighFreqStatic);
+    effectiveGamma *= 1.0 - ldrDenseMotion * 0.5;
 
     // (#4) Karis 5-tap unsharp mask on the de-jittered curr.
     //
@@ -255,23 +302,44 @@ void CSMain(uint2 id : SV_DispatchThreadID)
         float3 cardinalMean    = nh.cardinalSum * 0.25;
         float  peakRatio       = Luma(curr) / max(Luma(cardinalMean), 1e-3);
         float  brightPeakKill  = smoothstep(2.0, 5.0, peakRatio);
-        float  sharpKill       = saturate(isHighFreqStatic + brightPeakKill + isSpecularFull);
+        // Motion gate added 2026-05-17, BAND LOOSENED 2026-05-20.
+        //
+        // Original logic: `curr*5 - cardinals` amplifies centre-vs-cardinal
+        // delta 5×; under camera motion the centre tap shifts every frame
+        // because jitter + motion lands it on different sub-pixel content,
+        // and amplifying that swing 5× translates into shimmer. Gating
+        // sharpen by velFactor=(0.5,2.5) was meant to disable sharpen
+        // "during motion" and keep static surfaces full-sharp.
+        //
+        // Problem: the Halton(2,3) jitter sequence produces a per-frame
+        // jitter delta of ~0.5–0.7 px on its own, so velPx is RARELY 0 in
+        // practice — even a perfectly still camera has velPx ≈ 0.5,
+        // landing right at the start of smoothstep(0.5, 2.5). Tiny camera
+        // microtwitches push it to 1+ which fully shuts sharpen down.
+        // Result: "static observation" was effectively always-unsharp,
+        // contributing to the perceived TAA softness.
+        //
+        // New band smoothstep(2.0, 8.0, velPx) only fires on motion that
+        // genuinely accumulates >2 px of true world motion per frame
+        // (running speed / camera flick). Static + jitter + slow walk all
+        // keep full sharpen. The 5×-amplification shimmer concern is now
+        // handled by Blackman-Harris reconstruction (TAA_Neighbourhood.hlsli)
+        // which doesn't pre-spread the centre tap across the 3x3 — so the
+        // delta sharpen amplifies is the genuine signal, not jitter noise.
+        float  sharpVelKill    = smoothstep(2.0, 8.0, velPx);
+        float  sharpKill       = saturate(isHighFreqStatic + brightPeakKill + isSpecularFull + sharpVelKill);
         float  effStrength     = sharpenStrength * (1.0 - sharpKill);
         curr = lerp(curr, sharp, effStrength);
     }
 
-    // Fix G: on high-freq-static pixels go FULLY to the raw jittered centre
-    // tap. Tent de-jitter is correct for smooth regions but catastrophic for
-    // 1-pixel-wide high-contrast geometry: it averages the fence pixel with
-    // 8 background neighbours, collapsing the jitter-phase coverage signal
-    // that TAA relies on for sub-pixel reconstruction. Each frame jitter
-    // places the sub-pixel geometry at a slightly different screen position;
-    // the RAW sample encodes "this frame, this pixel is X% slat" for that
-    // specific jitter phase. TAA then integrates X across frames into the
-    // correct coverage value.
-    //
-    // currRaw was already extracted in ComputeNeighbourhood — no extra Load.
-    curr = lerp(curr, currRaw, isHighFreqStatic);
+    // For LDR fence-style sub-pixel geometry, replace the reconstructed curr
+    // with the raw centre tap — even BH still folds in some cardinal/corner
+    // weight (~0.1 + ~0.01), which would collapse the jitter-phase coverage
+    // signal TAA needs for sub-pixel reconstruction of 1-px-wide features.
+    // HDR-bright cases SKIP this (currRaw oscillates between bright/dark per
+    // jitter phase for HDR sources; the BH-reconstructed centre is more
+    // temporally stable for multi-pixel-wide content).
+    curr = lerp(curr, currRaw, isHighFreqStatic * (1.0 - isHDRBright));
 
     // HDR-space neighbourhood mean from the combined 3x3 pass — used by
     // Fix K below and the bright-peak detection further down.
@@ -320,12 +388,45 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float3 nMin = m1 - effectiveGamma * sigma;
     float3 nMax = m1 + effectiveGamma * sigma;
 
+    // Motion-time AABB Y expansion — HDR-bright neighbourhoods ONLY. Karis-
+    // weighted m1/σ undercount bright pixels so HDR stars/spec peaks fall
+    // outside the box during motion; expanding to unweighted yMin/yMax saves
+    // them. For LDR neighbourhoods (no bright outliers to preserve), this
+    // expansion just widens the box and lets CR-sampled contamination
+    // through, producing visible motion ghost on dense-σ backgrounds (tile
+    // floors etc.) — gated by isHDRBright so LDR keeps the tight Karis box.
+    float aabbExpand = velFactor * isHDRBright;
+    if (aabbExpand > 0.0)
+    {
+        nMin.x = lerp(nMin.x, min(nMin.x, nh.yMin), aabbExpand);
+        nMax.x = lerp(nMax.x, max(nMax.x, nh.yMax), aabbExpand);
+    }
+
     // ---- Sample history with 9-tap Catmull-Rom + variance-clip --------------
     // Clamp to >= 0: Catmull-Rom negative lobes can produce sub-zero values that
     // flip sign after ToneMapLuma (denominator < 1) and amplify into fireflies.
-    float3 histLinear = max(SampleHistoryCatmullRom9Tap(gHistory, gLinear,
-                                                         prevUV * res, res),
-                            0.0);
+    //
+    // Motion-time bilinear blend: CR's 9-tap spreads over a 4×4 pixel area, so
+    // at sub-pixel prevUV offsets it picks up colour from pixels that USED to
+    // contain a moving foreground feature (thin column / wire / pole). With
+    // dense-σ neighbourhoods (tile floor, foliage) the contaminated hist stays
+    // inside the wide AABB and survives variance clip → visible ghost trail
+    // behind the moving feature. Bilinear's 2×2 tap area stays closer to
+    // prevUV and doesn't reach the contaminated neighbour. Smoothly cross-fade
+    // CR → bilinear with motion: static keeps CR's sharpness, fast motion
+    // gets bilinear's reduced contamination (motion blur perception masks
+    // bilinear's slight softness).
+    float3 histLinearCR    = SampleHistoryCatmullRom9Tap(gHistory, gLinear,
+                                                          prevUV * res, res);
+    float3 histLinearBilin = gHistory.SampleLevel(gLinear, prevUV, 0).rgb;
+    // Band tightened (0.5, 2.0) → (8.0, 20.0) on 2026-05-17 — normal walking /
+    // panning motion peaks well under 8 px/frame, and at (0.5, 2.0) CR fully
+    // collapsed to bilinear, whose 2×2 tap footprint visibly soft-focuses
+    // textures during motion. CR's negative-lobe `max(0,…)` clamp already
+    // handles its own contamination; only genuine fast swings (camera flick)
+    // need the bilinear fallback now.
+    float  useBilinear     = smoothstep(8.0, 20.0, velPx);
+    float3 histLinear      = max(lerp(histLinearCR, histLinearBilin, useBilinear), 0.0);
     float  histPrevLuma = gHistory.SampleLevel(gLinear, prevUV, 0).a;  // (#10) plumbed luma channel
 
     // (#7) Salvi 5-tap cross blur on history luma — supplies the lumaGain
@@ -352,7 +453,30 @@ void CSMain(uint2 id : SV_DispatchThreadID)
 #endif
     float3 histYCoCg = RGBToYCoCg(hist);
     float  histY     = histYCoCg.x;   // pre-clip Y, saved for distance-to-clamp below
-    hist = YCoCgToRGB(ClipAABB(nMin, nMax, histYCoCg));
+
+    // Fast-swing HDR clip bypass: when camera swings fast, the current 3x3 may
+    // miss sub-pixel bright features entirely. If history Y exceeds the
+    // unweighted neighbourhood max AND we're moving fast enough that velocity
+    // reprojection trust outweighs disocclusion risk AND the neighbourhood is
+    // genuinely HDR-bright (isHDRBright gate prevents LDR disocclusion ghost
+    // — e.g. a moving character revealing a wall would also satisfy the
+    // histY > yMax test, but isHDRBright=0 keeps the bypass off there).
+    float3 histClipped = YCoCgToRGB(ClipAABB(nMin, nMax, histYCoCg));
+    float3 histRaw     = YCoCgToRGB(histYCoCg);
+    float  bypassClip  = smoothstep(1.0, 5.0, velPx)
+                       * smoothstep(0.0, 0.2, histY - nh.yMax)
+                       * isHDRBright;
+    hist = lerp(histClipped, histRaw, bypassClip);
+
+    // Disocclusion signal via clip magnitude. The variance clip's job is to
+    // flag "this history is wrong" — if it had to move hist substantially,
+    // this pixel had a content change (foreground passed by, occluder
+    // revealed). Used downstream as an UPWARD α-boost (disoccBoost) rather
+    // than as a damp gate: pushing α to 0.6 makes curr dominate the blend
+    // and the wrong hist decays in 1-2 frames; just gating the damp would
+    // leave α at 0.3 baseline and let the polluted hist enter at 70%.
+    float3 clipDelta = histRaw - histClipped;
+    float  clipMag   = max(max(abs(clipDelta.r), abs(clipDelta.g)), abs(clipDelta.b));
 
     // ---- Frame-rate-independent velocity-adaptive blend ---------------------
     // isSpecularFull drives both the tau and the lumaGain so that rough noisy
@@ -373,32 +497,41 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float3 currT = curr;   // linear-blend mode: legacy name, no tonemap
 #endif
     // ============================================================================
-    // (#12) FINAL ALPHA COMPOSITION ORDER
+    // FINAL ALPHA COMPOSITION ORDER
     //
     // alpha = lerp(diffuse, specular, isSpecFull)               (1) baseAlpha — frame-rate-independent τ
     //       → lerp(α, max(α, 0.3), velFactor)                   (2) velocity boost — moving pixels track
     //       + lumaGain · isSpec · (maxFromLuma - α)             (3) anti-flicker (specular only) — bidirectional |Δluma|
     //       × distToClamp / (distToClamp + boxW)                (4) Salvi/Karis distance-to-clamp (multiplicative ↓)
-    //       max α, isOutlineEdge · 0.9                          (5) outline rejection — UPPER override
-    //       lerp(α, min(α, 0.1), brightPeakDamp)                (6) bright-peak damp (lowers α)
-    //       lerp(α, min(α, 0.03), highFreqStatic · !outline)    (7) fence/wire damp (lowers α)
-    //       lerp(α, min(α, 0.03), mirrorDamp · !outline)        (7b) mirror-shimmer damp (lowers α; roughness<0.1 + low velocity)
+    //       lerp(α, min(α, 0.1), brightPeakDamp)                (5) bright-peak damp (lowers α)
+    //       lerp(α, min(α, 0.03), highFreqStatic)               (6) fence/wire damp (lowers α)
+    //       lerp(α, min(α, 0.01), distantSpecDamp)              (6b) distant specular extra crush (α=0.01)
+    //       lerp(α, min(α, 0.02), mirrorDamp)                   (7) mirror-shimmer damp (roughness<0.1 + low velocity)
     //       lerp(1.0, α, edgeConf)                              (8) edge-fade override — α→1 within 1.5px of border
     //
     // Final α range is clamped by the strongest active rule:
-    //   • outline (5) sets a high floor — once active α ≥ 0.9 regardless of upstream damps
-    //   • highFreqStatic (7) sets a low ceiling — once active α ≤ 0.03 unless outline already raised it
+    //   • highFreqStatic (6) sets a low ceiling — once active α ≤ 0.03
+    //   • distantSpecDamp (6b) tightens further to ≤ 0.01 on specular surfaces
     //   • edge-fade (8) is the LAST step and overrides everything when within 1.5 px of screen border
     //     (history confidence is structurally low there — Catmull-Rom is sampling clamped edge texels)
     // ============================================================================
-    float  safeTau       = max(tauHistory, 1e-4);
-    float  diffuseAlpha  = 1.0 - exp(-deltaTime / safeTau);
-    float  specularAlpha = 1.0 - exp(-deltaTime / (safeTau * 8.0));
+    // Direct history weight (2026-05-24, replaces the τ-seconds model — see
+    // TAA_Common.hlsli for rationale). The 0.125 spec multiplier preserves
+    // the old τ*8 ratio so specular tracking remains slow (longer history)
+    // relative to diffuse without forcing a second slider on the user.
+    float  diffuseAlpha  = 1.0 - saturate(historyWeight);
+    float  specularAlpha = diffuseAlpha * 0.125;
     float  baseAlpha     = lerp(diffuseAlpha, specularAlpha, isSpecularFull);
     // velPx / velFactor computed earlier (hoisted above the clip block for
     // Fix E). (#8) smoothstep(0.5, 2.5, velPx) — see the velFactor comment
     // above for the rationale on the tightened band vs the old (1, 4).
-    float  alpha         = lerp(baseAlpha, max(baseAlpha, 0.3), velFactor);
+    // Velocity boost target lowered 0.5 → 0.15 (2026-05-17). 0.5 = 50% new
+    // sample per moving frame was effectively a 2-frame box filter under
+    // sustained camera motion — HDR sub-pixel highlights aliased differently
+    // each jitter phase and the high α let the per-frame alias straight into
+    // history → shimmer. Real disocclusion path below still uses 0.5; this
+    // baseline boost only widens history weight for ordinary motion.
+    float  alpha         = lerp(baseAlpha, max(baseAlpha, 0.15), velFactor);
 
     // ---- Luminance-gain anti-flicker (specular / noisy regions only) --------
     //
@@ -440,9 +573,8 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     // box. Pure scalar luminance — chrominance flicker is rarely perceptible.
     //
     // Composition note: this multiplicatively reduces alpha. The downstream
-    // outline rejection (max alpha) and bright-peak / high-freq-static damps
-    // (lerp toward min) still take precedence — that ordering is intentional
-    // so outlines stay sharp and bright fireflies still get crushed.
+    // bright-peak / high-freq-static damps (lerp toward min) still take
+    // precedence so bright fireflies still get crushed.
     if (antiFlicker != 0)
     {
         float yMin = m1.x - effectiveGamma * sigma.x;
@@ -452,7 +584,7 @@ void CSMain(uint2 id : SV_DispatchThreadID)
         alpha = saturate(alpha * distToClamp / (distToClamp + boxW));
     }
 
-    // ---- Bright-peak detection (for outline rejection gate + anti-flicker) --
+    // ---- Bright-peak detection (for anti-flicker damping) ------------------
     // Fix I: detection is now in HDR space, not tonemapped. ToneMapLuma
     // compresses a 50x HDR peak down to ~2x ratio in tonemapped space,
     // which sat right at the edge of the old smoothstep(1.5, 3.0) and
@@ -466,36 +598,6 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float currLumaHDR  = Luma(curr);
     float isBrightPeak = smoothstep(2.0, 8.0, currLumaHDR / meanLumaHDR);
 
-    // ---- Outline ghost rejection -------------------------------------------
-    // Outline pixels have high color contrast but near-zero velocity (they're
-    // post-process, not geometry). When the color difference between current
-    // and clipped history is large AND velocity is small, force higher alpha
-    // to reject stale history (prevents outline ghosting/trails).
-    //
-    // Gated by (1 - isBrightPeak) so sub-pixel highlights never trigger the
-    // rejection: outline edges have mid-range luma transitions, bright peaks
-    // are luminance spikes above the local background — distinguishable.
-    float3 colorDiff = abs(currT - hist);
-    float  diffMag   = max(colorDiff.r, max(colorDiff.g, colorDiff.b));
-    // Fix B (rebalanced): the raised diffMag threshold (0.15→0.35 band) is
-    // already self-gating against ordinary texture/specular contrast, so the
-    // velocity gate is dropped entirely. The earlier `step(velPx, 0.3)` meant
-    // outline-rejection went to zero the moment a character started moving,
-    // so the new character-position outline got no alpha boost — old outline
-    // survived in history → visible ghost / "outline drops out" on motion.
-    //
-    // Outlines are post-process: they don't appear in the velocity buffer, so
-    // they need history REJECTION on their own merit (colour delta alone).
-    // isBrightPeak guard still prevents sub-pixel highlights from triggering.
-    float  isOutlineEdge = smoothstep(0.15, 0.35, diffMag)
-                         * (1.0 - isBrightPeak);
-    // Outline α target raised from 0.4 → 0.9. At 0.4 the blend was
-    // 0.6*history + 0.4*current, which dilutes the outline (history at the
-    // moving character's new silhouette is the wrong colour — background,
-    // not outline). 0.9 leaves 10% history for stability on the wider
-    // isOutlineEdge ramp without visibly softening the line. If you see
-    // flicker on character boundaries, back off to ~0.7.
-    alpha = max(alpha, isOutlineEdge * 0.9);
 
     // ---- Bright-peak anti-flicker ------------------------------------------
     // For static bright peaks, force alpha down toward a small value so the
@@ -514,16 +616,16 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float flickerDamp = isBrightPeak * nearStatic;
     alpha = lerp(alpha, min(alpha, 0.1), flickerDamp);
 
-    // Fix H: alpha crush for high-freq-static pixels. At baseAlpha≈0.19
-    // (60fps, τ=0.08s) every frame pulls the result 19% toward "this
-    // frame's jitter phase" — even if history has perfectly integrated
-    // the right coverage, that 19% swing visibly disturbs the integration.
-    // Crushing to 0.03 means only 3% new info per frame → ~33-frame window
-    // for history to converge and any single-frame phase error is diluted
-    // 30x. Gated against outline-edge because outlines legitimately have
-    // high σ + zero velocity (they're post-process), but need FAST
-    // responsiveness (the `max(alpha, 0.9)` above) not slow integration.
-    alpha = lerp(alpha, min(alpha, 0.03), isHighFreqStatic * (1.0 - isOutlineEdge));
+    // Fix H: alpha crush for high-freq-static pixels. Crushing to 0.03 means
+    // only 3% new info per frame → ~33-frame window for history to converge.
+    alpha = lerp(alpha, min(alpha, 0.03), isHighFreqStatic);
+
+    // Distant specular extra crush. high-freq-static + specular = sub-pixel
+    // spec peak shifting between adjacent pixels with peak/dim 20-50x. α=0.03
+    // still leaves visible per-frame swing; α=0.01 (≈100-frame window) drops
+    // it below visibility.
+    float distantSpecDamp = isHighFreqStatic * isSpecularFull;
+    alpha = lerp(alpha, min(alpha, 0.01), distantSpecDamp);
 
     // ---- Mirror-shimmer α crush (chrome / wet / very-low roughness) ---------
     // Very-low-roughness specular surfaces (roughness < 0.1: polished metal,
@@ -538,21 +640,88 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     // mirror's reflected scene is itself TAA-resolved so the only thing
     // sampling at full rate would be camera motion — and camera motion
     // gives velPx > 0.5 which gates this off (nearStatic falls to 0).
-    //
-    // Gated against isOutlineEdge so post-process outlines on mirror
-    // surfaces still respond fast.
     float isMirror     = 1.0 - smoothstep(0.0, 0.2, roughness);
-    float mirrorDamp   = isMirror * (1.0 - smoothstep(0.5, 3.0, velPx)) * (1.0 - isOutlineEdge);
+    float mirrorDamp   = isMirror * (1.0 - smoothstep(0.5, 3.0, velPx));
     alpha = lerp(alpha, min(alpha, 0.02), mirrorDamp);
+
+    // Disocclusion α-boost via depth + clipMag (max), gated by (1 - isHDRBright).
+    //
+    //   depthMM via 1-tap point sample of prev-depth at prevUV. Catches the
+    //     dense-σ-bg-with-thin-foreground case where AABB is so wide that
+    //     CR contamination fits inside (clipMag stays 0). A column at a
+    //     different depth than the bg trivially trips depthMM regardless
+    //     of how wide the colour AABB is.
+    //   clipMag-based detector for coplanar disocclusion (foreground and
+    //     background at similar depth) where depth signal fails.
+    //
+    // Both HDR-gated. HDR-bright pixels rely on spec damps (fix-H/H+,
+    // mirror, bright-peak); the depth-mismatch from sub-pixel jitter at
+    // HDR spec edges would otherwise α-boost and bypass them, causing
+    // edge flicker that's hard to fix without making the detector too
+    // insensitive for LDR cases.
+    //
+    // Boost target 0.5 = 3-frame ≈ 50ms convergence. Modest enough that
+    // residual false-fires aren't visible flashes.
+    {
+        int2  prevPxI    = clamp(int2(prevUV * res), int2(0, 0), dim - 1);
+        float prevDepthV = gPrevDepth.Load(int3(prevPxI, 0)).r;
+        float depthMM    = abs(currDepthVal - prevDepthV) / max(currDepthVal, 1e-5);
+
+        float ldrGate     = 1.0 - isHDRBright;
+        float disoccDepth = smoothstep(0.04, 0.12, depthMM) * ldrGate;
+        float disoccClip  = smoothstep(0.05, 0.2,  clipMag) * ldrGate;
+        float disocclusion = max(disoccDepth, disoccClip);
+
+        alpha = lerp(alpha, max(alpha, 0.5), disocclusion);
+    }
+
+    // ---- Outline-aware history weakening -----------------------------------
+    // OutlinePass stamps a stencil bit on every rim pixel painted by the
+    // inverted-hull sub-pass. Rim pixels share the BACKGROUND's velocity and
+    // depth (the hull writes colour but not depth), so default TAA reprojects
+    // them as if they were stationary background — leaving a several-frame
+    // outline trail behind a moving silhouette. Floor α to outlineMinAlpha
+    // (default 0.5 ≈ 3-frame convergence) on these pixels so the new outline
+    // colour wins the blend within ~50 ms instead of taking 25+ frames.
+    //
+    // Gated by outlineStencilBit being non-zero, which the C++ side clears
+    // when no stencil SRV was plumbed in (e.g. depth format isn't D24_S8).
+    // Placed AFTER every damp so it can't be undone by Fix-H/H+/mirror/etc.,
+    // but BEFORE edge-fade (#1) — screen-border pixels need α→1 regardless of
+    // their outline state because Catmull-Rom is sampling clamped texels.
+    if (outlineStencilBit != 0)
+    {
+        uint stencilByte = gOutlineStencil.Load(int3(id, 0)).y;
+        if ((stencilByte & outlineStencilBit) != 0)
+            alpha = max(alpha, outlineMinAlpha);
+    }
 
     // (#1) Edge-fade: pixels within 1.5 px of any screen border get
     // edgeConf < 1, fading α toward 1.0 (full new sample, no history).
     // edgeConf was computed above based on prevUV * res. Last alpha modifier
-    // so it overrides every previous rule when at the very border — even
-    // outline rejection, which would otherwise insist on stale clamped history.
+    // so it overrides every previous rule when at the very border —
+    // history confidence is structurally low there because Catmull-Rom is
+    // sampling clamped edge texels.
     alpha = lerp(1.0, alpha, edgeConf);
 
     float3 resolved = lerp(hist, currT, alpha);
+
+    // Fast-swing HDR max-protect with decay. Prevents sub-pixel HDR features
+    // (stars, distant spec peaks) from vanishing during rapid camera swings
+    // (CR sub-pixel hist sampling + occasional miss-frames cumulatively dim
+    // bright sources). max(resolved, hist * decay) preserves hist against
+    // dim-curr washout while allowing bounded fade so camera moving PAST a
+    // bright source doesn't leave permanent ghost.
+    //
+    // Decay 0.88 + per-frame CR (≈0.7) + dim-curr blend gives ≈0.6 per-frame
+    // decay → bright source fades to invisible in ~6-10 frames (~150ms at
+    // 60fps). Trade-off chosen to balance star preservation vs ghost trail.
+    //
+    // Tightened gate (8, 20) so only genuinely fast swings engage the
+    // max-protect — moderate camera motion relies on the AABB Y expansion
+    // and clip bypass above (which don't introduce ghost).
+    float fastMotionHDR = isHDRBright * smoothstep(8.0, 20.0, velPx);
+    resolved = lerp(resolved, max(resolved, hist * 0.88), fastMotionHDR);
 
     // ---- Output -------------------------------------------------------------
     // (#10) Alpha channel carries an exponentially-blended prev luma for
@@ -586,4 +755,6 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     float lumaBlend  = max(alpha, 0.05);
     float outLuma    = lerp(histPrevLuma, resolvedLumaHDR, lumaBlend);
     gOutput[id] = float4(outRGB, outLuma);
+    // (gPrevDepthOut / gPrevVelOut already written near top of shader so the
+    //  no-history / out-of-bounds early-return paths leave valid data.)
 }

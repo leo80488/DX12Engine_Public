@@ -8,6 +8,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include <DirectXMath.h>
 
 class TrailSystem;
@@ -65,8 +66,7 @@ private:
     ShaderLibrary       m_shaderLib;
     RHI::PipelineState  m_pso;
 
-    RHI::GPUBuffer      m_renderCB;
-    void*               m_renderCBMapped = nullptr;
+    FrameCB<RenderCB>   m_renderCB;
 
     DirectX::XMFLOAT4X4 m_viewProj{};
     DirectX::XMFLOAT3   m_camForward{ 0, 0, 1 };

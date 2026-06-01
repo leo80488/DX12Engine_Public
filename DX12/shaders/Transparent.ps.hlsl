@@ -39,12 +39,13 @@ cbuffer PushConstants : register(b0, space0)
 
 // LightCB at b2 — the GBuffer VS owns b1 for PerViewCB; both share the same
 // root signature. Forward transparent reads only a subset of the LightCB
-// fields (lightDir, lightColor, cameraPos, ambient, iblRadianceMips,
+// fields (lightDir, lightColor, cameraPos, iblRadianceMips,
 // iblStrength, iblUseSH, reflectionProbeCount), but it sees the full layout
 // so that any future C++ addition stays automatically in sync — the shader's
 // dead reads are optimised away by DXC.
 #define LIGHT_CB_REGISTER b2
 #include "light_cb.hlsli"
+#include "view_mode_common.hlsli"   // VIEW_MODE_* + WIREFRAME_COLOR (LightCB.viewMode)
 
 StructuredBuffer<MaterialGPUData> g_Materials  : register(t2, space0);
 Texture2D<float4>                 g_BaseColor  : register(t3, space0);
@@ -88,6 +89,21 @@ float4 main(PSIn i) : SV_TARGET
 #endif
 
     MaterialGPUData mat = g_Materials[materialIndex];
+
+    // --- Global view-mode override (runtime, LightCB.viewMode) ---------------
+    // Forward path produces final color directly (unlike the deferred meshes,
+    // whose Unlit/Wireframe color is handled in Lighting.ps). Mirror it here so
+    // transparent geometry obeys the same global view mode.
+    //   Wireframe → flat teal (alpha 1 ⇒ replaces under the common blend modes).
+    //   Unlit     → base color × base map, no PBR/IBL.
+    if (viewMode == VIEW_MODE_WIREFRAME)
+        return float4(WIREFRAME_COLOR, 1.0);
+    if (viewMode == VIEW_MODE_UNLIT)
+    {
+        float4 unlit = mat.baseColor * g_BaseColor.Sample(g_LinearWrap, i.uv);
+        clip(unlit.a - 0.01);
+        return unlit;
+    }
 
     float4 baseColor      = mat.baseColor;
     float  roughnessMin   = mat.roughnessMin;
@@ -217,11 +233,13 @@ float4 main(PSIn i) : SV_TARGET
         float3 kDibl   = (1.0 - Fibl) * (1.0 - metalness);
         float3 diffIBL = kDibl * baseColor.rgb * iblDiffuse;
 
-        iblDiffuseTerm  = diffIBL * ao * skyIBLDiffuseScale;
+        // iblStrength is the single master scale on indirect lighting
+        // (Unreal-style): gates both diffuse and specular IBL uniformly.
+        // skyIBLDiffuseScale stays as a per-source diffuse weight composed
+        // before the master scale (matches Lighting.ps.hlsl).
+        iblDiffuseTerm  = diffIBL * ao * skyIBLDiffuseScale * iblStrength;
         iblSpecularTerm = specIBL * ao * iblStrength;
     }
-    // Linear ambient floor — body contribution (absorbed by the glass volume).
-    float3 flatAmbient = baseColor.rgb * ambient * ao;
 
     // Emissive — sits with surface terms (it is *emitted* by the surface, not
     // absorbed by the body, so it must remain visible even on thin glass).
@@ -242,7 +260,7 @@ float4 main(PSIn i) : SV_TARGET
     // Forward-transparent PBR splits the lit colour into two semantic groups
     // because they have different transparency physics:
     //
-    //   bodyColor  — Lambertian diffuse + ambient + IBL diffuse. These come
+    //   bodyColor  — Lambertian diffuse + IBL diffuse. These come
     //                from light passing INTO the medium; for a translucent
     //                body they are absorbed in proportion to opacity, so they
     //                must be modulated by surfaceAlpha.
@@ -269,7 +287,7 @@ float4 main(PSIn i) : SV_TARGET
     // already provides "highlight at full intensity" because it is added on
     // top of  dest*(1 - surfaceAlpha)  by the premultiplied math, no alpha
     // trick required.
-    float3 bodyColor = directDiffuse + iblDiffuseTerm + flatAmbient;
+    float3 bodyColor = directDiffuse + iblDiffuseTerm;
     float3 surfColor = directSpecular + iblSpecularTerm + emissiveTerm;
 
 #if ADDITIVE_BLEND

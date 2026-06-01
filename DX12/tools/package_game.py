@@ -4,7 +4,7 @@
 Requires Phase 2 project split: Game.vcxproj (exe) links EngineCore.vcxproj (lib).
 
 Modes:
-  --cook       (default)  Walk game.json -> startup_world -> referenced assets,
+  --cook       (default)  Walk game.json -> startup_scene -> referenced assets,
                           and copy only those files under asset/.
   --no-cook               Copy the entire asset/ tree (legacy behaviour).
 
@@ -37,14 +37,14 @@ VCXPROJ = PROJECT_ROOT / "Game.vcxproj"
 # blob of bytes, we walk backwards from the dot to the start of the path token.
 ASSET_EXTS = (
     ".itex", ".imsh", ".imat", ".ianim", ".iscn",
-    ".iskel", ".imorph", ".meshlib", ".ippc", ".lua", ".iworld",
+    ".iskel", ".imorph", ".meshlib", ".ippc", ".lua", ".iscene",
 )
 
 # Extensions whose files we re-scan for transitive references.
-SCANNABLE_EXTS = {".iworld", ".imat", ".iscn", ".ippc", ".iskel", ".meshlib"}
+SCANNABLE_EXTS = {".iscene", ".imat", ".iscn", ".ippc", ".iskel", ".meshlib"}
 
 # Characters that terminate a path token when walking backwards from an
-# extension match. .iworld percent-encodes spaces (%20) and is space-free in
+# extension match. .iscene percent-encodes spaces (%20) and is space-free in
 # path values; .iscn/.imat/.iskel store raw spaces inside filenames and use
 # newline/tab/= as delimiters — so we DO NOT include space here.
 _PATH_STOP_BYTES = set(b"\t\r\n\0\"'=<>{}[]|,;")
@@ -54,7 +54,7 @@ _PERCENT_RE = re.compile(r"%([0-9a-fA-F]{2})")
 
 
 def percent_decode(s: str) -> str:
-    """Decode %XX sequences (matches WorldSerializer::PercentEncode)."""
+    """Decode %XX sequences (matches SceneSerializer::PercentEncode)."""
     return _PERCENT_RE.sub(lambda m: chr(int(m.group(1), 16)), s)
 
 
@@ -108,12 +108,12 @@ def resolve(raw: str, base_dir: str) -> str:
     return ""
 
 
-def cook_world(startup_world):
-    """Walk .iworld and transitively scan any file whose extension is in
+def cook_scene(startup_scene):
+    """Walk .iscene and transitively scan any file whose extension is in
        SCANNABLE_EXTS. Paths extracted from a file are first tried as
        project-root-relative, then as relative to that file's directory.
        Returns (set_of_resolved_paths, list_of_unresolved_refs)."""
-    start = normalize(startup_world)
+    start = normalize(startup_scene)
     found = {start}
     queue = [start]
     missing = []
@@ -247,16 +247,16 @@ def package(config: str, out_dir: Path, exe_name: str, cook: bool, pack: bool) -
     # Game.exe only reads .imsh/.itex/.ianim internal formats.
 
     # 3. Assets — two axes:
-    #      cook=True  → walk .iworld deps; False → include whole asset/ tree
+    #      cook=True  → walk .iscene deps; False → include whole asset/ tree
     #      pack=True  → single game.ipak bundle; False → loose files on disk
     manifest = read_manifest()
-    startup_world = manifest.get("startup_world", "") if cook else ""
+    startup_scene = manifest.get("startup_scene", "") if cook else ""
 
     asset_paths = set()
 
-    if cook and startup_world:
-        print(f"[cook] walking '{startup_world}'")
-        cooked, missing = cook_world(startup_world)
+    if cook and startup_scene:
+        print(f"[cook] walking '{startup_scene}'")
+        cooked, missing = cook_scene(startup_scene)
         asset_paths |= cooked
         if missing:
             print(f"[cook] {len(missing)} referenced path(s) do not exist on disk:")
@@ -265,7 +265,7 @@ def package(config: str, out_dir: Path, exe_name: str, cook: bool, pack: bool) -
             if len(missing) > 20:
                 print(f"       ... and {len(missing) - 20} more")
     else:
-        reason = "no startup_world in game.json" if cook else "cook disabled"
+        reason = "no startup_scene in game.json" if cook else "cook disabled"
         print(f"[asset] {reason}; including entire asset/ tree")
         for f in (PROJECT_ROOT / "asset").rglob("*"):
             if f.is_file():
@@ -298,8 +298,8 @@ def package(config: str, out_dir: Path, exe_name: str, cook: bool, pack: bool) -
         print(f"[manifest] no project game.json; writing template to {manifest_dst}")
         manifest_dst.write_text(
             '{\n'
-            '  "_comment": "Edit startup_world to the .iworld you want to boot.",\n'
-            '  "startup_world": ""\n'
+            '  "_comment": "Edit startup_scene to the .iscene you want to boot.",\n'
+            '  "startup_scene": ""\n'
             '}\n',
             encoding="utf-8")
 

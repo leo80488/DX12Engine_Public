@@ -9,25 +9,28 @@ A real-time rendering engine and editor written in C++20 / Direct3D 12 (Shader M
 ## Features
 
 **Rendering**
-- Deferred G-Buffer with bindless per-vertex-format geometry and ExecuteIndirect culling
-- Clustered Forward+ / Deferred lighting, CSM (3 cascades, Halton-jittered), spot shadow atlas
-- DDGI (inline RayQuery), runtime-baked reflection probes, Hi-Z stochastic SSR
-- Hillaire 2020 atmosphere, sky-SH IBL, IBL cube + BRDF LUT
+- Deferred G-Buffer with bindless per-vertex-format (PVF) geometry and ExecuteIndirect GPU culling
+- Clustered Forward+ / Deferred lighting (16×9×24 froxels), 4-cascade CSM (3 near + 1 ultra-far terrain) + spot shadow atlas
+- DDGI (inline RayQuery, per-probe SH irradiance, up to 4 volumes), runtime-baked reflection probes, Hi-Z stochastic SSR subsystem
+- Hillaire 2020 atmosphere, sky-SH IBL, IBL cube + BRDF LUT, volumetric clouds
 - Froxel volumetric fog + volumetric raymarch god-rays
-- TAA, XeGTAO, Bloom (Sledgehammer), CAS, Auto-Exposure, Lens Flare, Tonemap, Color Grading
-- Mesh-shader terrain pipeline, decals, outline (3-pass), glass-shatter, GPU particles / trails / tracers / beams
-- GPU skinning + morph targets + IK + sockets + chain physics
+- TAA + FXAA, XeGTAO, Bloom (Sledgehammer), CAS, Auto-Exposure, Lens Flare, Tonemap, Color Grading
+- Mesh-shader terrain pipeline, decals, outline (3-pass), glass-shatter, GPU particles / trails / tracers / beams / afterimages
+- GPU skinning + morph targets + CCD IK (incl. ground-aware foot IK) + sockets + chain / spring-bone physics
+- Hardware video decode (FFmpeg D3D12VA → NV12 YUV→RGB composite, screen- and world-space)
 
 **Engine**
-- Pool-per-component ECS, scene-graph hierarchy, post-process volume system
-- Resource cooker (Mesh / Material / Texture / Animation / Skeleton / PMX / VMD / VRM / Audio)
-- Async loading, descriptor-heap allocators, PSO + DXIL shader-blob caches, hot-reload
+- Pool-per-component (sparse-set) ECS, 16-phase dependency-aware parallel scheduler, scene-graph hierarchy
+- Post-process volume system, AnimNotify / Timeline runtime, time-of-day, GUID-stable entity references
+- Resource cooker (Mesh / `.meshlib` / Material / Texture / Animation / Skeleton / PMX / VMD / VRM / Audio) + `.ipak` virtual filesystem
+- Async loading, GPU BC compression, descriptor-heap allocators, PSO + DXIL shader-blob caches, hot-reload
+- Jolt Physics + kinematic character controller, Recast/Detour navigation, behavior-tree AI (Intent / Tactical / LOD layers)
 - Reverse-Z, bindless everything, material schema, reflection-driven inspector
 
 **Tooling**
-- ImGui-docking editor (Hierarchy / Viewport / Inspector / Asset Browser / Timeline)
+- ImGui-docking editor (Hierarchy / Viewport / Inspector / Asset Browser / Timeline + SSR / Font / Camera / Profiler debug windows)
 - ShaderLab sub-second shader-iteration sandbox
-- Lua 5.4 + sol2 scripting, Behavior Tree AI authored in Lua
+- Lua 5.4 + sol2 scripting (gameplay, UI, AI behavior trees), GameModeStack scene flow
 - Jolt Physics, XAudio2 + X3DAudio
 
 ## Build

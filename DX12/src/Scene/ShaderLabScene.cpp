@@ -1,6 +1,7 @@
 #include "Scene/ShaderLabScene.h"
 
 #include "ECS/Components.h"
+#include "ECS/CameraSystem.h"
 #include "ECS/SkyboxComponent.h"
 #include "Graphics/Renderer.h"
 #include "Scene/MeshSpawner.h"
@@ -36,12 +37,12 @@ namespace
     const LightData kRim  = MakeDirLight({ 0.10f, -0.20f, -0.95f }, { 1.00f, 1.00f, 1.00f }, 0.6f);
 }
 
-void ShaderLabScene::Init(SceneContext* ctx)
+void ShaderLabScene::Init(GameModeContext* ctx)
 {
     m_ctx = ctx;
     if (!m_ctx || !m_ctx->world)
     {
-        LOG_ERROR("ShaderLabScene: Init received null SceneContext / World");
+        LOG_ERROR("ShaderLabScene: Init received null GameModeContext / World");
         return;
     }
     LOG_INFO("ShaderLabScene: Init — minimal shader test scene");
@@ -51,7 +52,12 @@ void ShaderLabScene::Init(SceneContext* ctx)
     // ---- Camera --------------------------------------------------------------
     m_cameraEntity = world.CreateEntity();
     world.SetName(m_cameraEntity, "ShaderLab Camera");
+    CameraControllerComponent camCtrl{};
     world.AddComponent<CameraComponent>(m_cameraEntity, CameraComponent{});
+    world.AddComponent<CameraControllerComponent>(m_cameraEntity, camCtrl);
+    world.AddComponent<LocalTransform>(m_cameraEntity,
+        CameraSystem::MakeTransform(camCtrl, { 4.f, 3.f, 5.f }));
+    world.AddComponent<GlobalTransform>(m_cameraEntity, GlobalTransform{});
     m_spawnedEntities.push_back(m_cameraEntity);
 
     // ---- 3-point light rig --------------------------------------------------
@@ -124,7 +130,7 @@ void ShaderLabScene::Shutdown()
 // OnUIRender — single ImGui window with the MVP knobs. Lives here (not in
 // EditorLayer) per design doc §6.3: tool-specific UI in tool source.
 // ---------------------------------------------------------------------------
-void ShaderLabScene::OnUIRender(SceneContext& ctx)
+void ShaderLabScene::OnUIRender(GameModeContext& ctx)
 {
     if (!ctx.world) return;
     World& world = *ctx.world;
@@ -137,7 +143,7 @@ void ShaderLabScene::OnUIRender(SceneContext& ctx)
 
     // ---- Mesh ---------------------------------------------------------------
     {
-        static const char* kMeshNames[] = { "Cube", "Sphere", "Cone" };
+        static const char* kMeshNames[] = { "Cube", "Sphere", "Cone", "Plane", "Torus" };
         if (ImGui::Combo("Test Mesh", &m_meshType, kMeshNames, IM_ARRAYSIZE(kMeshNames)))
             ApplyMeshSwap(world);
     }
@@ -378,8 +384,8 @@ std::string ShaderLabScene::MakeCapturePath() const
 void ShaderLabScene::ApplyTurntable(World& world, float dt)
 {
     if (m_cameraEntity == NullEntity || !world.IsAlive(m_cameraEntity)) return;
-    auto* cam = world.GetComponent<CameraComponent>(m_cameraEntity);
-    if (!cam) return;
+    auto* lt = world.GetComponent<LocalTransform>(m_cameraEntity);
+    if (!lt) return;
 
     m_orbitYaw += m_turntableSpeed * dt;
 
@@ -389,16 +395,15 @@ void ShaderLabScene::ApplyTurntable(World& world, float dt)
     const float cosY = std::cosf(m_orbitYaw);
     const float sinY = std::sinf(m_orbitYaw);
 
-    cam->position.x = m_orbitDistance * sinY * cosP;
-    cam->position.y = m_orbitDistance * sinP;
-    cam->position.z = m_orbitDistance * cosY * cosP;
+    lt->translation = { m_orbitDistance * sinY * cosP,
+                        m_orbitDistance * sinP,
+                        m_orbitDistance * cosY * cosP };
 
-    // Camera looks at origin → forward = -position / distance. Convert that
-    // back to (yaw, pitch) using the same convention the existing renderer
-    // uses: forward = (sin(yaw)*cos(pitch), -sin(pitch), cos(yaw)*cos(pitch)).
-    const float fx = -sinY * cosP;
-    const float fy = -sinP;
-    const float fz = -cosY * cosP;
-    cam->yaw   = std::atan2f(fx, fz);
-    cam->pitch = -std::asinf(fy);
+    // Camera looks back at the origin. With the FPS forward convention
+    // forward = (sin(yaw)cos(pitch), -sin(pitch), cos(yaw)cos(pitch)),
+    // looking from the orbit position toward the origin is exactly
+    // yaw = orbitYaw + π, pitch = orbitPitch — no trig inversion needed.
+    DirectX::XMStoreFloat4(&lt->rotation,
+        DirectX::XMQuaternionRotationRollPitchYaw(
+            m_orbitPitch, m_orbitYaw + DirectX::XM_PI, 0.f));
 }

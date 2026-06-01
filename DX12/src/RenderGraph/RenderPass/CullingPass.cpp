@@ -37,12 +37,7 @@ void CullingPass::Init(IGraphicsDevice& gfx)
     { LOG_ERROR("CullingPass: PSO creation failed"); return; }
 
     // CB
-    RHI::GPUBufferDesc bd{};
-    bd.size       = (sizeof(CullingCB) + 255) & ~255u;
-    bd.usage      = RHI::Usage::UPLOAD;
-    bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(bd, m_cb))
-        m_cbMapped = gfx.MapBuffer(m_cb);
+    m_cb.Create(gfx, "Culling.CB");
 
     LOG_SUCCESS("CullingPass: initialized (GPU frustum culling)");
 }
@@ -65,8 +60,7 @@ void CullingPass::Execute(RHI::CommandList cl,
     // Upload CB
     m_cbData.viewProj      = m_viewProj;
     m_cbData.instanceCount = m_instanceCount;
-    if (m_cbMapped)
-        std::memcpy(m_cbMapped, &m_cbData, sizeof(CullingCB));
+    if (auto* slot = m_cb.Current(gfx)) *slot = m_cbData;
 
     // Clear the draw count to 0 (GPU atomic counter).
     // We use a small upload buffer trick: write 0 to a temp and copy.
@@ -74,7 +68,7 @@ void CullingPass::Execute(RHI::CommandList cl,
     // TODO: proper UAV clear. For now, the counter is expected to be zeroed externally.
 
     gfx.BindComputePipelineState(m_pso, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kInstanceSRV,    gfx.GetBufferSRVGpuHandle(instanceBuffer), cl);
     gfx.SetComputeDescriptorTable(kMeshAABBSRV,    gfx.GetBufferSRVGpuHandle(meshAABBBuffer), cl);
     gfx.SetComputeDescriptorTable(kOutCommandsUAV, gfx.GetBufferUAVGpuHandle(outArgBuffer), cl);

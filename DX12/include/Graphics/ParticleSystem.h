@@ -23,6 +23,7 @@
 //          slot, VS self-discards dead slots.
 
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include "Resource/SystemHandles.h"     // Resource::TextureHandle
 #include "ECS/ECS.h"
 
@@ -174,12 +175,14 @@ public:
 
     // Descriptor accessors used by passes.
     const RHI::GPUBuffer& GetParticlePool()    const { return m_particlePool; }
-    const RHI::GPUBuffer& GetEmitterBuffer()   const { return m_emitterBuffer; }
+    // Emitter buffer is triple-buffered (per-frame written); accessor returns
+    // the current frame's slot.
+    const RHI::GPUBuffer& GetEmitterBuffer()   const;
     uint64_t              GetPoolSRVHandle()   const { return m_poolSrvHandle; }
     uint64_t              GetPoolUAVHandle()   const { return m_poolUavHandle; }
 
     // Per-frame globals CB (delta time, frame index, global gravity).
-    const RHI::GPUBuffer& GetSystemCB()        const { return m_systemCB; }
+    const RHI::GPUBuffer& GetSystemCB()        const;
     void                  UpdateSystemCB(float dt, uint32_t frameIndex);
 
     // Total pool slot count (convenience).
@@ -202,12 +205,13 @@ private:
     // Stride: kEmitterSlotStride (256) so each emitter's slot is 256B-aligned
     // for D3D12 root CBV binding requirements. ParticleEmitterGPU (~112B) is
     // written at the start of each slot; remaining bytes are zeroed padding.
-    RHI::GPUBuffer   m_emitterBuffer;
-    void*            m_emitterMapped = nullptr;
+    // Triple-buffered ring — written every frame by CollectEmitters.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer   m_emitterBuffer[kFrameCount];
+    void*            m_emitterMapped[kFrameCount] = {};
 
-    // Per-frame globals CB (UPLOAD heap, root CBV).
-    RHI::GPUBuffer   m_systemCB;
-    void*            m_systemCBMapped = nullptr;
+    // Per-frame globals CB (UPLOAD heap, root CBV). Triple-buffered.
+    FrameCB<ParticleSystemCB> m_systemCB;
 
     // Ring cursor into m_particlePool — advanced by CollectEmitters.
     uint32_t         m_writeCursor = 0;

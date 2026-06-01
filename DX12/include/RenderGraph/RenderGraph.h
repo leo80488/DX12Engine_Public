@@ -76,6 +76,20 @@ namespace RG
         // Returns an invalid CommandList if the graph has no passes.
         RHI::CommandList Execute(IGraphicsDevice& gfx, const float clearColor[4]);
 
+        // Register a cross-queue dependency for a specific pass. When Execute()
+        // opens that pass's CL, it adds the dependency via AddCommandListDependency
+        // so the pass waits for @p depCL before recording.
+        //
+        // Used to land an async-compute producer's wait at exactly the consumer
+        // pass — e.g. LightingPass waits for the DDGI compute-queue CL — instead
+        // of stalling the whole graph at its first pass (which would eliminate
+        // the async-compute overlap with GBuffer/Shadow/SkyIBL).
+        //
+        // Pass name matches RenderPass::GetName(). Wait map is one-shot: cleared
+        // at the start of each Execute() so callers re-register every frame
+        // (matches the SetDrawList / BindBuffer convention).
+        void SetExternalWait(const char* passName, RHI::CommandList depCL);
+
         // Hot-reload entry point. Delegates to RenderPass::ReloadShaders on
         // every registered pass. Caller is responsible for ensuring the GPU
         // is idle (no in-flight commands referencing the old PSOs) — the
@@ -154,6 +168,10 @@ namespace RG
         std::unordered_map<std::string, uint32_t>               m_nameToIndex;
         std::unordered_map<std::string, const RHI::GPUBuffer*>  m_cbBindings;
         std::unordered_map<std::string, const RHI::GPUBuffer*>  m_bufferBindings;
+        // Pass-name → cross-queue dependency CL. Populated by SetExternalWait,
+        // consumed and cleared by Execute. Storing CL by value is fine — the
+        // RHI::CommandList handle is trivially copyable.
+        std::unordered_map<std::string, RHI::CommandList>       m_externalWaits;
 
         PassNode* m_currentSetupNode = nullptr;
 

@@ -12,9 +12,25 @@
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/PSOCache.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #include <cmath>
 #include <DirectXMath.h>
+
+// HLSL-layout shadow of the per-frame SkyCB (b2 space0). Moved into the
+// header so FrameCB<SkyCBData> can be a member of SkyboxPass without forcing
+// the whole header to include the .cpp.
+struct alignas(16) SkyCBData
+{
+    float    sunDir[3];    float sunDiskSize;       // cos(half-angle of sun core)
+    float    sunColor[3];  float sunDiskIntensity;
+    float    moonDir[3];   float moonDiskCos;       // cos(half-angle of moon disk)
+    float    moonColor[3]; float moonVisible;       // 1 = draw moon, 0 = skip
+    float    starIntensity;                          // [0,1] day/night blend
+    float    starTime;                               // seconds, twinkle phase
+    float    starDensity;                            // grid resolution
+    float    starBrightness;                         // overall multiplier
+};
 
 namespace RG { class RenderContext; }
 
@@ -34,6 +50,10 @@ public:
     /** Called by Renderer each frame with the prefiltered radiance cubemap GPU handle.
      *  Pass 0 to skip the skybox draw. */
     void SetEnvMap(uint64_t gpuHandle) { m_envMapGpuHandle = gpuHandle; }
+
+    /** Global view-mode suppress — skip the skybox draw in Wireframe view so
+     *  the background stays the cleared black. Set every frame by Renderer. */
+    void SetViewModeHidden(bool h) { m_viewModeHidden = h; }
 
     /** Borrow the 36-vertex cube ByteAddressBuffer so external passes
      *  (e.g. reflection probe capture) can reuse the same geometry without
@@ -89,8 +109,10 @@ public:
         m_starBrightness = brightness;
     }
 
-    /** Returns the CB so Renderer can register it with the RenderGraph. */
-    const RHI::GPUBuffer& GetSkyCB() const { return m_skyCB; }
+    /** Returns the current-frame slot of the triple-buffered SkyCB so
+     *  Renderer can register it with the RenderGraph each frame. Caller
+     *  must rebind every frame because the underlying buffer rotates. */
+    const RHI::GPUBuffer& GetSkyCB(IGraphicsDevice& gfx) const { return m_skyCB.CurrentBuffer(gfx); }
 
 private:
     PSODesc BuildPSODesc() const;
@@ -106,9 +128,11 @@ private:
     // IBL environment cubemap — set by Renderer via SetEnvMap() each frame.
     uint64_t            m_envMapGpuHandle = 0;
 
+    // Global view-mode suppress (Renderer hides the skybox in Wireframe view).
+    bool                m_viewModeHidden = false;
+
     // Sun disk state (written each frame via SetSun, uploaded into m_skyCB).
-    RHI::GPUBuffer      m_skyCB;
-    void*               m_skyCBMapped = nullptr;
+    FrameCB<SkyCBData>  m_skyCB;
     DirectX::XMFLOAT3   m_sunDir           { 0.0f, 1.0f, 0.0f };
     DirectX::XMFLOAT3   m_sunColor         { 0.0f, 0.0f, 0.0f };
     float               m_sunDiskCos       = 0.99998f;   // cos(0.5°)

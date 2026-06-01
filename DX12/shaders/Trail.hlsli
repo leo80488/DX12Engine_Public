@@ -33,7 +33,7 @@ struct TrailAppendRequest
     uint   trailSlot;
     float  width;
     float  maxAge;
-    float  _pad0;
+    uint   flags;        // bit0 = reset header (head/count→0) before append; bit1 = reset-only (skip append)
     float4 startColor;
     float4 endColor;
 };                       // 64 bytes

@@ -32,30 +32,27 @@ void WorldUIBillboardPass::Init(IGraphicsDevice& gfx)
     m_psoCache.Init(gfx, m_shaderLib);
 
     // Vertex buffer — flat-expanded (no IA index buffer; engine root sig
-    // doesn't expose one).  Each frame we rebuild from scratch.
+    // doesn't expose one).  Each frame we rebuild from scratch. Triple-
+    // buffered ring so frame N+1 CPU writes can't race frame N GPU reads.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxVertices) * sizeof(WorldUIVertex);
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_RAW;
-        if (gfx.CreateBuffer(bd, m_vertexBuffer))
-            m_vbMapped = gfx.MapBuffer(m_vertexBuffer);
-        else
-            LOG_ERROR("WorldUIBillboardPass: VB creation failed");
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(bd, m_vertexBuffer[i]))
+                m_vbMapped[i] = gfx.MapBuffer(m_vertexBuffer[i]);
+            else
+                LOG_ERROR("WorldUIBillboardPass: VB[%u] creation failed", i);
+        }
     }
 
     // Stub CB — engine binds PerViewCB at b1 anyway, but the root sig
     // expects some non-zero CBV bound at slot=0; reuse the same trick as
     // UIPass.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = 256;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "WorldUIBillboard.CB");
 
     {
         RHI::SamplerDesc sd{};
@@ -200,9 +197,10 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
 {
     if (!enabled || !m_gfx || !target || !target->IsValid()) return;
     if (canvasW == 0 || canvasH == 0) return;
-    if (!m_vbMapped) return;
 
     auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    if (!m_vbMapped[frameSlot]) return;
     const PSODesc psoDesc = BuildPSODesc();
     const RHI::PipelineState* pso = m_psoCache.GetOrCreate(psoDesc);
     if (!pso || !pso->IsValid()) return;
@@ -413,7 +411,7 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
 
     // ---- Upload ----
     const size_t bytes = verts.size() * sizeof(WorldUIVertex);
-    std::memcpy(m_vbMapped, verts.data(), bytes);
+    std::memcpy(m_vbMapped[frameSlot], verts.data(), bytes);
 
     // ---- Transition target → RT ----
     if (entryState != RHI::ResourceState::RENDERTARGET)
@@ -444,7 +442,7 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
 
     // Upload our own un-jittered viewProj into m_cb (so UI doesn't dance
     // with TAA jitter). Engine's PerViewCB has the jittered variant.
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
         // Shader reads as float4x4 viewProj at register(b1).  HLSL
         // expects column-major when storing matrices in cbuffer; the
@@ -452,14 +450,12 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
         // convention with HLSL column-major buffer).  Match that by
         // transposing on upload.
         XMMATRIX m = XMLoadFloat4x4(&viewProjMatrix);
-        XMFLOAT4X4 transposed;
-        XMStoreFloat4x4(&transposed, XMMatrixTranspose(m));
-        std::memcpy(m_cbMapped, &transposed, sizeof(XMFLOAT4X4));
+        XMStoreFloat4x4(slot, XMMatrixTranspose(m));
     }
-    gfx.BindConstantBuffer(m_cb, 0, cl);   // b1 space0
+    gfx.BindConstantBuffer(m_cb.CurrentBuffer(gfx), 0, cl);   // b1 space0
     if (m_samplerIdx >= 0) gfx.BindSampler(m_samplerIdx, 0, cl);
 
-    const uint64_t vbHandle = gfx.GetBufferSRVGpuHandle(m_vertexBuffer);
+    const uint64_t vbHandle = gfx.GetBufferSRVGpuHandle(m_vertexBuffer[frameSlot]);
     if (vbHandle) gfx.BindDescriptorTableGpuHandle(kRootSlot_VertexSRV, vbHandle, cl);
 
     // Bind the engine's bindless texture table at t0 space2 — covers the

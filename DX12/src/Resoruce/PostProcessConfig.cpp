@@ -157,13 +157,7 @@ void Resource::PostProcessConfig::CaptureFrom(const Renderer& rc)
     {
         atmosphereEnabled      = sk->IsAtmosphereEnabled();
         skyboxSource           = static_cast<uint32_t>(sk->GetSkyboxSource());
-        timeOfDayEnabled       = sk->IsTimeOfDayEnabled();
-        timeOfDay              = sk->GetTimeOfDay();
-        timeSpeed              = sk->GetTimeSpeed();
-        latitude               = sk->GetLatitude();
-        sunIntensityScale      = sk->GetSunIntensityScale();
         iblStrength            = sk->GetIBLStrength();
-        skyAmbientColor        = sk->GetAmbientColor();
         aerialCompositeEnabled = sk->IsAerialCompositeEnabled();
     }
 }
@@ -241,13 +235,7 @@ void Resource::PostProcessConfig::ApplyTo(Renderer& r) const
     {
         sk->SetAtmosphereEnabled(atmosphereEnabled);
         sk->SetSkyboxSource(static_cast<SkyIBLPass::SkyboxSource>(skyboxSource));
-        sk->SetTimeOfDayEnabled(timeOfDayEnabled);
-        sk->SetTimeOfDay(timeOfDay);
-        sk->SetTimeSpeed(timeSpeed);
-        sk->SetLatitude(latitude);
-        sk->SetSunIntensityScale(sunIntensityScale);
         sk->SetIBLStrength(iblStrength);
-        sk->SetAmbientColor(skyAmbientColor);
         sk->SetAerialCompositeEnabled(aerialCompositeEnabled);
     }
 }
@@ -333,15 +321,10 @@ bool Resource::SavePostProcessConfig(const PostProcessConfig& c, const std::stri
     ss << buf;
 
     snprintf(buf, sizeof(buf),
-        "SkyIBL atmosphereEnabled=%u skyboxSource=%u todEnabled=%u"
-        " timeOfDay=%.6f timeSpeed=%.6f latitude=%.6f"
-        " sunIntensity=%.6f iblStrength=%.6f ambient=%.6f_%.6f_%.6f"
-        " aerialComposite=%u\n",
+        "SkyIBL atmosphereEnabled=%u skyboxSource=%u"
+        " iblStrength=%.6f aerialComposite=%u\n",
         c.atmosphereEnabled ? 1u : 0u, c.skyboxSource,
-        c.timeOfDayEnabled ? 1u : 0u,
-        c.timeOfDay, c.timeSpeed, c.latitude,
-        c.sunIntensityScale, c.iblStrength,
-        c.skyAmbientColor.x, c.skyAmbientColor.y, c.skyAmbientColor.z,
+        c.iblStrength,
         c.aerialCompositeEnabled ? 1u : 0u);
     ss << buf;
 
@@ -453,13 +436,7 @@ bool Resource::LoadPostProcessConfig(const std::string& path, PostProcessConfig&
         {
             out.atmosphereEnabled      = GetB(m, "atmosphereEnabled", out.atmosphereEnabled);
             out.skyboxSource           = static_cast<uint32_t>(GetI(m, "skyboxSource", out.skyboxSource));
-            out.timeOfDayEnabled       = GetB(m, "todEnabled",       out.timeOfDayEnabled);
-            out.timeOfDay              = GetF(m, "timeOfDay",        out.timeOfDay);
-            out.timeSpeed              = GetF(m, "timeSpeed",        out.timeSpeed);
-            out.latitude               = GetF(m, "latitude",         out.latitude);
-            out.sunIntensityScale      = GetF(m, "sunIntensity",     out.sunIntensityScale);
             out.iblStrength            = GetF(m, "iblStrength",      out.iblStrength);
-            out.skyAmbientColor        = GetF3(m, "ambient",         out.skyAmbientColor);
             out.aerialCompositeEnabled = GetB(m, "aerialComposite",  out.aerialCompositeEnabled);
         }
     }

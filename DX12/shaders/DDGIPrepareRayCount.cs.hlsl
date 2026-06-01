@@ -32,7 +32,21 @@ void main(uint3 DTid : SV_DispatchThreadID)
     if (probeIdx >= probeCount) return;
 
     const uint maxBuckets = max(g_Vol.raysPerProbe / DDGI_RAY_BUCKET_COUNT, 1u);
-    const uint minBuckets = max(maxBuckets / 4u, 1u);
+    // minBuckets == maxBuckets — adaptive ray count DISABLED (constant full
+    // budget every frame). Rationale: with raysPerProbe=64 the old
+    // minBuckets=maxBuckets/4 dropped converged probes to 16 rays/frame, whose
+    // single-frame estimate is both noisy AND biased. Worse, "ray count ↔
+    // inconsistency" formed a slow feedback loop (few rays → biased newSample →
+    // high inconsistency → more rays → unbiased → low inconsistency → few rays
+    // → ...) with a period of tens of frames — a LOW-frequency oscillation the
+    // relight EMA passes straight through, surfacing as whole-scene "breathing"
+    // that only hysteresis ~0.99 could damp. Holding the ray count constant
+    // removes the loop entirely and gives every probe its best per-frame
+    // estimate, so a moderate hysteresis stays stable. Cost: ~2× steady-state
+    // trace work vs the old adaptive average. If that ever hits TDR on huge
+    // probe grids, re-introduce adaptivity as a SLOW-RAMPED value (so the loop
+    // stays sub-EMA-bandwidth) rather than the old fast variance ramp.
+    const uint minBuckets = maxBuckets;
 
     // Variance-driven adaptive ray count. We pick the largest "inconsistency"
     // signal across this probe's irradiance-tile texels — a probe whose

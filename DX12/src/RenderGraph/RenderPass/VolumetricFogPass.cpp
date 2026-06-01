@@ -24,64 +24,9 @@ static constexpr uint32_t kEnvMapRootSlot = 19;  // t6 space0 — we re-purpose 
                                                  // to bind the 3D scattering
                                                  // SRV for the apply PS.
 
-struct alignas(16) FroxelConstants
-{
-    float    viewProj[16];
-    float    invViewProj[16];
-    float    prevViewProj[16];
-
-    float    cameraPos[3];   float nearPlane;
-    float    farPlane;       float froxelNear;
-    float    froxelFar;      float temporalAlpha;
-
-    uint32_t frameIndex;
-    uint32_t froxelW;
-    uint32_t froxelH;
-    uint32_t froxelD;
-
-    float    fogDensity;
-    float    fogScattering;
-    float    fogAbsorption;
-    float    anisotropy;
-
-    float    heightFogStart;
-    float    heightFogFalloff;
-    float    ambientContribution;
-    float    _pad0;
-
-    float    sunDir[3];      float sunStrength;
-    float    sunColor[3];    float _pad1;
-    float    ambientColor[3];float _pad2;
-
-    // CSM (matches HLSL FroxelParams tail).
-    float    shadowMatrix0[16];
-    float    shadowMatrix1[16];
-    float    shadowMatrix2[16];
-    float    cascadeSplits[4];
-    float    shadowParams[4]; // x=texelSize, y=blendRange, z=bias, w=strength
-    float    cameraForward[3];float _pad3;
-
-    // Voxel occupancy grid — written by SceneVoxelPass, consumed by
-    // FroxelLightInject for spot/point light occlusion. Grid is a
-    // world-space AABB snapped to voxel size around the camera.
-    float    voxelGridMin[3];    float _padVG0;
-    float    voxelGridExtent[3]; uint32_t voxelGridDim; // extent = gridMax - gridMin
-};
-
-// (Shadow data lives inside FroxelConstants now — single CB slot keeps the
-//  compute root signature unchanged.)
-
-struct alignas(16) VolApplyConstants
-{
-    float    nearZ;
-    float    farZ;
-    float    froxelNear;
-    float    froxelFar;
-    uint32_t froxelDepth;
-    uint32_t _pad0;
-    uint32_t _pad1;
-    uint32_t _pad2;
-};
+// FroxelConstants / VolApplyConstants moved to VolumetricFogPass.h so the
+// per-frame CBs can be FrameCB<T> members (T needs to be a complete type at
+// the FrameCB<T> instantiation point).
 
 // ---------------------------------------------------------------------------
 VolumetricFogPass::VolumetricFogPass(RG::RGTextureHandle depth)
@@ -103,9 +48,15 @@ VolumetricFogPass::~VolumetricFogPass()
     for (int i = 0; i < 2; ++i)
         if (m_historyTex[i].IsValid()) m_gfx->DestroyTexture(m_historyTex[i]);
     DestroyRaymarchTextures();
-    if (m_paramCB.IsValid())     { if (m_paramCBMapped)     m_gfx->UnmapBuffer(m_paramCB);     m_gfx->DestroyBuffer(m_paramCB); }
-    if (m_applyCB.IsValid())     { if (m_applyCBMapped)     m_gfx->UnmapBuffer(m_applyCB);     m_gfx->DestroyBuffer(m_applyCB); }
-    if (m_volLightsBuf.IsValid()){ if (m_volLightsBufMapped) m_gfx->UnmapBuffer(m_volLightsBuf); m_gfx->DestroyBuffer(m_volLightsBuf); }
+    m_paramCB.Destroy(*m_gfx);
+    m_applyCB.Destroy(*m_gfx);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
+    {
+        if (m_volLightsBufMapped[i])    m_gfx->UnmapBuffer(m_volLightsBuf[i]);
+        if (m_volLightsBuf[i].IsValid()) m_gfx->DestroyBuffer(m_volLightsBuf[i]);
+        m_volLightsBufMapped[i] = nullptr;
+        m_lightsSrv[i]          = 0;
+    }
 }
 
 void VolumetricFogPass::Setup(RG::RenderGraphBuilder& b)
@@ -228,26 +179,15 @@ void VolumetricFogPass::Init(IGraphicsDevice& gfx)
     // ---- 3D textures + descriptors -----------------------------------------
     Create3DTextures(gfx);
 
-    // ---- CBs ---------------------------------------------------------------
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(FroxelConstants) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_paramCB))
-            m_paramCBMapped = gfx.MapBuffer(m_paramCB);
-    }
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(VolApplyConstants) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_applyCB))
-            m_applyCBMapped = gfx.MapBuffer(m_applyCB);
-    }
+    // ---- CBs (triple-buffered) --------------------------------------------
+    if (!m_paramCB.Create(gfx, "VolumetricFogPass.ParamCB"))
+        LOG_ERROR("VolumetricFogPass: ParamCB create failed");
+    if (!m_applyCB.Create(gfx, "VolumetricFogPass.ApplyCB"))
+        LOG_ERROR("VolumetricFogPass: ApplyCB create failed");
 
-    // Volumetric light StructuredBuffer<GPULight> (UPLOAD). Holds the subset
-    // of scene lights that opted into volumetric (VolumetricLightComponent).
+    // Volumetric light StructuredBuffer<GPULight> (UPLOAD), triple-buffered.
+    // Holds the subset of scene lights that opted into volumetric
+    // (VolumetricLightComponent).
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = kMaxVolLights * sizeof(VolLight);
@@ -255,10 +195,13 @@ void VolumetricFogPass::Init(IGraphicsDevice& gfx)
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
-        if (gfx.CreateBuffer(bd, m_volLightsBuf))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_volLightsBufMapped = gfx.MapBuffer(m_volLightsBuf);
-            m_lightsSrv          = gfx.GetBufferSRVGpuHandle(m_volLightsBuf);
+            if (gfx.CreateBuffer(bd, m_volLightsBuf[i]))
+            {
+                m_volLightsBufMapped[i] = gfx.MapBuffer(m_volLightsBuf[i]);
+                m_lightsSrv[i]          = gfx.GetBufferSRVGpuHandle(m_volLightsBuf[i]);
+            }
         }
     }
 
@@ -373,9 +316,11 @@ void VolumetricFogPass::SetVolumetricLights(const std::vector<VolLight>& lights)
 {
     m_spotLightCount = static_cast<uint32_t>((std::min)(lights.size(),
                                                         size_t(kMaxVolLights)));
-    if (m_volLightsBufMapped && m_spotLightCount > 0)
+    if (!m_gfx || m_spotLightCount == 0) return;
+    const uint32_t s = m_gfx->GetFrameIndex();
+    if (s < kFrameCount && m_volLightsBufMapped[s])
     {
-        std::memcpy(m_volLightsBufMapped, lights.data(),
+        std::memcpy(m_volLightsBufMapped[s], lights.data(),
                     m_spotLightCount * sizeof(VolLight));
     }
 }
@@ -448,7 +393,7 @@ void VolumetricFogPass::DispatchDensity(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_densityPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_densityTex), cl);
     gfx.DispatchCompute((kFroxelW + 7) / 8, (kFroxelH + 7) / 8, kFroxelD, cl);
 
@@ -465,7 +410,7 @@ void VolumetricFogPass::DispatchLightInject(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_lightInjectPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRVT0, gfx.GetTextureSRVGpuHandle(m_densityTex), cl);
     // CSM shadow array — ShadowPass now leaves it in DEPTH_READ|PIXEL_SR|
     // NON_PIXEL_SR (DEPTH_READ_SRV in the engine RHI), so the compute path
@@ -473,8 +418,11 @@ void VolumetricFogPass::DispatchLightInject(RHI::CommandList cl)
     if (m_shadowSrv)
         gfx.SetComputeDescriptorTable(kSRVT1, m_shadowSrv, cl);
     // Clustered-lighting GPULight buffer (point + spot lights for volumetric).
-    if (m_lightsSrv)
-        gfx.SetComputeDescriptorTable(/*t2 space2 root param 3*/ 3, m_lightsSrv, cl);
+    {
+        const uint64_t lightsSrv = m_lightsSrv[gfx.GetFrameIndex()];
+        if (lightsSrv)
+            gfx.SetComputeDescriptorTable(/*t2 space2 root param 3*/ 3, lightsSrv, cl);
+    }
     // Scene depth (t3 space2, root param 7) — used by ScreenSpaceShadow inside
     // the compute shader so spot/point lights don't beam through walls. The
     // graph's b.ReadSRV(m_depth) declaration in Setup() already transitions
@@ -514,7 +462,7 @@ void VolumetricFogPass::DispatchScatter(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_scatterPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRVT0, gfx.GetTextureSRVGpuHandle(m_lightingTex), cl);
     gfx.SetComputeDescriptorTable(kUAV0,  gfx.GetTextureUAVGpuHandle(m_scatteringTex), cl);
     // XY only — shader walks Z internally.
@@ -542,7 +490,7 @@ void VolumetricFogPass::DispatchTemporal(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_temporalPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRVT0, gfx.GetTextureSRVGpuHandle(m_scatteringTex), cl);
     gfx.SetComputeDescriptorTable(kSRVT1, gfx.GetTextureSRVGpuHandle(m_historyTex[r]), cl);
     gfx.SetComputeDescriptorTable(kUAV0,  gfx.GetTextureUAVGpuHandle(m_historyTex[w]), cl);
@@ -565,15 +513,18 @@ void VolumetricFogPass::DispatchRaymarch(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_rmPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     // t0 space2 = FroxelDensity 3D (σ_s / σ_t lookup, same as density output).
     gfx.SetComputeDescriptorTable(kSRVT0, gfx.GetTextureSRVGpuHandle(m_densityTex), cl);
     // t1 space2 = CSM array (sun shadowing).
     if (m_shadowSrv)
         gfx.SetComputeDescriptorTable(kSRVT1, m_shadowSrv, cl);
     // t2 space2 = Lights buffer (opted-in volumetric lights).
-    if (m_lightsSrv)
-        gfx.SetComputeDescriptorTable(3, m_lightsSrv, cl);
+    {
+        const uint64_t lightsSrv = m_lightsSrv[gfx.GetFrameIndex()];
+        if (lightsSrv)
+            gfx.SetComputeDescriptorTable(3, lightsSrv, cl);
+    }
     // t3 space2 = Scene depth (view-Z clamp + sky detection).
     const RHI::Texture* depthTex = cl.GetContext().GetTexture(m_depth);
     if (depthTex)
@@ -607,7 +558,7 @@ void VolumetricFogPass::DispatchRaymarchTemporal(RHI::CommandList cl)
                   RHI::ResourceState::UNORDERED_ACCESS, cl);
 
     gfx.BindComputePipelineState(m_rmTemporalPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_paramCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_paramCB.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRVT0,
         gfx.GetTextureSRVGpuHandle(m_rmCurrentTex), cl);
     gfx.SetComputeDescriptorTable(kSRVT1,
@@ -699,7 +650,7 @@ void VolumetricFogPass::DrawApply(RHI::CommandList cl)
     if (!pso || !pso->IsValid()) return;
 
     // Upload tiny Apply CB (per-frame; near/far + froxel range).
-    if (m_applyCBMapped)
+    if (auto* slot = m_applyCB.Current(*m_gfx))
     {
         VolApplyConstants c{};
         c.nearZ        = m_nearPlane;
@@ -707,7 +658,7 @@ void VolumetricFogPass::DrawApply(RHI::CommandList cl)
         c.froxelNear   = m_froxelNear;
         c.froxelFar    = m_froxelFar;
         c.froxelDepth  = kFroxelD;
-        std::memcpy(m_applyCBMapped, &c, sizeof(c));
+        *slot = c;
     }
 
     cl.BindDescriptorHeaps();
@@ -731,7 +682,7 @@ void VolumetricFogPass::DrawApply(RHI::CommandList cl)
 // ---------------------------------------------------------------------------
 RHI::CommandList VolumetricFogPass::Execute(RHI::CommandList cl)
 {
-    if (!m_enabled) return cl;
+    if (!m_enabled || m_viewModeHidden) return cl;
     if (!m_densityPSO.IsValid()) return cl;
 
     IGraphicsDevice& gfx = *m_gfx;
@@ -759,10 +710,11 @@ RHI::CommandList VolumetricFogPass::Execute(RHI::CommandList cl)
         DirectX::XMVector3Length(DirectX::XMVectorSubtract(currP, prevP)));
     constexpr float kTeleportThreshold = 5.0f;
     const float effectiveAlpha =
-        (m_historyValid && camDelta < kTeleportThreshold) ? m_temporalAlpha : 1.0f;
+        (m_historyValid && m_externalHistoryValid && camDelta < kTeleportThreshold)
+            ? m_temporalAlpha : 1.0f;
 
     // Upload FroxelConstants.
-    if (m_paramCBMapped)
+    if (auto* paramCBSlot = m_paramCB.Current(gfx))
     {
         FroxelConstants c{};
         std::memcpy(c.viewProj,     &m_viewProj,     sizeof(c.viewProj));
@@ -825,7 +777,7 @@ RHI::CommandList VolumetricFogPass::Execute(RHI::CommandList cl)
         c.voxelGridExtent[2] = m_voxelGridMax.z - m_voxelGridMin.z;
         c.voxelGridDim       = m_voxelGridDim;
 
-        std::memcpy(m_paramCBMapped, &c, sizeof(c));
+        *paramCBSlot = c;
     }
 
     auto pBegin = [&](const char* name) -> uint32_t {
@@ -855,7 +807,7 @@ RHI::CommandList VolumetricFogPass::Execute(RHI::CommandList cl)
         uint32_t r = pBegin("VolFog.Temporal");
         DispatchTemporal(cl);
         pEnd(r);
-        useHistoryForApply = m_historyValid;
+        useHistoryForApply = m_historyValid && m_externalHistoryValid;
     }
     else
     {

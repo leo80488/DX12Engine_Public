@@ -1,7 +1,7 @@
 // ProbeCapture.ps.hlsl — minimal lit forward pixel shader for reflection
-// probe baking. Pairs with GBuffer.vs.hlsl unchanged. Reads sun + ambient
-// from a per-face capture CB at b1 (which also holds the face viewProj the
-// GBuffer VS consumes). Writes ONE HDR color RTV — feeds the prefilter
+// probe baking. Pairs with GBuffer.vs.hlsl unchanged. Reads sun direction +
+// colour from a per-face capture CB at b1 (which also holds the face viewProj
+// the GBuffer VS consumes). Writes ONE HDR color RTV — feeds the prefilter
 // compute shader downstream.
 //
 // Intentionally simple:
@@ -37,7 +37,6 @@ cbuffer ProbeCaptureCB : register(b1, space0)
     float4x4 c_curViewProjNoJitter;
     float3   c_sunDir;     float c_pad0;
     float3   c_sunColor;   float c_pad1;
-    float3   c_ambient;    float c_pad2;
     float3   c_cameraPos;  float c_pad3;
 };
 
@@ -141,7 +140,7 @@ float4 main(PSIn i) : SV_TARGET
     // Ambient — SkySH gives a low-frequency environment irradiance that
     // matches what the lighting pass uses for the diffuse IBL term, so
     // baked probes inherit the same colour palette as the final shading.
-    float3 amb  = baseColor.rgb * (EvalSH2(N) + c_ambient);
+    float3 amb  = baseColor.rgb * EvalSH2(N);
 
     // Output HDR linear. No tonemap, no exposure — the prefilter compute
     // shader needs raw radiance to generate physically-meaningful mip levels.

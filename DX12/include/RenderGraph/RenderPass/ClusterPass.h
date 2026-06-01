@@ -11,6 +11,7 @@
 
 #include "Graphics/GraphicsStruct.h"
 #include "Graphics/ShaderLibrary.h"
+#include "Graphics/FrameCB.h"
 #include "ECS/Components.h"
 
 #include <DirectXMath.h>
@@ -65,8 +66,10 @@ public:
     // before LightingPass::Execute().
     void Execute(RHI::CommandList cl);
 
-    // SRV handles for LightingPass to bind.
-    uint64_t GetLightsSRVHandle()    const { return m_lightsSRV; }
+    // SRV handles for LightingPass to bind. The lights buffer is triple-
+    // buffered (UPLOAD, written each frame) so the SRV varies per frame slot;
+    // the other two are DEFAULT-heap so their SRV is stable.
+    uint64_t GetLightsSRVHandle()    const;
     uint64_t GetLightIndexSRVHandle() const { return m_lightIndexSRV; }
     uint64_t GetLightGridSRVHandle() const { return m_lightGridSRV; }
 
@@ -113,13 +116,18 @@ private:
     RHI::PipelineState m_probeCullPSO;
 
     // Buffers
-    RHI::GPUBuffer m_lightBuffer;       // StructuredBuffer<GPULight> — UPLOAD
+    // Lights buffer is UPLOAD + per-frame written → triple-buffered ring.
+    static constexpr uint32_t kFrameCount = 3;
+    RHI::GPUBuffer m_lightBuffer[kFrameCount];  // StructuredBuffer<GPULight> — UPLOAD ring
+    void*          m_lightMapped[kFrameCount] = {};
+    uint64_t       m_lightsSRV[kFrameCount]    = {};
+
     RHI::GPUBuffer m_clusterAABBBuffer; // RWStructuredBuffer<ClusterAABB> — DEFAULT
     RHI::GPUBuffer m_lightIndexBuffer;  // RWStructuredBuffer<uint> — DEFAULT
     RHI::GPUBuffer m_lightGridBuffer;   // RWStructuredBuffer<LightGridEntry> — DEFAULT
-    RHI::GPUBuffer m_counterBuffer;     // RWStructuredBuffer<uint> — DEFAULT (single atomic counter)
-    RHI::GPUBuffer m_clusterCB;         // Constant buffer — UPLOAD
-    RHI::GPUBuffer m_counterResetBuf;   // 4-byte UPLOAD buffer for counter reset
+    RHI::GPUBuffer m_counterBuffer;     // RWStructuredBuffer<uint> — DEFAULT (single atomic counter; dead — see .cpp)
+    FrameCB<ClusterCB> m_clusterCB;     // Constant buffer — UPLOAD, triple-buffered
+    RHI::GPUBuffer m_counterResetBuf;   // 4-byte UPLOAD buffer for counter reset (init-time write only)
 
     // Reflection-probe cluster outputs — same layout convention as the light
     // grid (base offset = clusterIdx * kMaxProbesPerCluster, count in grid).
@@ -127,7 +135,6 @@ private:
     RHI::GPUBuffer m_probeGridBuffer;   // RWStructuredBuffer<ProbeGridEntry> — DEFAULT
 
     // GPU handles
-    uint64_t m_lightsSRV      = 0;
     uint64_t m_clusterAABBSRV = 0;
     uint64_t m_clusterAABBUAV = 0;
     uint64_t m_lightIndexSRV  = 0;
@@ -144,8 +151,6 @@ private:
     uint32_t m_probeCount     = 0;
 
     // Mapped pointers
-    void* m_lightMapped     = nullptr;
-    void* m_clusterCBMapped = nullptr;
     void* m_counterResetMapped = nullptr;
 
     // State

@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "ECS/ECS.h"
 #include "AI/BTNode.h"   // BTInstance complete type — required for unique_ptr<BTInstance>
@@ -41,7 +42,16 @@ namespace AI
         float,
         std::string,
         Entity,
-        DirectX::XMFLOAT3>;
+        DirectX::XMFLOAT3,
+        // Array variant — BT params like PatrolPoints' waypoint list need a
+        // nested structure that doesn't collapse into a single XMFLOAT3.
+        // Round-trip back to Lua as `{ {x,y,z}, {x,y,z}, ... }`.
+        std::vector<DirectX::XMFLOAT3>,
+        // String-list variant — used by params like SetRandomState's
+        // `candidates = { "WALK_1", "WALK_2" }`. Without this entry the
+        // Lua→BBValue parser falls into the XMFLOAT3 branch and silently
+        // collapses the list to a zero vector.
+        std::vector<std::string>>;
 }
 
 struct BlackboardComponent

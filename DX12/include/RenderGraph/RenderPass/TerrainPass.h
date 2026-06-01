@@ -72,6 +72,12 @@ public:
     };
     void SetActiveTile(const TileBindings& b) { m_tile = b; }
 
+    // Global view-mode: when true, Execute selects a FILL_MODE_WIREFRAME PSO.
+    // Terrain writes the GBuffer like opaque meshes, so its Unlit/Wireframe
+    // *color* is produced by the deferred LightingPass branch — this only flips
+    // the rasterizer fill. Driven per-frame by Renderer from ViewMode::Wireframe.
+    void SetWireframe(bool w) { m_wireframe = w; }
+
     // Read-only accessor — ShadowPass uses this to dispatch a depth-only
     // copy of the terrain into each CSM cascade with the same heightmap
     // SRV the colour pass is using this frame. dispatchAsGroupCount==0 or
@@ -79,10 +85,15 @@ public:
     const TileBindings& GetTileBindings() const { return m_tile; }
 
 private:
-    bool BuildPSO(IGraphicsDevice& gfx);
+    // Builds the terrain mesh-shader PSO into @p outPso with the given fill
+    // mode. Called twice at Init (solid + wireframe) so the view-mode switch is
+    // a cheap PSO swap in Execute rather than a runtime rebuild.
+    bool BuildPSO(IGraphicsDevice& gfx, bool wireframe, RHI::PipelineState& outPso);
 
     ShaderLibrary       m_shaderLib;
-    RHI::PipelineState  m_pso;
+    RHI::PipelineState  m_pso;          // solid fill (FILL_MODE_SOLID)
+    RHI::PipelineState  m_psoWire;      // wireframe fill (FILL_MODE_WIREFRAME)
+    bool                m_wireframe = false;
     int                 m_clampSamplerIdx = -1;   // s0 — heightmap/splatmap (UV ∈ [0,1])
     int                 m_wrapSamplerIdx  = -1;   // s1 — layer albedos sampled at world XZ × tiling
 

@@ -128,6 +128,17 @@ enum class ShaderID : uint32_t
     WorldUI_VS                 = 95,  // World-space UI billboard VS (3D quads, viewProj)
     WorldUI_PS                 = 96,  // World-space UI textured + tint PS
     LensFlare_CS               = 97,  // Procedural directional-light lens flare (additive HDR)
+    FXAA_CS                    = 98,  // NVIDIA FXAA 3.11 quality preset, single-pass HDR-aware
+    OutlineObjectID_VS         = 99,  // Minimal PVF VS for outline ObjectID sub-pass (un-jittered VP)
+    AfterimageCopy_CS          = 100, // Afterimage: copy skinned pos/nrm slice into snapshot pool
+    CloudNoiseBake_CS          = 101, // Volumetric clouds: bake 128^3 Worley/Perlin noise once
+    CloudRaymarch_CS           = 102, // Volumetric clouds: quarter-res raymarch through cloud slab
+    CloudComposite_VS          = 103, // Volumetric clouds: fullscreen-triangle VS
+    CloudComposite_PS          = 104, // Volumetric clouds: bilinear upsample + alpha-over composite
+    VideoComposite_VS          = 105, // Video playback: fullscreen-triangle VS
+    VideoComposite_PS          = 106, // Video playback: NV12 Y/UV plane → linear RGB composite
+    VideoQuad_VS               = 107, // Video playback: world-space quad VS (procedural 6-vert)
+    VideoQuad_PS               = 108, // Video playback: NV12 sample for world-space video quad
     Count,
 };
 

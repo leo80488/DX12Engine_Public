@@ -31,13 +31,8 @@ static constexpr uint32_t kPrefilterSampleTable[7] = {
     32,     // mip 5 (  4^2)
     32,     // mip 6 (  2^2)
 };
-static constexpr uint32_t kPrefilterCBStride = 256; // D3D12 CBV alignment
-
-struct alignas(16) SHConstants
-{
-    uint32_t sampleCount;
-    uint32_t _pad[3];
-};
+// kPrefilterCBStride is defined as a class-static in SkyIBLPass.h so the
+// PrefilterCBPool wrapper can size itself at compile time.
 
 struct alignas(16) PrefilterConstants
 {
@@ -51,15 +46,9 @@ struct alignas(16) PrefilterConstants
     uint32_t _pad2;
 };
 
-struct alignas(16) AtmosphereConstants
-{
-    float    sunDir[3];    float _pad0;
-    float    sunColor[3];  uint32_t faceSize;
-    float    cameraAltitudeKm;
-    float    _pad1;
-    float    _pad2;
-    float    _pad3;
-};
+// AtmosphereConstants is now declared as a nested type in SkyIBLPass.h so the
+// FrameCB<AtmosphereConstants> member can be instantiated at class-definition
+// time. The local copy here is intentionally removed to avoid ODR drift.
 
 struct alignas(16) LutDimConstants
 {
@@ -91,7 +80,7 @@ struct alignas(16) AerialConstants
     uint32_t _pad2;
 };
 
-static constexpr uint32_t kLutCBStride   = 512; // larger for AerialConstants
+// kLutCBStride is a class-static in SkyIBLPass.h (sized for AerialConstants).
 static constexpr uint32_t kLutCBSlotTrans  = 0;
 static constexpr uint32_t kLutCBSlotMS     = 1;
 static constexpr uint32_t kLutCBSlotSV     = 2;
@@ -178,48 +167,21 @@ void SkyIBLPass::Init(IGraphicsDevice& gfx)
     }
 
     // SH constants CB.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(SHConstants) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "SkyIBL.SHConstants");
 
     // Prefilter per-dispatch CB — one 256-byte slot for each (face, mip) pair
     // so the bootstrap full bake (6 faces × 7 mips = 42 slots) doesn't race
     // the GPU. Subsequent temporal updates only use 7 of those slots.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = kPrefilterCBStride * kSpecularMips * 6;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_prefilterCB))
-            m_prefilterCBMapped = gfx.MapBuffer(m_prefilterCB);
-    }
+    // FrameCB ring eliminates the cross-frame race on the pool itself.
+    m_prefilterCB.Create(gfx, "SkyIBL.PrefilterCB");
 
-    // Atmosphere CB — single 256-byte slot.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = 256;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_atmosphereCB))
-            m_atmosphereCBMapped = gfx.MapBuffer(m_atmosphereCB);
-    }
+    // Atmosphere CB — single AtmosphereConstants per frame.
+    m_atmosphereCB.Create(gfx, "SkyIBL.AtmosphereCB");
 
     // Shared LUT CB pool: 5 × 512-byte slots (Transmittance / MultiScatter /
-    // SkyView / Atmosphere / Aerial). Stride is 512 because AerialConstants
+    // SkyView / [unused Atmo] / Aerial). Stride is 512 because AerialConstants
     // (invViewProj + lots of floats) exceeds the 256-byte slot size.
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = kLutCBStride * 5;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_atmoLutCB))
-            m_atmoLutCBMapped = gfx.MapBuffer(m_atmoLutCB);
-    }
+    m_atmoLutCB.Create(gfx, "SkyIBL.AtmoLutCB");
 
     CreateSpecularCube(gfx);
     CreateAtmosphereCube(gfx);
@@ -256,154 +218,9 @@ void SkyIBLPass::CreateSpecularCube(IGraphicsDevice& gfx)
 }
 
 // ---------------------------------------------------------------------------
-bool SkyIBLPass::TickTimeOfDay(float deltaSeconds)
-{
-    if (!m_timeOfDayEnabled) return false;
-
-    if (m_timeSpeed != 0.0f)
-    {
-        m_timeOfDay += m_timeSpeed * deltaSeconds;
-        m_timeOfDay -= std::floor(m_timeOfDay); // wrap to [0, 1)
-    }
-
-    // Convert normalised time-of-day to hour angle (H = 0 at solar noon,
-    // +π at midnight). timeOfDay=0.5 means noon (sun at zenith for lat=0).
-    const float H   = (m_timeOfDay - 0.5f) * (2.0f * 3.14159265f);
-    const float lat = m_latitudeRad;
-
-    // Solar declination: treat as zero (equinox) for simplicity — the sun
-    // traces a great circle through the zenith at the equator on equinox.
-    // Hour angle rotates about the world Y-axis; latitude tilts the plane.
-    const float cosH = std::cos(H);
-    const float sinH = std::sin(H);
-    const float cosL = std::cos(lat);
-    const float sinL = std::sin(lat);
-
-    // Sun direction in a local frame where Y is up (zenith at noon).
-    // Standard equatorial-to-horizontal transform (declination δ = 0):
-    //   altitude α:  sin(α) = sin(φ) sin(δ) + cos(φ) cos(δ) cos(H)
-    //                       = cos(φ) cos(H)
-    //   azimuth A:   uses the other coordinates; here we build the vector directly.
-    DirectX::XMFLOAT3 dir;
-    dir.x = -std::cos(0.0f) * sinH;           // east–west: +x east at sunrise side
-    dir.y = cosL * cosH + sinL * 0.0f;        // zenith component
-    dir.z = -sinL * cosH + cosL * 0.0f;       // north–south
-    // Normalise for safety.
-    const float len = std::sqrt(dir.x*dir.x + dir.y*dir.y + dir.z*dir.z);
-    if (len > 1e-6f) { dir.x /= len; dir.y /= len; dir.z /= len; }
-
-    // ---- Day / night swap ----------------------------------------------------
-    // When the geometric sun drops below horizon, the MOON takes over as the
-    // directional light. The moon sits exactly opposite the sun in the sky
-    // (-dir). All downstream consumers (LightCB, shadows, fog) just see this
-    // as "the active sun" — no per-consumer special case. The Skybox pass
-    // reads IsMoonActive() to swap the analytic disk for a textured moon.
-    const bool sunBelowHorizon = (dir.y < 0.0f);
-    m_isMoon = sunBelowHorizon;
-
-    // Skybox-only moon-disk state — always compute moon position (= -sunDir).
-    // Early-fade: disk starts fading around +7° and fully disappears at +0.6°
-    // (matches the shader's smoothstep(0.01, 0.12, moonDir.y)). We gate the
-    // CB upload at the low-end threshold so there's no per-frame waste once
-    // the moon has set.
-    m_moonDir = { -dir.x, -dir.y, -dir.z };
-    m_moonDiskVisible = (m_moonDir.y > 0.01f);
-    // Moon disk tint stays constant (cool blue-white) so it's clearly visible
-    // throughout its arc — intensity fade happens in the pixel shader via the
-    // horizon mask, not via this colour. Small multiplier — the disk should
-    // read as a bright celestial body but not bloom out the night sky.
-	float moonScale = 0.1f; // tweak this to make the moon brighter or dimmer relative to the sun
-    m_moonColor = { 0.55f * moonScale, 0.70f * moonScale, 1.00f * moonScale };
-
-    // The atmosphere / aerial-perspective shaders sample the GEOMETRIC sun.
-    // Below horizon we force its colour to zero so Rayleigh / Mie scattering
-    // stops contributing — sky goes black, no blue daylight dome at night.
-    m_atmosphereSunDir = dir;
-    if (sunBelowHorizon)
-    {
-        m_atmosphereSunColor = { 0.0f, 0.0f, 0.0f };
-    }
-    else
-    {
-        const float elev      = dir.y;
-        const float daylight  = std::max(0.0f, elev);
-        const float tw        = std::exp(-std::max(0.0f, -elev) * 8.0f);
-        const float basePeak  = 5.0f;
-        const float intensity = basePeak * (0.05f + 0.95f * daylight) * tw
-                              * m_sunIntensityScale;
-        const float warmth    = 1.0f - std::min(1.0f, daylight * 2.0f);
-        m_atmosphereSunColor = {
-            intensity * 1.00f,
-            intensity * (1.00f - 0.30f * warmth),
-            intensity * (1.00f - 0.55f * warmth) };
-    }
-
-    // Active light direction flips hard at horizon — sun and moon point in
-    // opposite directions so there is no meaningful "blended" direction. To
-    // keep that flip invisible we use NON-OVERLAPPING ramps below: both sunT
-    // and moonT hit zero at dir.y == 0, so total intensity is zero at the
-    // instant of the direction switch.
-    if (sunBelowHorizon)
-    {
-        m_sunDir.x = -dir.x;
-        m_sunDir.y = -dir.y;
-        m_sunDir.z = -dir.z;
-    }
-    else
-    {
-        m_sunDir = dir;
-    }
-
-    // Cross-fade weights. kBand = 0.05 ≈ 2.9° — narrow enough that the twilight
-    // dip isn't obvious, wide enough that any intensity & direction change is
-    // spread across several frames of a typical time-of-day cycle.
-    //
-    //   y >= +kBand : sunT = 1, moonT = 0     → pure sun
-    //   y == 0      : sunT = 0, moonT = 0     → both dark, direction flip safe
-    //   y <= -kBand : sunT = 0, moonT = 1     → pure moon
-    auto smoothstep01 = [](float t) {
-        t = std::clamp(t, 0.0f, 1.0f);
-        return t * t * (3.0f - 2.0f * t);
-    };
-    const float kBand = 0.05f;
-    const float sunT  = smoothstep01( dir.y / kBand);
-    const float moonT = smoothstep01(-dir.y / kBand);
-
-    // --- Sun colour model (original formula, clamped to y >= 0) ---------------
-    DirectX::XMFLOAT3 sunCol { 0, 0, 0 };
-    {
-        const float elev      = std::max(0.0f, dir.y);
-        const float tw        = std::exp(-std::max(0.0f, -dir.y) * 8.0f);
-        const float basePeak  = 5.0f;
-        const float intensity = basePeak * (0.05f + 0.95f * elev) * tw
-                              * m_sunIntensityScale;
-        const float warmth    = 1.0f - std::min(1.0f, elev * 2.0f);
-        sunCol.x = intensity * (1.00f);
-        sunCol.y = intensity * (1.00f - 0.30f * warmth);
-        sunCol.z = intensity * (1.00f - 0.55f * warmth);
-    }
-
-    // --- Moon colour model (original formula, using the moon's elevation) -----
-    DirectX::XMFLOAT3 moonCol { 0, 0, 0 };
-    {
-        const float moonElev  = -dir.y;                // moon = -sun
-        const float moonlight = std::max(0.0f, moonElev);
-        const float basePeak  = 5.0f;
-        const float intensity = basePeak * m_moonIntensityScale
-                              * (0.75f + 0.25f * moonlight)
-                              * m_sunIntensityScale;
-        moonCol.x = intensity * 0.55f;
-        moonCol.y = intensity * 0.70f;
-        moonCol.z = intensity * 1.00f;
-    }
-
-    m_sunColor.x = sunCol.x * sunT + moonCol.x * moonT;
-    m_sunColor.y = sunCol.y * sunT + moonCol.y * moonT;
-    m_sunColor.z = sunCol.z * sunT + moonCol.z * moonT;
-
-    return true;
-}
-
+// TickTimeOfDay() removed — TOD pipeline lives in ECS (see TODSystems.h).
+// Renderer pushes m_sunDir/m_sunColor (active body) via SetSunDir and the
+// geometric sun via SetAtmosphereSun each frame.
 // ---------------------------------------------------------------------------
 uint64_t SkyIBLPass::ResolveSkyboxSrvHandle(uint64_t staticFallback) const
 {
@@ -451,7 +268,7 @@ void SkyIBLPass::DispatchAtmosphere(RHI::CommandList cl)
         m_atmosphereState = RHI::ResourceState::UNORDERED_ACCESS;
     }
 
-    if (m_atmosphereCBMapped)
+    if (auto* slot = m_atmosphereCB.Current(gfx))
     {
         AtmosphereConstants c{};
         // Use the geometric-sun pair (colour=0 below horizon) so the sky
@@ -464,11 +281,11 @@ void SkyIBLPass::DispatchAtmosphere(RHI::CommandList cl)
         c.sunColor[2] = m_atmosphereSunColor.z;
         c.faceSize         = kAtmosphereSize;
         c.cameraAltitudeKm = 0.5f;
-        std::memcpy(m_atmosphereCBMapped, &c, sizeof(c));
+        *slot = c;
     }
 
     gfx.BindComputePipelineState(m_atmospherePSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_atmosphereCB, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_atmosphereCB.CurrentBuffer(gfx), cl);
     // t0 = SkyView LUT, t1 = Transmittance LUT (see SkyAtmosphere.cs.hlsl).
     gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_skyViewTex), cl);
     gfx.SetComputeDescriptorTable(2,     gfx.GetTextureSRVGpuHandle(m_transmittanceTex), cl);
@@ -523,8 +340,9 @@ void SkyIBLPass::DispatchPrefilter(RHI::CommandList cl, uint64_t sourceSrv)
                                       : float(mip) / float(kSpecularMips - 1);
 
             // Pack the per-dispatch CB (each (face, mip) pair gets a unique
-            // 256-byte slot so no writes overlap the GPU's read).
-            if (m_prefilterCBMapped)
+            // 256-byte slot so no writes overlap the GPU's read inside this
+            // frame; FrameCB ring handles cross-frame).
+            if (auto* pool = m_prefilterCB.Current(gfx))
             {
                 PrefilterConstants c{};
                 c.faceSize       = faceW;
@@ -533,10 +351,10 @@ void SkyIBLPass::DispatchPrefilter(RHI::CommandList cl, uint64_t sourceSrv)
                 c.sourceMipCount = 1;
                 c.faceIndex      = face;
                 const uint32_t slot = fi * kSpecularMips + mip;
-                uint8_t* dst = static_cast<uint8_t*>(m_prefilterCBMapped)
-                             + slot * kPrefilterCBStride;
+                uint8_t* dst = pool->bytes + slot * kPrefilterCBStride;
                 std::memcpy(dst, &c, sizeof(c));
-                gfx.SetComputeRootCBV(kCBSlot, m_prefilterCB, slot * kPrefilterCBStride, cl);
+                gfx.SetComputeRootCBV(kCBSlot, m_prefilterCB.CurrentBuffer(gfx),
+                                      slot * kPrefilterCBStride, cl);
             }
 
             gfx.SetComputeDescriptorTable(kUAV0,
@@ -631,7 +449,7 @@ void SkyIBLPass::DispatchAerialPerspective(RHI::CommandList cl)
         m_aerialState = RHI::ResourceState::UNORDERED_ACCESS;
     }
 
-    if (m_atmoLutCBMapped)
+    if (auto* pool = m_atmoLutCB.Current(gfx))
     {
         AerialConstants c{};
         c.sunDir[0] = m_atmosphereSunDir.x;
@@ -650,12 +468,12 @@ void SkyIBLPass::DispatchAerialPerspective(RHI::CommandList cl)
         c.cameraForward[1] = m_cameraForwardWorld.y;
         c.cameraForward[2] = m_cameraForwardWorld.z;
         c.lutW = kAerialW; c.lutH = kAerialH; c.lutD = kAerialD;
-        std::memcpy(static_cast<uint8_t*>(m_atmoLutCBMapped) + kLutCBSlotAerial * kLutCBStride,
-                    &c, sizeof(c));
+        std::memcpy(pool->bytes + kLutCBSlotAerial * kLutCBStride, &c, sizeof(c));
     }
 
     gfx.BindComputePipelineState(m_aerialPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB, kLutCBSlotAerial * kLutCBStride, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB.CurrentBuffer(gfx),
+                          kLutCBSlotAerial * kLutCBStride, cl);
     gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_transmittanceTex), cl);
     gfx.SetComputeDescriptorTable(2,     gfx.GetTextureSRVGpuHandle(m_multiScatterTex), cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_aerialTex), cl);
@@ -683,17 +501,18 @@ void SkyIBLPass::BakeStaticLUTs(RHI::CommandList cl)
     IGraphicsDevice& gfx = *m_gfx;
 
     // Upload CB slots for Transmittance and MultiScatter dims.
-    if (m_atmoLutCBMapped)
+    if (auto* pool = m_atmoLutCB.Current(gfx))
     {
         LutDimConstants t{ kTransmittanceW, kTransmittanceH, 0, 0 };
         LutDimConstants m{ kMultiScatterW,  kMultiScatterH,  0, 0 };
-        std::memcpy(static_cast<uint8_t*>(m_atmoLutCBMapped) + kLutCBSlotTrans * kLutCBStride, &t, sizeof(t));
-        std::memcpy(static_cast<uint8_t*>(m_atmoLutCBMapped) + kLutCBSlotMS    * kLutCBStride, &m, sizeof(m));
+        std::memcpy(pool->bytes + kLutCBSlotTrans * kLutCBStride, &t, sizeof(t));
+        std::memcpy(pool->bytes + kLutCBSlotMS    * kLutCBStride, &m, sizeof(m));
     }
 
     // ---- Transmittance ------------------------------------------------------
     gfx.BindComputePipelineState(m_transmittancePSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB, kLutCBSlotTrans * kLutCBStride, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB.CurrentBuffer(gfx),
+                          kLutCBSlotTrans * kLutCBStride, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_transmittanceTex), cl);
     gfx.DispatchCompute((kTransmittanceW + 7) / 8, (kTransmittanceH + 7) / 8, 1, cl);
 
@@ -708,7 +527,8 @@ void SkyIBLPass::BakeStaticLUTs(RHI::CommandList cl)
     // so Dispatch = (lutW, lutH, 1). Each threadgroup spawns 64 sphere samples
     // and LDS-reduces to a single output pixel.
     gfx.BindComputePipelineState(m_multiScatterPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB, kLutCBSlotMS * kLutCBStride, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB.CurrentBuffer(gfx),
+                          kLutCBSlotMS * kLutCBStride, cl);
     gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_transmittanceTex), cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_multiScatterTex), cl);
     gfx.DispatchCompute(kMultiScatterW, kMultiScatterH, 1, cl);
@@ -737,7 +557,7 @@ void SkyIBLPass::DispatchSkyViewLUT(RHI::CommandList cl)
         m_skyViewState = RHI::ResourceState::UNORDERED_ACCESS;
     }
 
-    if (m_atmoLutCBMapped)
+    if (auto* pool = m_atmoLutCB.Current(gfx))
     {
         SkyViewConstants c{};
         c.sunDir[0] = m_atmosphereSunDir.x;
@@ -746,12 +566,12 @@ void SkyIBLPass::DispatchSkyViewLUT(RHI::CommandList cl)
         c.cameraAltitudeKm = 0.5f; // hard-coded ground-level camera
         c.lutWidth  = kSkyViewW;
         c.lutHeight = kSkyViewH;
-        std::memcpy(static_cast<uint8_t*>(m_atmoLutCBMapped) + kLutCBSlotSV * kLutCBStride,
-                    &c, sizeof(c));
+        std::memcpy(pool->bytes + kLutCBSlotSV * kLutCBStride, &c, sizeof(c));
     }
 
     gfx.BindComputePipelineState(m_skyViewPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB, kLutCBSlotSV * kLutCBStride, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_atmoLutCB.CurrentBuffer(gfx),
+                          kLutCBSlotSV * kLutCBStride, cl);
     gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_transmittanceTex), cl);
     // t1 space2 (root param 2) — MultiScatter LUT.
     gfx.SetComputeDescriptorTable(2,     gfx.GetTextureSRVGpuHandle(m_multiScatterTex), cl);
@@ -851,11 +671,11 @@ RHI::CommandList SkyIBLPass::Execute(RHI::CommandList cl)
     {
         uint32_t r = pBegin("SkyIBL.SHProjection");
 
-        if (m_cbMapped)
+        if (auto* slot = m_cb.Current(gfx))
         {
-            SHConstants c{};
+            SkyIBLPass::SHConstants c{};
             c.sampleCount = kSHSampleCount;
-            std::memcpy(m_cbMapped, &c, sizeof(c));
+            *slot = c;
         }
 
         if (m_shState != RHI::ResourceState::UNORDERED_ACCESS)
@@ -866,7 +686,7 @@ RHI::CommandList SkyIBLPass::Execute(RHI::CommandList cl)
         }
 
         gfx.BindComputePipelineState(m_pso, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+        gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
         gfx.SetComputeDescriptorTable(kSRV0, sourceSrv, cl);
         gfx.SetComputeDescriptorTable(kUAV0, m_shUavHandle, cl);
         gfx.DispatchCompute(1, 1, 1, cl);

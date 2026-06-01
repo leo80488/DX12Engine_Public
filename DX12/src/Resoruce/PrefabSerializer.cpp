@@ -163,6 +163,29 @@ DirectX::XMFLOAT4X4 ParseMatrix(const std::string& s)
     return m;
 }
 
+// Decompose a 4x4 to XYZ Euler degrees so an inspector can show stable
+// rotation values without a per-frame quat↔euler round-trip. Lossy near
+// gimbal lock — acceptable for offset matrices.
+DirectX::XMFLOAT3 DecomposeToEulerDeg(const DirectX::XMFLOAT4X4& m)
+{
+    using namespace DirectX;
+    XMVECTOR vScl, vRot, vTrn;
+    if (!XMMatrixDecompose(&vScl, &vRot, &vTrn, XMLoadFloat4x4(&m)))
+        return { 0.f, 0.f, 0.f };
+    XMFLOAT4 q; XMStoreFloat4(&q, vRot);
+    const float ysqr = q.y * q.y;
+    const float t0 = 2.0f * (q.w * q.x + q.y * q.z);
+    const float t1 = 1.0f - 2.0f * (q.x * q.x + ysqr);
+    const float rx = std::atan2(t0, t1);
+    float t2 = 2.0f * (q.w * q.y - q.z * q.x);
+    t2 = (t2 >  1.0f) ?  1.0f : (t2 < -1.0f ? -1.0f : t2);
+    const float ry = std::asin(t2);
+    const float t3 = 2.0f * (q.w * q.z + q.x * q.y);
+    const float t4 = 1.0f - 2.0f * (ysqr + q.z * q.z);
+    const float rz = std::atan2(t3, t4);
+    return { XMConvertToDegrees(rx), XMConvertToDegrees(ry), XMConvertToDegrees(rz) };
+}
+
 // ---------------------------------------------------------------------------
 // Apply MaterialOverride property bag onto a MaterialComponent.
 // ---------------------------------------------------------------------------
@@ -366,25 +389,38 @@ bool Resource::SavePrefab(Entity root, World& world, const std::string& path)
                 serializer.serialize(world, e, ss);
         }
 
-        // --- Cross-entity references: write only if target is also being
-        // saved. Tag prefix "Prefab*" so the registry walk in LoadPrefab
-        // ignores them (no FindByTag match) and our deferred fixup picks
-        // them up after every new entity is created. ---
+        // --- Cross-entity references --------------------------------------
+        // Tag prefix "Prefab*" so the registry walk in LoadPrefab ignores
+        // them; our deferred fixup picks them up after every new entity is
+        // created.
+        //
+        // Target-resolution policy: if target is in the prefab subtree, write
+        // its prefab-local idx so load wires it up automatically. If it's
+        // OUTSIDE (e.g. a weapon prefab whose owner lives in the scene),
+        // write target=-1 — the load path still creates the component (with
+        // NullEntityHandle) so authored offset/socketIndex survive, and
+        // equipment code rebinds the target at runtime. Prior behaviour
+        // silently dropped the whole reference, which made standalone weapon
+        // prefabs lose their attachment data.
         if (auto* fs = world.GetComponent<FollowSocketComponent>(e))
         {
-            if (auto it = entityToIdx.find(fs->target.entity); it != entityToIdx.end())
-                ss << "  PrefabFollowSocket: target=" << it->second
-                   << " socket=" << fs->socketIndex
-                   << " m=" << MatrixToString(fs->localOffset) << "\n";
+            auto it = entityToIdx.find(fs->target.entity);
+            const int tgtIdx = (it != entityToIdx.end()) ? it->second : -1;
+            ss << "  PrefabFollowSocket: target=" << tgtIdx
+               << " socket=" << fs->socketIndex
+               << " m=" << MatrixToString(fs->localOffset) << "\n";
         }
         if (auto* fe = world.GetComponent<FollowEntityComponent>(e))
         {
-            if (auto it = entityToIdx.find(fe->target.entity); it != entityToIdx.end())
-                ss << "  PrefabFollowEntity: target=" << it->second
-                   << " m=" << MatrixToString(fe->localOffset) << "\n";
+            auto it = entityToIdx.find(fe->target.entity);
+            const int tgtIdx = (it != entityToIdx.end()) ? it->second : -1;
+            ss << "  PrefabFollowEntity: target=" << tgtIdx
+               << " m=" << MatrixToString(fe->localOffset) << "\n";
         }
         if (auto* sr = world.GetComponent<SkeletonRef>(e))
         {
+            // SkeletonRef is a hard skinning dependency — without a target
+            // the follower can't be rendered. Keep the in-set gate.
             if (auto it = entityToIdx.find(sr->entity); it != entityToIdx.end())
                 ss << "  PrefabSkeletonRef: target=" << it->second << "\n";
         }
@@ -488,14 +524,27 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
         return NullEntity;
     }
 
-    // 3. Detect skinned prefab (SceneRef component)
-    std::string scenePath, animPath;
+    // 3. Detect skinned prefab (SceneRef component). sceneIdx tracks which
+    // N-line owns the SceneRef so the prefab root can be a wrapper entity
+    // (e.g. user wrapped the character under an empty entity); without this,
+    // the legacy code assumed sceneIdx == 0 and mis-mapped every index when
+    // the wrapper sat at idx 0 and the .iscn root at idx 1.
+    //
+    // Multi-SceneRef: a prefab may carry several SceneRef nodes when
+    // CollectLinkedFollowers auto-included a follower whose subtree owns its
+    // own .iscn (e.g. a character + an equipped weapon prefab). The first
+    // (lowest-idx) entry drives animation binding + prefab root; the rest are
+    // loaded into the same entityMap so their idx ranges stay consistent.
+    struct SceneRefEntry { int idx; std::string path; };
+    std::vector<SceneRefEntry> sceneRefs;
+    std::string animPath;
     for (const auto& cb : compBlocks)
     {
         if (cb.tag == "SceneRef")
         {
             auto it = cb.kv.find("path");
-            if (it != cb.kv.end()) scenePath = PercentDecode(it->second);
+            if (it != cb.kv.end())
+                sceneRefs.push_back({ cb.nodeIdx, PercentDecode(it->second) });
         }
         else if (cb.tag == "AnimRef")
         {
@@ -503,6 +552,10 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
             if (it != cb.kv.end()) animPath = PercentDecode(it->second);
         }
     }
+    std::sort(sceneRefs.begin(), sceneRefs.end(),
+              [](const SceneRefEntry& a, const SceneRefEntry& b) { return a.idx < b.idx; });
+    const std::string scenePath = sceneRefs.empty() ? std::string{} : sceneRefs.front().path;
+    const int         sceneIdx  = sceneRefs.empty() ? -1            : sceneRefs.front().idx;
 
     // ---- Skinned character flow ----
     if (!scenePath.empty() && renderer)
@@ -521,10 +574,13 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
             return NullEntity;
         }
 
-        // Apply transform from first N line
-        if (!nodes.empty())
+        // Apply transform/name from the N-line that owned the SceneRef block.
+        // Defaults to nodes[0] for legacy prefabs (saved before wrapping was
+        // supported, where the prefab root IS the .iscn root).
+        const int sceneIdxLocal = (sceneIdx >= 0) ? sceneIdx : 0;
+        for (const auto& nr : nodes)
         {
-            const auto& nr = nodes[0];
+            if (nr.idx != sceneIdxLocal) continue;
             LocalTransform lt;
             lt.translation = { nr.tx, nr.ty, nr.tz };
             lt.rotation    = { nr.qx, nr.qy, nr.qz, nr.qw };
@@ -533,6 +589,7 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
                 *existing = lt;
             if (!nr.name.empty())
                 world.SetName(res.rootEntity, nr.name);
+            break;
         }
 
         // Collect loaded entities in DFS order for index-based component application
@@ -544,13 +601,66 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
         };
         collectDFS(res.rootEntity);
 
-        // Build idx → entity map. The loaded scene tree fills [0..N-1]; any
-        // N-line beyond that is an "extra" entity (e.g. trail attached to a
-        // bone via FollowSocket) that wasn't part of the .iscn — we create
-        // those fresh below.
+        // Build idx → entity map. The .iscn DFS fills [sceneIdxLocal .. sceneIdxLocal+N-1];
+        // every N-line outside that range is an "extra" entity (wrapper
+        // empty, trail attached to a bone via FollowSocket, etc.) and gets
+        // created from scratch in the loop below.
         std::unordered_map<int, Entity> entityMap;
         for (size_t i = 0; i < loadedEntities.size(); ++i)
-            entityMap[static_cast<int>(i)] = loadedEntities[i];
+            entityMap[sceneIdxLocal + static_cast<int>(i)] = loadedEntities[i];
+
+        // Multi-SceneRef secondary load: spawn each remaining SceneRef'd
+        // subtree and merge its DFS entities into entityMap. Without this,
+        // a prefab containing e.g. "character + equipped weapon" only
+        // materialised the LAST SceneRef and the other became 30 broken
+        // wrapper entities — Sockets pointing at bone 42 on an entity with
+        // no SkeletonComponent, FollowSocket reading an identity socket
+        // transform, and an Inf WorldAabb that AV'd SceneBVH on the first
+        // BuildRenderScene tick.
+        for (size_t s = 1; s < sceneRefs.size(); ++s)
+        {
+            const SceneRefEntry& srf = sceneRefs[s];
+            auto resN = SceneInstanceLoader::Load(srf.path, world, assetMgr, *meshLib, renderer);
+            if (!resN.success || resN.rootEntity == NullEntity)
+            {
+                LOG_WARNING("PrefabSerializer: secondary scene '%s' failed to load — idx=%d skipped",
+                            srf.path.c_str(), srf.idx);
+                continue;
+            }
+
+            // N-line override (transform + name) — same convention as primary.
+            for (const auto& nr : nodes)
+            {
+                if (nr.idx != srf.idx) continue;
+                LocalTransform lt;
+                lt.translation = { nr.tx, nr.ty, nr.tz };
+                lt.rotation    = { nr.qx, nr.qy, nr.qz, nr.qw };
+                lt.scale       = { nr.sx, nr.sy, nr.sz };
+                if (auto* existing = world.GetComponent<LocalTransform>(resN.rootEntity))
+                    *existing = lt;
+                if (!nr.name.empty())
+                    world.SetName(resN.rootEntity, nr.name);
+                break;
+            }
+
+            std::vector<Entity> nLoaded;
+            std::function<void(Entity)> collectDFSn = [&](Entity ent) {
+                nLoaded.push_back(ent);
+                const Children* ch = world.GetComponent<Children>(ent);
+                if (ch) for (Entity child : ch->entities) collectDFSn(child);
+            };
+            collectDFSn(resN.rootEntity);
+
+            for (size_t i = 0; i < nLoaded.size(); ++i)
+                entityMap[srf.idx + static_cast<int>(i)] = nLoaded[i];
+
+            // Append to loadedEntities so the post-process MaterialOverride
+            // loop reaches secondary-scene entities too.
+            loadedEntities.insert(loadedEntities.end(), nLoaded.begin(), nLoaded.end());
+
+            if (!world.HasComponent<SceneSourcePath>(resN.rootEntity))
+                world.AddComponent<SceneSourcePath>(resN.rootEntity, SceneSourcePath{ srf.path });
+        }
 
         std::vector<NodeRecord> sortedNodes = nodes;
         std::sort(sortedNodes.begin(), sortedNodes.end(),
@@ -569,7 +679,7 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
             lt.scale       = { nr.sx, nr.sy, nr.sz };
             world.AddComponent<LocalTransform> (e, lt);
             world.AddComponent<GlobalTransform>(e, GlobalTransform{});
-            world.AddComponent<Visibility>     (e, Visibility{});
+            world.AddComponent<VisibilityComponent>(e, VisibilityComponent{});
             world.AddComponent<RenderLayer>    (e, RenderLayer{});
             world.AddComponent<Children>       (e, Children{});
 
@@ -621,30 +731,39 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
 
             if (cb.tag == "PrefabFollowSocket")
             {
+                // target=-1 (saved with target outside prefab) → resolveTargetIdx
+                // returns NullEntity. Component is still created so authored
+                // offset/socketIndex persist; runtime equip rebinds the target.
                 const Entity tgt = resolveTargetIdx(cb.kv);
-                if (tgt == NullEntity) continue;
                 FollowSocketComponent fs;
-                fs.target = world.MakeHandle(tgt);
+                fs.target = (tgt != NullEntity) ? world.MakeHandle(tgt)
+                                                : NullEntityHandle;
                 if (auto it = cb.kv.find("socket"); it != cb.kv.end())
                     try { fs.socketIndex = static_cast<uint32_t>(std::stoul(it->second)); } catch (...) {}
                 if (auto it = cb.kv.find("m"); it != cb.kv.end())
-                    fs.localOffset = ParseMatrix(it->second);
+                {
+                    fs.localOffset      = ParseMatrix(it->second);
+                    fs.rotationEulerDeg = DecomposeToEulerDeg(fs.localOffset);
+                }
                 world.AddComponent<FollowSocketComponent>(e, fs);
             }
             else if (cb.tag == "PrefabFollowEntity")
             {
                 const Entity tgt = resolveTargetIdx(cb.kv);
-                if (tgt == NullEntity) continue;
                 FollowEntityComponent fe;
-                fe.target = world.MakeHandle(tgt);
+                fe.target = (tgt != NullEntity) ? world.MakeHandle(tgt)
+                                                : NullEntityHandle;
                 if (auto it = cb.kv.find("m"); it != cb.kv.end())
-                    fe.localOffset = ParseMatrix(it->second);
+                {
+                    fe.localOffset      = ParseMatrix(it->second);
+                    fe.rotationEulerDeg = DecomposeToEulerDeg(fe.localOffset);
+                }
                 world.AddComponent<FollowEntityComponent>(e, fe);
             }
             else if (cb.tag == "PrefabSkeletonRef")
             {
                 const Entity tgt = resolveTargetIdx(cb.kv);
-                if (tgt == NullEntity) continue;
+                if (tgt == NullEntity) continue;  // hard dep — skip if unresolved
                 world.AddComponent<SkeletonRef>(e, SkeletonRef{ tgt });
             }
         }
@@ -708,9 +827,57 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
             }
         }
 
-        LOG_SUCCESS("PrefabSerializer: loaded skinned prefab '%s' — root=%u",
-                    path.c_str(), res.rootEntity);
-        return res.rootEntity;
+        // Final pass: re-wire Parent/Children from saved parentIdx for every
+        // node. This handles two cases SceneInstanceLoader can't:
+        //   1. The .iscn root has a wrapper parent (sceneIdx > 0).
+        //   2. Extras created with a parent pointing into the .iscn DFS
+        //      (e.g. a trail node parented under a specific bone).
+        // Idempotent for the in-.iscn relationships SceneInstanceLoader
+        // already wired.
+        for (const NodeRecord& nr : nodes)
+        {
+            if (nr.parent < 0) continue;
+            auto eit = entityMap.find(nr.idx);
+            if (eit == entityMap.end()) continue;
+            auto pit = entityMap.find(nr.parent);
+            if (pit == entityMap.end()) continue;
+
+            const Entity child  = eit->second;
+            const Entity parent = pit->second;
+
+            Parent* p = world.GetComponent<Parent>(child);
+            if (p && p->entity == parent) continue;
+            if (p) p->entity = parent;
+            else   world.AddComponent<Parent>(child, Parent{ parent });
+
+            Children* ch = world.GetComponent<Children>(parent);
+            if (!ch)
+            {
+                Children newCh; newCh.entities.push_back(child);
+                world.AddComponent<Children>(parent, std::move(newCh));
+            }
+            else
+            {
+                auto& v = ch->entities;
+                if (std::find(v.begin(), v.end(), child) == v.end())
+                    v.push_back(child);
+            }
+        }
+
+        // Prefab root = entity whose saved parentIdx is -1 (top of the prefab).
+        // For legacy prefabs this is the .iscn root. For wrapped prefabs it's
+        // the empty/wrapper entity that holds the .iscn root as its child.
+        Entity prefabRoot = res.rootEntity;
+        for (const NodeRecord& nr : nodes)
+        {
+            if (nr.parent != -1) continue;
+            auto it = entityMap.find(nr.idx);
+            if (it != entityMap.end()) { prefabRoot = it->second; break; }
+        }
+
+        LOG_SUCCESS("PrefabSerializer: loaded skinned prefab '%s' — root=%u sceneIdx=%d",
+                    path.c_str(), prefabRoot, sceneIdxLocal);
+        return prefabRoot;
     }
 
     // ---- Standard (non-skinned) prefab ----
@@ -735,7 +902,7 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
 
         world.AddComponent<LocalTransform> (e, lt);
         world.AddComponent<GlobalTransform>(e, GlobalTransform{});
-        world.AddComponent<Visibility>     (e, Visibility{});
+        world.AddComponent<VisibilityComponent>(e, VisibilityComponent{});
         world.AddComponent<RenderLayer>    (e, RenderLayer{});
         world.AddComponent<Children>       (e, Children{});
 
@@ -787,30 +954,37 @@ Entity Resource::LoadPrefab(const std::string& path, World& world, AssetManager&
 
         if (cb.tag == "PrefabFollowSocket")
         {
+            // target=-1 → component created with NullEntityHandle; equip code rebinds.
             const Entity tgt = resolveTargetIdx(cb.kv);
-            if (tgt == NullEntity) continue;
             FollowSocketComponent fs;
-            fs.target = world.MakeHandle(tgt);
+            fs.target = (tgt != NullEntity) ? world.MakeHandle(tgt)
+                                            : NullEntityHandle;
             if (auto it = cb.kv.find("socket"); it != cb.kv.end())
                 try { fs.socketIndex = static_cast<uint32_t>(std::stoul(it->second)); } catch (...) {}
             if (auto it = cb.kv.find("m"); it != cb.kv.end())
-                fs.localOffset = ParseMatrix(it->second);
+            {
+                fs.localOffset      = ParseMatrix(it->second);
+                fs.rotationEulerDeg = DecomposeToEulerDeg(fs.localOffset);
+            }
             world.AddComponent<FollowSocketComponent>(e, fs);
         }
         else if (cb.tag == "PrefabFollowEntity")
         {
             const Entity tgt = resolveTargetIdx(cb.kv);
-            if (tgt == NullEntity) continue;
             FollowEntityComponent fe;
-            fe.target = world.MakeHandle(tgt);
+            fe.target = (tgt != NullEntity) ? world.MakeHandle(tgt)
+                                            : NullEntityHandle;
             if (auto it = cb.kv.find("m"); it != cb.kv.end())
-                fe.localOffset = ParseMatrix(it->second);
+            {
+                fe.localOffset      = ParseMatrix(it->second);
+                fe.rotationEulerDeg = DecomposeToEulerDeg(fe.localOffset);
+            }
             world.AddComponent<FollowEntityComponent>(e, fe);
         }
         else if (cb.tag == "PrefabSkeletonRef")
         {
             const Entity tgt = resolveTargetIdx(cb.kv);
-            if (tgt == NullEntity) continue;
+            if (tgt == NullEntity) continue;  // hard dep — skip if unresolved
             world.AddComponent<SkeletonRef>(e, SkeletonRef{ tgt });
         }
     }

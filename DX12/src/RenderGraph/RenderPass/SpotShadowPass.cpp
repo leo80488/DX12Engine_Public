@@ -27,13 +27,13 @@ SpotShadowPass::SpotShadowPass()
 SpotShadowPass::~SpotShadowPass()
 {
     if (!m_gfxPtr) return;
-    for (uint32_t i = 0; i < kMaxCasters; ++i)
+    m_casterCBs.Destroy(*m_gfxPtr);
+    for (uint32_t i = 0; i < kFrameCount; ++i)
     {
-        if (m_casterCBMapped[i]) m_gfxPtr->UnmapBuffer(m_casterCBs[i]);
-        if (m_casterCBs[i].IsValid()) m_gfxPtr->DestroyBuffer(m_casterCBs[i]);
+        if (m_indirectArgMapped[i])    m_gfxPtr->UnmapBuffer(m_indirectArgBuffer[i]);
+        if (m_indirectArgBuffer[i].IsValid()) m_gfxPtr->DestroyBuffer(m_indirectArgBuffer[i]);
+        m_indirectArgMapped[i] = nullptr;
     }
-    if (m_indirectArgMapped) m_gfxPtr->UnmapBuffer(m_indirectArgBuffer);
-    if (m_indirectArgBuffer.IsValid()) m_gfxPtr->DestroyBuffer(m_indirectArgBuffer);
     if (m_atlas.IsValid()) m_gfxPtr->DestroyTexture(m_atlas);
 }
 
@@ -69,28 +69,24 @@ void SpotShadowPass::Init(IGraphicsDevice& gfx)
             LOG_ERROR("SpotShadowPass: shadow atlas creation failed");
     }
 
-    // ---- One tiny UPLOAD CB per slice (single float4x4 each) --------------
-    for (uint32_t i = 0; i < kMaxCasters; ++i)
-    {
-        RHI::GPUBufferDesc bd;
-        bd.size       = (sizeof(XMFLOAT4X4) + 255u) & ~255ull; // 256 bytes aligned
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_casterCBs[i]))
-            m_casterCBMapped[i] = gfx.MapBuffer(m_casterCBs[i]);
-        else
-            LOG_ERROR("SpotShadowPass: caster CB %u creation failed", i);
-    }
+    // ---- Caster CB pool (triple-buffered, 256B-aligned per slice) ---------
+    if (!m_casterCBs.Create(gfx, "SpotShadowPass.CasterCBs"))
+        LOG_ERROR("SpotShadowPass: caster CB pool creation failed");
 
     // ---- Indirect draw command buffer (same layout as ShadowPass / GBuffer)
+    // Triple-buffered ring — each frame writes its own arg buffer so the
+    // ExecuteIndirect can't race with next-frame CPU writes.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxIndirectCommands) * sizeof(IndirectDrawCommand);
         bd.stride     = sizeof(IndirectDrawCommand);
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::NONE;
-        if (gfx.CreateBuffer(bd, m_indirectArgBuffer))
-            m_indirectArgMapped = gfx.MapBuffer(m_indirectArgBuffer);
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(bd, m_indirectArgBuffer[i]))
+                m_indirectArgMapped[i] = gfx.MapBuffer(m_indirectArgBuffer[i]);
+        }
     }
 
     // Linear-wrap sampler for alpha-test PS (matches GBuffer.ps's g_LinearWrap).
@@ -106,7 +102,7 @@ void SpotShadowPass::Init(IGraphicsDevice& gfx)
 
     LOG_SUCCESS("SpotShadowPass: initialised (Atlas %ux%u x %u slices, indirect=%s)",
                 kShadowMapSize, kShadowMapSize, kMaxCasters,
-                m_indirectArgMapped ? "YES" : "NO");
+                m_indirectArgMapped[0] ? "YES" : "NO");
 }
 
 // ---------------------------------------------------------------------------
@@ -155,13 +151,16 @@ uint64_t SpotShadowPass::GetAtlasSrvHandle() const
 // ---------------------------------------------------------------------------
 void SpotShadowPass::UploadCasterCBs()
 {
+    if (!m_gfxPtr) return;
+    auto* pool = m_casterCBs.Current(*m_gfxPtr);
+    if (!pool) return;
     for (uint32_t i = 0; i < m_activeCount; ++i)
     {
-        if (!m_casterCBMapped[i]) continue;
         XMMATRIX m = XMLoadFloat4x4(&m_pendingVP[i]);
         XMFLOAT4X4 t;
         XMStoreFloat4x4(&t, XMMatrixTranspose(m));
-        std::memcpy(m_casterCBMapped[i], &t, sizeof(XMFLOAT4X4));
+        std::memcpy(pool->slots + i * kCasterCBStride,
+                    &t, sizeof(XMFLOAT4X4));
     }
 }
 
@@ -228,7 +227,8 @@ RHI::CommandList SpotShadowPass::Execute(RHI::CommandList cl)
     UploadCasterCBs();
 
     const uint64_t bindlessHandle = cl.GetBindlessTableHandle();
-    const bool useIndirect = (m_indirectArgMapped != nullptr);
+    const uint32_t frameSlot      = gfx.GetFrameIndex();
+    const bool useIndirect = (m_indirectArgMapped[frameSlot] != nullptr);
 
     // Build indirect arg buffer, split alpha / non-alpha — same layout as CSM.
     uint32_t groupOffsets[2] = { 0, 0 };
@@ -236,7 +236,7 @@ RHI::CommandList SpotShadowPass::Execute(RHI::CommandList cl)
 
     if (useIndirect)
     {
-        auto* args = static_cast<IndirectDrawCommand*>(m_indirectArgMapped);
+        auto* args = static_cast<IndirectDrawCommand*>(m_indirectArgMapped[frameSlot]);
 
         // Transparent source contributes ONLY to the alpha-test bucket — pure
         // alpha-blended packets (no alphaRef) would otherwise render solid.
@@ -284,10 +284,10 @@ RHI::CommandList SpotShadowPass::Execute(RHI::CommandList cl)
     }
 
     // ---- Render each active caster into its slice --------------------------
+    const RHI::GPUBuffer& casterCBBuf = m_casterCBs.CurrentBuffer(gfx);
+    if (!casterCBBuf.IsValid()) return cl;
     for (uint32_t s = 0; s < m_activeCount; ++s)
     {
-        if (!m_casterCBs[s].IsValid()) continue;
-
         gfx.SetDepthStencilSlice(m_atlas, s, cl);
 
         cl.SetViewport(kShadowMapSize, kShadowMapSize);
@@ -310,8 +310,13 @@ RHI::CommandList SpotShadowPass::Execute(RHI::CommandList cl)
             cl.BindBufferSRVByName(kMeshDescSlot,    "MeshDescriptors");
             if (bindlessHandle)
                 cl.BindDescriptorTableHandle(kBindlessSlot, bindlessHandle);
-            cl.GetDevice().BindConstantBuffer(m_casterCBs[s],
-                                              kShadowPerViewSlot, cl);
+            // Each caster occupies one 256-aligned slot inside the pool CB
+            // — pass the byte offset rather than relying on the slot value.
+            auto& dx12CB = static_cast<GraphicsDX12&>(cl.GetDevice());
+            dx12CB.BindConstantBufferAtOffset(kShadowPerViewSlot,
+                                              casterCBBuf,
+                                              static_cast<uint64_t>(s) * kCasterCBStride,
+                                              cl);
 
             // ALPHA_TEST PS reads MaterialBuffer (alphaRef) + bindless g_AllTextures[].
             if (g == 1)
@@ -332,7 +337,7 @@ RHI::CommandList SpotShadowPass::Execute(RHI::CommandList cl)
 
             if (useIndirect)
             {
-                gfx.ExecuteIndirectDraw(m_indirectArgBuffer,
+                gfx.ExecuteIndirectDraw(m_indirectArgBuffer[frameSlot],
                                         groupOffsets[g],
                                         groupCounts[g],
                                         nullptr, 0, cl);

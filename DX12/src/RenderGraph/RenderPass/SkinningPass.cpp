@@ -44,31 +44,38 @@ void SkinningPass::Init(IGraphicsDevice& gfx)
 
     // Job buffer: one 256-byte-aligned slot per job. Root CBV points at each
     // slot's offset. UPLOAD heap, no bind flags needed for root CBV.
+    // Triple-buffered ring so per-frame writes don't race in-flight GPU reads.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxSkinJobs) * 256u;
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::NONE;
-        if (gfx.CreateBuffer(bd, m_jobBuffer))
-            m_jobBufferMapped = gfx.MapBuffer(m_jobBuffer);
-        if (!m_jobBufferMapped)
-            LOG_ERROR("SkinningPass: failed to map job buffer");
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(bd, m_jobBuffer[i]))
+                m_jobBufferMapped[i] = gfx.MapBuffer(m_jobBuffer[i]);
+            if (!m_jobBufferMapped[i])
+                LOG_ERROR("SkinningPass: failed to map job buffer[%u]", i);
+        }
     }
 
-    // Morph weight upload buffer: kMaxSkinJobs × 512 bytes.
+    // Morph weight upload buffer: kMaxSkinJobs × 512 bytes — triple-buffered.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxSkinJobs) * 512u;
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_RAW;
-        if (gfx.CreateBuffer(bd, m_morphWeightBuf))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_morphWeightMapped = gfx.MapBuffer(m_morphWeightBuf);
-            m_morphWeightSRV    = gfx.GetBufferSRVGpuHandle(m_morphWeightBuf);
+            if (gfx.CreateBuffer(bd, m_morphWeightBuf[i]))
+            {
+                m_morphWeightMapped[i] = gfx.MapBuffer(m_morphWeightBuf[i]);
+                m_morphWeightSRV[i]    = gfx.GetBufferSRVGpuHandle(m_morphWeightBuf[i]);
+            }
+            if (!m_morphWeightMapped[i])
+                LOG_WARNING("SkinningPass: failed to map morph weight buffer[%u] (morphs disabled)", i);
         }
-        if (!m_morphWeightMapped)
-            LOG_WARNING("SkinningPass: failed to map morph weight buffer (morphs disabled)");
     }
 
     LOG_SUCCESS("SkinningPass: initialised");
@@ -77,11 +84,14 @@ void SkinningPass::Init(IGraphicsDevice& gfx)
 // ---------------------------------------------------------------------------
 RHI::CommandList SkinningPass::Execute(RHI::CommandList cl)
 {
-    if (!m_pso.IsValid() || !m_jobBufferMapped) return cl;
+    if (!m_pso.IsValid())                        return cl;
     if (!m_jobs || m_jobs->empty())              return cl;
     if (!m_poseBuffer || !m_vertRing)            return cl;
+    if (!m_gfx)                                  return cl;
 
     auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    if (!m_jobBufferMapped[frameSlot])           return cl;
 
     // ---- Phase 1 (CPU): upload all jobs (256-byte aligned) + morph weights --
     uint32_t totalJobs = 0;
@@ -97,7 +107,7 @@ RHI::CommandList SkinningPass::Execute(RHI::CommandList cl)
 
         // Write SkinJobCB at 256-byte aligned offset.
         SkinJobCB* slot = reinterpret_cast<SkinJobCB*>(
-            static_cast<uint8_t*>(m_jobBufferMapped) + totalJobs * 256u);
+            static_cast<uint8_t*>(m_jobBufferMapped[frameSlot]) + totalJobs * 256u);
         std::memset(slot, 0, 256);
         slot->poseByteOffset        = job.poseByteOffset;
         slot->vertexCount           = job.vertexCount;
@@ -108,10 +118,10 @@ RHI::CommandList SkinningPass::Execute(RHI::CommandList cl)
         slot->prevPoseByteOffset    = job.prevPoseByteOffset;
         slot->outPrevPosByteOffset  = job.outPrevPosByteOffset;
 
-        if (job.morphCount > 0 && m_morphWeightMapped)
+        if (job.morphCount > 0 && m_morphWeightMapped[frameSlot])
         {
             float* wDst = reinterpret_cast<float*>(
-                static_cast<uint8_t*>(m_morphWeightMapped) + totalJobs * 512u);
+                static_cast<uint8_t*>(m_morphWeightMapped[frameSlot]) + totalJobs * 512u);
             std::memset(wDst, 0, 512);
             std::memcpy(wDst, job.morphWeights,
                         (std::min)(job.morphCount, 128u) * sizeof(float));
@@ -127,8 +137,8 @@ RHI::CommandList SkinningPass::Execute(RHI::CommandList cl)
     gfx.SetComputeDescriptorTable(kPose,   m_poseBuffer->GetCurrentSRVHandle(), cl);
     gfx.SetComputeDescriptorTable(kOutPos, m_vertRing->GetPosUAVHandle(),       cl);
     gfx.SetComputeDescriptorTable(kOutNrm, m_vertRing->GetNrmUAVHandle(),       cl);
-    if (m_morphWeightSRV != 0)
-        gfx.SetComputeDescriptorTable(kMorphWeights, m_morphWeightSRV, cl);
+    if (m_morphWeightSRV[frameSlot] != 0)
+        gfx.SetComputeDescriptorTable(kMorphWeights, m_morphWeightSRV[frameSlot], cl);
 
     uint32_t dispatchIdx = 0;
     for (const SkinDispatchDesc& job : *m_jobs)
@@ -137,7 +147,7 @@ RHI::CommandList SkinningPass::Execute(RHI::CommandList cl)
         if (dispatchIdx >= totalJobs) break;
 
         // Root CBV → point at this job's 256-byte slot in the upload buffer.
-        gfx.SetComputeRootCBV(kCBSlot, m_jobBuffer, dispatchIdx * 256u, cl);
+        gfx.SetComputeRootCBV(kCBSlot, m_jobBuffer[frameSlot], dispatchIdx * 256u, cl);
 
         gfx.SetComputeDescriptorTable(kRestPos, job.restPosSRVHandle, cl);
         gfx.SetComputeDescriptorTable(kRestNrm, job.restNrmSRVHandle, cl);

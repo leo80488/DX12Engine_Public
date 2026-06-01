@@ -25,6 +25,7 @@ void UIPass::Init(IGraphicsDevice& gfx)
     // (UIDrawList stores v+idx; UIPass expands to flat triangle list at upload
     // time because the engine's PVF root signature does not expose IA index
     // buffer binding — see GraphicsDX12::IASetIndexBuffer(nullptr).)
+    // Triple-buffered ring so CPU writes don't race in-flight GPU reads.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxIndices) * sizeof(UI::UIVertex);
@@ -32,22 +33,17 @@ void UIPass::Init(IGraphicsDevice& gfx)
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
         bd.misc_flags = RHI::ResourceMiscFlag::BUFFER_RAW;
-        if (gfx.CreateBuffer(bd, m_vertexBuffer))
-            m_vbMapped = gfx.MapBuffer(m_vertexBuffer);
-        else
-            LOG_ERROR("UIPass: vertex buffer creation failed");
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(bd, m_vertexBuffer[i]))
+                m_vbMapped[i] = gfx.MapBuffer(m_vertexBuffer[i]);
+            else
+                LOG_ERROR("UIPass: vertex buffer[%u] creation failed", i);
+        }
     }
 
     // UI CB (canvas size at b1 space0).
-    {
-        RHI::GPUBufferDesc bd{};
-        struct UICB { float w, h; uint32_t pad0, pad1; };
-        bd.size       = (sizeof(UICB) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "UI.CB");
 
     // 1×1 white default texture — bound when a draw cmd has no texture so the
     // PS branch stays unified (sample × tint = tint when sampling white).
@@ -143,7 +139,8 @@ void UIPass::Execute(RHI::CommandList cl,
     const PSODesc psoDesc = BuildPSODesc();
     const RHI::PipelineState* pso = m_psoCache.GetOrCreate(psoDesc);
     if (!pso || !pso->IsValid()) return;
-    if (!m_vbMapped) return;
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    if (!m_vbMapped[frameSlot]) return;
 
     // ---- Upload: flat-expand UIDrawList → triangle list VB --------------
     // UIDrawList stores indexed primitives. The engine root sig has no IA
@@ -160,7 +157,7 @@ void UIPass::Execute(RHI::CommandList cl,
                     srcIdx.size(), kMaxIndices);
     }
     const size_t totalVerts = std::min<size_t>(srcIdx.size(), kMaxIndices);
-    UI::UIVertex* dst = static_cast<UI::UIVertex*>(m_vbMapped);
+    UI::UIVertex* dst = static_cast<UI::UIVertex*>(m_vbMapped[frameSlot]);
 
     struct ExpandedCmd
     {
@@ -199,11 +196,10 @@ void UIPass::Execute(RHI::CommandList cl,
     (void)totalVerts;
 
     // ---- Update CB (canvas size) ----------------------------------------
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
-        struct UICB { float w, h; uint32_t pad0, pad1; };
-        UICB cb{ static_cast<float>(canvasW), static_cast<float>(canvasH), 0, 0 };
-        std::memcpy(m_cbMapped, &cb, sizeof(cb));
+        UIPass::UICB cb{ static_cast<float>(canvasW), static_cast<float>(canvasH), 0, 0 };
+        *slot = cb;
     }
 
     // ---- Transition target → RT ----------------------------------
@@ -239,12 +235,12 @@ void UIPass::Execute(RHI::CommandList cl,
     gfx.SetPrimitiveTopology(RHI::PrimitiveTopology::TRIANGLELIST, cl);
 
     // CB at b1 space0 — engine helper: slot=0 → b1.
-    gfx.BindConstantBuffer(m_cb, 0, cl);
+    gfx.BindConstantBuffer(m_cb.CurrentBuffer(gfx), 0, cl);
     // Sampler at s0 — engine helper: slot=0 → root param 15.
     if (m_samplerIdx >= 0) gfx.BindSampler(m_samplerIdx, 0, cl);
 
     // VB ByteAddressBuffer at t2 space0.
-    const uint64_t vbHandle = gfx.GetBufferSRVGpuHandle(m_vertexBuffer);
+    const uint64_t vbHandle = gfx.GetBufferSRVGpuHandle(m_vertexBuffer[frameSlot]);
     if (vbHandle) gfx.BindDescriptorTableGpuHandle(kRootSlot_VertexSRV, vbHandle, cl);
 
     // ---- Draw, switching texture + scissor per command ------------------
@@ -290,7 +286,7 @@ void UIPass::Execute(RHI::CommandList cl,
             // Dump first 4 vertex positions for this cmd so we can correlate
             // with screen-space expectations. Each vertex is 20 bytes; we
             // wrote into the same buffer that's about to be drawn.
-            const UI::UIVertex* v = static_cast<UI::UIVertex*>(m_vbMapped) + ecmd.vertexOffset;
+            const UI::UIVertex* v = static_cast<UI::UIVertex*>(m_vbMapped[frameSlot]) + ecmd.vertexOffset;
             const uint32_t showCount = std::min<uint32_t>(4u, ecmd.vertexCount);
             char vertBuf[256] = {};
             int off = 0;

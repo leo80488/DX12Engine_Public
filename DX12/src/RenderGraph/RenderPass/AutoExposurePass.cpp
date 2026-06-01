@@ -11,22 +11,6 @@ static constexpr uint32_t kUAV1        = 5;   // exposure UAV
 
 static constexpr uint32_t kHistBins = 256;
 
-struct AutoExposureCB
-{
-    uint32_t width;
-    uint32_t height;
-    float    minLogLuma;
-    float    invLogLumaRange;
-    float    adaptationRate;
-    float    lowPercent;
-    float    highPercent;
-    float    minExposure;
-    float    maxExposure;
-    float    evBias;
-    float    keyValue;
-    float    pad[2];
-};
-
 // ---------------------------------------------------------------------------
 void AutoExposurePass::Init(IGraphicsDevice& gfx)
 {
@@ -82,24 +66,23 @@ void AutoExposurePass::Init(IGraphicsDevice& gfx)
     }
 
     // Per-dispatch CB
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(AutoExposureCB) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "AutoExposure.CB");
 
     // Staging for manual-exposure upload when the pass is disabled.
+    // Ringed across kFrameCount slots — the CopyBuffer the disabled-path
+    // queues each frame reads from one of these, so the next frame's CPU
+    // write must not land on the same buffer that the GPU is still copying.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = sizeof(float);
         bd.stride     = sizeof(float);
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::NONE;
-        if (gfx.CreateBuffer(bd, m_manualStaging))
-            m_manualStagingMapped = gfx.MapBuffer(m_manualStaging);
+        for (uint32_t i = 0; i < kFrameCount; ++i)
+        {
+            if (gfx.CreateBuffer(bd, m_manualStaging[i]))
+                m_manualStagingMapped[i] = gfx.MapBuffer(m_manualStaging[i]);
+        }
     }
 
     LOG_SUCCESS("AutoExposurePass: initialized");
@@ -118,8 +101,9 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
     // entirely (zero GPU cost beyond a 4-byte copy).
     if (!m_enabled)
     {
-        if (m_manualStagingMapped)
-            std::memcpy(m_manualStagingMapped, &m_manualExposure, sizeof(float));
+        const uint32_t frameSlot = gfx.GetFrameIndex();
+        if (m_manualStagingMapped[frameSlot])
+            std::memcpy(m_manualStagingMapped[frameSlot], &m_manualExposure, sizeof(float));
 
         if (m_exposureState != RHI::ResourceState::COPY_DST)
         {
@@ -127,7 +111,7 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
                 &m_exposureBuffer, m_exposureState, RHI::ResourceState::COPY_DST), cl);
             m_exposureState = RHI::ResourceState::COPY_DST;
         }
-        gfx.CopyBuffer(m_manualStaging, m_exposureBuffer, sizeof(float), cl);
+        gfx.CopyBuffer(m_manualStaging[frameSlot], m_exposureBuffer, sizeof(float), cl);
 
         gfx.PushBarrier(RHI::GPUBarrier::Buffer(
             &m_exposureBuffer, RHI::ResourceState::COPY_DST,
@@ -136,9 +120,9 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
         return cl;
     }
 
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
-        AutoExposureCB cb{};
+        AutoExposurePass::AutoExposureCB cb{};
         cb.width           = m_vpW;
         cb.height          = m_vpH;
         cb.minLogLuma      = m_minLogLuma;
@@ -150,7 +134,7 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
         cb.maxExposure     = m_maxExposure;
         cb.evBias          = m_evBias;
         cb.keyValue        = m_keyValue;
-        std::memcpy(m_cbMapped, &cb, sizeof(cb));
+        *slot = cb;
     }
 
     // UAV barrier to ensure histogram writes from last frame are visible
@@ -162,9 +146,11 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
         m_exposureState = RHI::ResourceState::UNORDERED_ACCESS;
     }
 
+    const RHI::GPUBuffer& cbBuf = m_cb.CurrentBuffer(gfx);
+
     // --- Histogram Build ---
     gfx.BindComputePipelineState(m_buildPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, cbBuf, cl);
     gfx.SetComputeDescriptorTable(kSRV0,  m_hdrSrvHandle, cl);
     gfx.SetComputeDescriptorTable(kUAV0,  gfx.GetBufferUAVGpuHandle(m_histogramBuffer), cl);
     gfx.DispatchCompute((m_vpW + 15) / 16, (m_vpH + 15) / 16, 1, cl);
@@ -173,7 +159,7 @@ RHI::CommandList AutoExposurePass::Execute(RHI::CommandList cl)
     gfx.PushBarrier(RHI::GPUBarrier::Memory(&m_histogramBuffer), cl);
     // --- Histogram Average ---
     gfx.BindComputePipelineState(m_averagePSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, cbBuf, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetBufferUAVGpuHandle(m_histogramBuffer), cl);
     gfx.SetComputeDescriptorTable(kUAV1, gfx.GetBufferUAVGpuHandle(m_exposureBuffer),  cl);
     gfx.DispatchCompute(1, 1, 1, cl);

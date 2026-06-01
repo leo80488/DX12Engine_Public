@@ -36,6 +36,16 @@ public:
     bool IsEnabled() const { return m_enabled; }
     void SetEnabled(bool v) { m_enabled = v; }
 
+    // Public reusable kinematics helpers — FootIKTargetSystem (and any other
+    // pre-IK pass) needs to read the skeleton's pre-IK world pose to decide
+    // where the effector currently sits. Both helpers are pure (no member
+    // state) so they live as static methods to keep the surface tight.
+    static DirectX::XMMATRIX LocalPoseToMatrix(const AnimationSystem::LocalPose& p);
+    static DirectX::XMMATRIX ComputeBoneWorldTransform(
+        uint32_t                          boneIndex,
+        const AnimationSystem::LocalPose* poses,
+        const SkeletonAsset&              skel);
+
 private:
     // Per-chain-link runtime state used during solving.
     struct ChainState
@@ -72,10 +82,15 @@ private:
                     std::vector<ChainState>&       states);
 
     // Compute world-space transform for a bone (traverses parent chain).
+    // Member alias of the public static — keeps the existing solver call
+    // sites unchanged.
     DirectX::XMMATRIX ComputeWorldTransform(
         uint32_t                          boneIndex,
         const AnimationSystem::LocalPose* poses,
-        const SkeletonAsset&              skel) const;
+        const SkeletonAsset&              skel) const
+    {
+        return ComputeBoneWorldTransform(boneIndex, poses, skel);
+    }
 
     AnimationSystem&  m_animSys;
     SkeletonRegistry& m_skeletons;

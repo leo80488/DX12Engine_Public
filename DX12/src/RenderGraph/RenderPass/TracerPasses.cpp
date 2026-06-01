@@ -68,8 +68,8 @@ void TracerSimPass::Execute(RHI::CommandList cl)
     if (spawnCount > 0)
     {
         gfx.BindComputePipelineState(m_emitPSO, cl);
-        gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(), 0, cl);
-        gfx.SetComputeDescriptorTable(kCSSpawnsSlot,  m_sys->GetSpawnSRV(), cl);
+        gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(gfx), 0, cl);
+        gfx.SetComputeDescriptorTable(kCSSpawnsSlot,  m_sys->GetSpawnSRV(gfx), cl);
         gfx.SetComputeDescriptorTable(kCSPoolUAVSlot, m_sys->GetPoolUAV(), cl);
 
         gfx.DispatchCompute((spawnCount + 63) / 64, 1, 1, cl);
@@ -80,7 +80,7 @@ void TracerSimPass::Execute(RHI::CommandList cl)
 
     // ---- Phase B: Update (one dispatch over the entire pool) -----------
     gfx.BindComputePipelineState(m_updatePSO, cl);
-    gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(), 0, cl);
+    gfx.SetComputeRootCBV(kCSCBSlot, m_sys->GetSystemCB(gfx), 0, cl);
     gfx.SetComputeDescriptorTable(kCSPoolUAVSlot, m_sys->GetPoolUAV(), cl);
 
     const uint32_t poolSize = TracerSystem::GetPoolCapacity();
@@ -167,16 +167,8 @@ void TracerRenderPass::Init(IGraphicsDevice& gfx)
     }
 
     // Per-frame render CB.
-    {
-        RHI::GPUBufferDesc cbd{};
-        cbd.size       = 256;
-        cbd.usage      = RHI::Usage::UPLOAD;
-        cbd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(cbd, m_renderCB))
-            m_renderCBMapped = gfx.MapBuffer(m_renderCB);
-        if (!m_renderCBMapped)
-            LOG_ERROR("TracerRenderPass: render CB map failed");
-    }
+    if (!m_renderCB.Create(gfx, "TracerRenderPass.RenderCB"))
+        LOG_ERROR("TracerRenderPass: render CB create failed");
 
     // Linear-wrap sampler for the optional noise texture.
     RHI::SamplerDesc sd;
@@ -188,29 +180,32 @@ void TracerRenderPass::Init(IGraphicsDevice& gfx)
 
 RHI::CommandList TracerRenderPass::Execute(RHI::CommandList cl)
 {
-    if (!m_sys || !m_pso.IsValid() || !m_renderCBMapped) return cl;
+    if (!m_sys || !m_pso.IsValid() || !m_renderCB.IsValid()) return cl;
+
+    auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
 
     using namespace DirectX;
 
     // Pack the render CB. Matrix transposed for HLSL row-vector mul().
-    RenderCB cb{};
-    XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
-    XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
-                    XMMatrixTranspose(vp));
-    cb.cameraPos[0]  = m_cameraPos.x;
-    cb.cameraPos[1]  = m_cameraPos.y;
-    cb.cameraPos[2]  = m_cameraPos.z;
-    cb.time          = m_time;
-    cb.nearZ         = m_nearZ;
-    cb.farZ          = m_farZ;
-    cb.fadeRange     = m_fadeRange;
-    cb.coreSharpness = m_coreSharpness;
-    cb.noiseTiling   = m_noiseTiling;
-    cb.scrollSpeed   = m_scrollSpeed;
-    cb.noiseFloor    = m_noiseFloor;
-    std::memcpy(m_renderCBMapped, &cb, sizeof(cb));
-
-    auto& gfx = static_cast<GraphicsDX12&>(*m_gfx);
+    if (auto* slot = m_renderCB.Current(gfx))
+    {
+        RenderCB cb{};
+        XMMATRIX vp = XMLoadFloat4x4(&m_viewProj);
+        XMStoreFloat4x4(reinterpret_cast<XMFLOAT4X4*>(cb.viewProj),
+                        XMMatrixTranspose(vp));
+        cb.cameraPos[0]  = m_cameraPos.x;
+        cb.cameraPos[1]  = m_cameraPos.y;
+        cb.cameraPos[2]  = m_cameraPos.z;
+        cb.time          = m_time;
+        cb.nearZ         = m_nearZ;
+        cb.farZ          = m_farZ;
+        cb.fadeRange     = m_fadeRange;
+        cb.coreSharpness = m_coreSharpness;
+        cb.noiseTiling   = m_noiseTiling;
+        cb.scrollSpeed   = m_scrollSpeed;
+        cb.noiseFloor    = m_noiseFloor;
+        *slot = cb;
+    }
 
     // Manual depth state transition: DEPTHSTENCIL → SHADER_RESOURCE so the PS
     // can sample it. Restored at the end of the pass for downstream
@@ -232,7 +227,7 @@ RHI::CommandList TracerRenderPass::Execute(RHI::CommandList cl)
     cl.SetPrimitiveTopology(RHI::PrimitiveTopology::TRIANGLESTRIP);
 
     // Render CB at b2 space0.
-    gfx.BindConstantBuffer(m_renderCB, /*slot=*/1, cl);
+    gfx.BindConstantBuffer(m_renderCB.CurrentBuffer(gfx), /*slot=*/1, cl);
 
     // Pool SRV at t4 space0.
     cl.BindDescriptorTableHandle(kGfxPoolSRVSlot, m_sys->GetPoolSRV());

@@ -149,6 +149,10 @@ struct DrawPacket
     uint64_t       texNormalMap        = 0;  // GPU SRV handle for normal map (0 = default flat normal)
     float          outlinePixels       = 2.0f; // per-material outline thickness (only used for DrawFilter::Custom)
     bool           screenSpaceOutline  = true; // enable screen-space edge detection for this draw
+    // Editor selection outline: written into ObjectID with depth-test OFF +
+    // bit-31 tag, painted yellow-green by OutlinePass's screen-space sub-pass.
+    // Skips the inverted-hull sub-pass entirely.
+    bool           isPickingOutline    = false;
     uint8_t        stencilRef          = 1;    // stencil value: 1=PBR, 2=NPR (written in GBuffer pass)
     // Cast-side rasterizer cull override for ShadowPass. Raw storage of
     // ShadowCullMode enum (0=Default back-cull, 1=Front, 2=None); the enum
@@ -159,6 +163,13 @@ struct DrawPacket
     // casting shadows via MaterialComponent::CAST_SHADOW. The packet still
     // lives in the Opaque/Transparent draw lists for GBuffer / Lighting.
     uint8_t        castShadow          = 1;
+    // Phase 3 author-intent: which views this packet participates in (see
+    // ViewBit in HierarchyComponents.h). Each pass AND's its own bit against
+    // viewMask before submitting. Default ~0u keeps legacy emitters (lights,
+    // billboards, beams that don't read VisibilityComponent) visible everywhere.
+    uint32_t       viewMask            = 0xFFFFFFFFu;
+    // 0 = entity opted out of the main / GBuffer pass (e.g. shadow-only proxies).
+    uint8_t        renderInMainPass    = 1;
     uint32_t       prevPosElementBase  = 0xFFFFFFFFu; // TAA: prev skinned pos base element (0xFFFFFFFF = none)
     // Custom pixel shader override — 0 means "use the pass default".
     // Populated upstream (Renderer::BuildRenderScene) by resolving the
@@ -202,13 +213,20 @@ struct IndirectGroup
 // ---------------------------------------------------------------------------
 // RenderCamera — camera state forwarded from the game layer to the Renderer.
 // Set per-frame via Renderer::SetCamera() before BeginFrame/Render.
+// `position` + `forward` come straight from the camera entity's GlobalTransform;
+// the Renderer builds the view matrix via XMMatrixLookToLH (no Euler angles).
 // Defaults reproduce the original hardcoded view (eye=(4,3,5), look-at origin).
 struct RenderCamera
 {
     DirectX::XMFLOAT3 position = { 4.f, 3.f, 5.f };
-    float             yaw      = -2.47f;  // FPS yaw around world-Y  (radians)
-    float             pitch    =  0.44f;  // FPS pitch around cam-X  (radians, clamped ±π/2)
+    DirectX::XMFLOAT3 forward  = { -0.566f, -0.424f, -0.707f }; // normalized world-space view dir
     float             fov      = DirectX::XM_PI / 3.f;
     float             nearZ    = 0.1f;
     float             farZ     = 200.f;
+    // False for one frame on a hard cut (Camera.HardCutTo, initial spawn,
+    // cinematic shot boundary). Temporal passes (TAA, XeGTAO, VolumetricFog,
+    // SSR) AND this with their internal heuristic — wired by the camera
+    // stack pipeline so all temporal-history-bearing effects clear in lockstep.
+    // Defaults to true so callers that don't set it preserve existing behavior.
+    bool              historyValid = true;
 };

@@ -82,7 +82,16 @@ uint32_t SceneBVH::BuildRecursive(uint32_t begin, uint32_t end, uint32_t parentI
         for (uint32_t i = begin; i < end; ++i)
         {
             float c = GetAxis(m_leafAABBs[i].Center(), axis);
-            int   b = (std::min)(static_cast<int>((c - axisMin) * scale), kBins - 1);
+            // Clamp both ends. If c is NaN/Inf (a leaf AABB with Inf min/max
+            // collapses Center() to NaN), the cast-to-int result is
+            // implementation-defined (typically INT_MIN on x64), which
+            // bins[b].count++ would AV on. std::min alone only caps the
+            // upper end, so we also need the lower-bound max(). Valid
+            // centers in [axisMin, axisMax] map to b ∈ [0, kBins-1]
+            // unchanged, so SAH quality and culling correctness are
+            // preserved.
+            int   b = static_cast<int>((c - axisMin) * scale);
+            b = (std::max)(0, (std::min)(b, kBins - 1));
             bins[b].count++;
             bins[b].bounds.Expand(m_leafAABBs[i]);
         }

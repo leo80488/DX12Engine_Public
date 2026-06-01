@@ -6,11 +6,12 @@
 
 struct GPUInstanceData
 {
-    float4x4 world;          // 64 bytes — transposed world matrix
+    float4x4 world;          // 64 bytes — transposed current world matrix
     uint     meshDescIdx;    //  4 bytes
     uint     materialIdx;    //  4 bytes
     uint     lodLevel;       //  4 bytes
-    uint     pad;            //  4 bytes  (total: 80 bytes)
-};
+    uint     pad;            //  4 bytes
+    float4x4 prevWorld;      // 64 bytes — transposed prev-frame world (TAA velocity)
+};                            // (total: 144 bytes)
 
 #endif // GPU_INSTANCE_HLSLI

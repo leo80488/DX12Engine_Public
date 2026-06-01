@@ -1,11 +1,13 @@
 #include "Scene/TitleScene.h"
 #include "Scene/GameScene.h"
 #include "ECS/Components.h"
+#include "ECS/CameraSystem.h"
 #include "ECS/SkyboxComponent.h"
-#include "Resource/WorldSerializer.h"
+#include "Resource/SceneSerializer.h"
 #include "Resource/AssetManager.h"
 #include "Resource/AssetFS.h"
 #include "Graphics/Renderer.h"
+#include "Input/InputSystem.h"
 #include "System/Log.h"
 
 #include <fstream>
@@ -17,19 +19,19 @@
 
 namespace
 {
-    // Title's data lives in this .iworld — open it in Editor to add a logo,
+    // Title's data lives in this .iscene — open it in Editor to add a logo,
     // tweak lighting, etc. without recompiling. The fallback below keeps the
     // engine bootable before the file exists.
-    constexpr const char* kTitleWorldPath = "asset/scenes/title.iworld";
+    constexpr const char* kTitleScenePath = "asset/scenes/title.iscene";
 
-    bool TryLoadWorld(SceneContext& ctx, const char* path)
+    bool TryLoadScene(GameModeContext& ctx, const char* path)
     {
         if (!::Resource::AssetFS::Get().HasInPak(path)
             && !std::ifstream(path).good())
             return false;
         if (!ctx.assetMgr) return false;
         std::string ppc;
-        return ::Resource::LoadWorld(
+        return ::Resource::LoadScene(
             path, *ctx.world, *ctx.assetMgr,
             &ctx.renderer, /*animClipSys=*/nullptr,
             /*outName=*/nullptr, &ppc);
@@ -39,9 +41,11 @@ namespace
     {
         Entity cam = world.CreateEntity();
         world.SetName(cam, "Title Camera");
-        CameraComponent cc;
-        cc.position = { 0.f, 1.5f, -3.f };
-        world.AddComponent<CameraComponent>(cam, cc);
+        CameraControllerComponent camCtrl{};
+        world.AddComponent<CameraComponent>(cam, CameraComponent{});
+        world.AddComponent<CameraControllerComponent>(cam, camCtrl);
+        world.AddComponent<LocalTransform>(cam, CameraSystem::MakeTransform(camCtrl, { 0.f, 1.5f, -3.f }));
+        world.AddComponent<GlobalTransform>(cam, GlobalTransform{});
         tracked.push_back(cam);
 
         Entity light = world.CreateEntity();
@@ -67,12 +71,12 @@ namespace
     }
 }
 
-void TitleScene::Init(SceneContext* ctx)
+void TitleScene::Init(GameModeContext* ctx)
 {
     m_ctx = ctx;
     if (!m_ctx || !m_ctx->world)
     {
-        LOG_ERROR("TitleScene: Init received null SceneContext / World");
+        LOG_ERROR("TitleScene: Init received null GameModeContext / World");
         return;
     }
     LOG_INFO("=== TITLE === press SPACE to start");
@@ -80,11 +84,11 @@ void TitleScene::Init(SceneContext* ctx)
     World& world = *m_ctx->world;
     world.Clear();
 
-    if (!TryLoadWorld(*m_ctx, kTitleWorldPath))
+    if (!TryLoadScene(*m_ctx, kTitleScenePath))
     {
         LOG_INFO("TitleScene: '%s' missing — using built-in fallback (open the "
-                 "title.iworld file in Editor and Save World to author it)",
-                 kTitleWorldPath);
+                 "title.iscene file in Editor and Save Scene to author it)",
+                 kTitleScenePath);
         SpawnFallback(world, m_spawnedEntities);
     }
 }
@@ -93,12 +97,10 @@ void TitleScene::Update(float /*dt*/)
 {
     if (!m_ctx) return;
 
-    // Edge-triggered SPACE: GetAsyncKeyState's low bit is set when a transition
-    // happened since last call, so the request fires once per press.
-    if ((GetAsyncKeyState(VK_SPACE) & 1) && m_ctx->requestReplaceScene)
+    if (Input::Get().WasKeyPressed(VK_SPACE) && m_ctx->requestReplaceMode)
     {
         LOG_INFO("TitleScene: -> GameScene");
-        m_ctx->requestReplaceScene(std::make_unique<GameScene>());
+        m_ctx->requestReplaceMode(std::make_unique<GameScene>());
     }
 }
 
@@ -106,7 +108,7 @@ void TitleScene::Shutdown()
 {
     if (!m_ctx || !m_ctx->world) return;
     World& world = *m_ctx->world;
-    // If we LoadWorld'd, the next scene's Init will Clear() — no need to track
+    // If we LoadScene'd, the next mode's Init will Clear() — no need to track
     // entities ourselves. The fallback path tracks via m_spawnedEntities.
     for (Entity e : m_spawnedEntities)
         if (world.IsAlive(e)) world.DestroyEntity(e);

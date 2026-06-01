@@ -130,18 +130,25 @@ namespace Resource
     constexpr uint32_t ISKEL_FLAG_EXTENDED = 0x01; // has grant/IK/transformOrder data
 
     // .ianim — standalone animation clips (named-channel, not bound to a skeleton).
-    // Payload: binary clip data; see AnimationImporter for exact layout.
+    // Payload: binary clip data; see AnimationImporter / AnimationSerializer for layout.
     // Payload order: [bone clips × clipCount] [morph clips × morphClipCount]
+    //                [notify section]   (only present when ANIM_FLAG_HAS_NOTIFIES set)
+    //
+    // The notify section is appended at the very tail so legacy loaders that
+    // stop after morph clips ignore it, and old .ianim files (flag clear) keep
+    // loading unchanged. Layout (see AnimationSerializer.cpp):
+    //   [uint32 notifyClipCount]                       // == clipCount
+    //   for each clip i: [uint32 jsonLen][jsonLen bytes]  // NotifyIO JSON string
     struct AnimationMetadata
     {
         uint32_t clipCount;       // number of bone AnimClipData entries
         uint32_t morphClipCount;  // number of MorphClipData entries (0 = no morph; backward-compat)
-        // flags (bitmask):
-        //   bit 0 = positionsAreOffsets (VMD: positions are additive to rest pose)
-        //   bit 1 = rotationsAreOffsets (VMD: rotations compose with rest pose)
-        uint32_t flags;
+        uint32_t flags;           // see ANIM_FLAG_* below
         uint32_t reserved;
     };
+    constexpr uint32_t ANIM_FLAG_POS_OFFSETS  = 0x1; // VMD: positions additive to rest pose
+    constexpr uint32_t ANIM_FLAG_ROT_OFFSETS  = 0x2; // VMD: rotations compose with rest pose
+    constexpr uint32_t ANIM_FLAG_HAS_NOTIFIES = 0x4; // tail notify section present
 
     // .imorph — per-mesh morph target deltas (vertex blend shapes).
     // One .imorph file per mesh that has morph targets.

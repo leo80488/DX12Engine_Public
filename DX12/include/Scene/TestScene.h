@@ -1,6 +1,6 @@
 #pragma once
 
-// TestScene — default level: a thin gameplay-only IScene.
+// TestScene — default level: a thin gameplay-only IGameMode.
 //
 // Post-refactor (Option B):
 //   - World, ScriptSystem, PhysicsSystem, CameraSystem all live in App.
@@ -10,16 +10,16 @@
 //   - Shutdown clears the entities this scene spawned so popping the scene
 //     leaves the World empty for the next push.
 
-#include "Scene/IScene.h"
+#include "Scene/IGameMode.h"
 
 #include <vector>
 
-class TestScene : public IScene
+class TestScene : public IGameMode
 {
 public:
     const char* GetName() const override { return "TestScene"; }
 
-    void Init    (SceneContext* ctx) override;
+    void Init    (GameModeContext* ctx) override;
     void Update  (float dt) override;
     void Shutdown() override;
 

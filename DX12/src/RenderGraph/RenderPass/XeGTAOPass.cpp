@@ -54,7 +54,6 @@ static constexpr uint32_t kCBOffsetMain      = 0;
 static constexpr uint32_t kCBOffsetTemporal  = 256;
 static constexpr uint32_t kCBOffsetDenoise   = 512;
 static constexpr uint32_t kCBOffsetPrefilter = 768;  // prefilter[mip] at 768 + mip*256 (legacy: prefilter uses base only)
-static constexpr uint32_t kCBTotalSize       = 256 * 8;  // 1 main + 1 temporal + 1 denoise + 5 prefilter
 
 struct alignas(16) PrefilterCB
 {
@@ -97,12 +96,7 @@ void XeGTAOPass::Init(IGraphicsDevice& gfx)
     makeCS(ShaderID::XeGTAODepthLinearize_CS, m_prefilterPSO, "XeGTAODepthPrefilter_CS");
 
     // Shared CB — partitioned by byte offset per dispatch type (see kCBOffset*).
-    RHI::GPUBufferDesc bd{};
-    bd.size       = kCBTotalSize;
-    bd.usage      = RHI::Usage::UPLOAD;
-    bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-    if (gfx.CreateBuffer(bd, m_cb))
-        m_cbMapped = gfx.MapBuffer(m_cb);
+    m_cb.Create(gfx, "XeGTAO.CB");
 
     // ---- Hilbert LUT (64x64 R16_UINT, immutable) ---------------------------
     {
@@ -132,6 +126,32 @@ void XeGTAOPass::Init(IGraphicsDevice& gfx)
             m_hilbertLUTSrv = gfx.GetTextureSRVGpuHandle(m_hilbertLUT);
         else
             LOG_ERROR("XeGTAOPass: failed to create Hilbert LUT");
+    }
+
+    // ---- 1x1 zero-velocity fallback (R16G16_FLOAT) -------------------------
+    // Bound to the velocity slot (t4 space2, root 8) in the temporal pass when
+    // the GBuffer velocity SRV is absent — the shader reads gVelocity
+    // unconditionally, so leaving slot 8 unbound trips GPU-Based Validation
+    // "uninitialized root argument accessed". (0,0) velocity → zero reprojection.
+    {
+        const uint16_t zeroVel[2] = { 0, 0 }; // (0.0h, 0.0h)
+        RHI::TextureDesc td{};
+        td.width      = 1;
+        td.height     = 1;
+        td.format     = RHI::Format::R16G16_FLOAT;
+        td.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
+        td.usage      = RHI::Usage::DEFAULT;
+        td.layout     = RHI::ResourceState::SHADER_RESOURCE_COMPUTE;
+
+        RHI::SubresourceData sub{};
+        sub.data_ptr    = zeroVel;
+        sub.row_pitch   = sizeof(zeroVel);  // 4 bytes
+        sub.slice_pitch = sizeof(zeroVel);
+
+        if (gfx.CreateTexture(td, m_zeroVelocityTex, &sub))
+            m_zeroVelocitySrv = gfx.GetTextureSRVGpuHandle(m_zeroVelocityTex);
+        else
+            LOG_ERROR("XeGTAOPass: failed to create zero-velocity fallback");
     }
 
     LOG_SUCCESS("XeGTAOPass: initialized");
@@ -268,10 +288,13 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
     const float tanHalfFOVY = 1.0f / pm[1 * 4 + 1];
     const float tanHalfFOVX = 1.0f / pm[0 * 4 + 0];
 
+    auto* cbMapped = m_cb.Current(gfx);
+    const RHI::GPUBuffer& cbBuf = m_cb.CurrentBuffer(gfx);
+
     // ---- Fill ALL CBs up-front (different byte offsets in m_cb) ------------
-    if (m_cbMapped)
+    if (cbMapped)
     {
-        uint8_t* base = static_cast<uint8_t*>(m_cbMapped);
+        uint8_t* base = cbMapped->bytes;
 
         // Main GTAOConstants — offset 0.
         {
@@ -315,7 +338,8 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
             TemporalCB tc{};
             tc.viewportWidth  = m_vpW;
             tc.viewportHeight = m_vpH;
-            tc.historyAlpha   = m_historyValid ? temporalHistoryAlpha : 0.0f;
+            tc.historyAlpha   = (m_historyValid && m_externalHistoryValid)
+                                  ? temporalHistoryAlpha : 0.0f;
             tc.rejectionDiff  = temporalRejectionDiff;
             std::memcpy(base + kCBOffsetTemporal, &tc, sizeof(tc));
         }
@@ -367,7 +391,7 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
         }
 
         gfx.BindComputePipelineState(m_prefilterPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, kCBOffsetPrefilter, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, kCBOffsetPrefilter, cl);
         gfx.SetComputeDescriptorTable(kSRV0, m_depthSrvHandle, cl);
         // u0..u4 — one UAV per mip level.
         gfx.SetComputeDescriptorTable(kUAV0,
@@ -407,7 +431,7 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
         }
 
         gfx.BindComputePipelineState(m_mainPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, kCBOffsetMain, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, kCBOffsetMain, cl);
         gfx.SetComputeDescriptorTable(kSRV0,
             gfx.GetTextureSRVGpuHandle(m_linearDepth), cl);
         if (m_normalSrvHandle)
@@ -450,7 +474,7 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
         }
 
         gfx.BindComputePipelineState(m_denoisePSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, kCBOffsetDenoise, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, kCBOffsetDenoise, cl);
         gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_aoRaw), cl);
         gfx.SetComputeDescriptorTable(kSRV1, gfx.GetTextureSRVGpuHandle(m_edges), cl);
         gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_aoFinal), cl);
@@ -527,7 +551,7 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
         // post-barrier (see above); no transition needed.
 
         gfx.BindComputePipelineState(m_temporalPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cb, kCBOffsetTemporal, cl);
+        gfx.SetComputeRootCBV(kCBSlot, cbBuf, kCBOffsetTemporal, cl);
         // t0 space2 = denoised AO (was raw AO before the reorder).
         gfx.SetComputeDescriptorTable(kSRV0, gfx.GetTextureSRVGpuHandle(m_aoFinal), cl);
         // t1 space2 = packed edge mask — drives α modulation in the shader.
@@ -538,10 +562,12 @@ void XeGTAOPass::Execute(RHI::CommandList cl)
         gfx.SetComputeDescriptorTable(/*t3 slot*/ 7,
             gfx.GetTextureSRVGpuHandle(m_prevLinearDepth[readIdx]), cl);
         // Velocity → root slot 8 = t4 space2. Engine-wide convention (TAA
-        // uses the same slot); keeps bindings legible when multiple compute
-        // passes read GBuffer velocity.
-        if (m_velocitySrvHandle)
-            gfx.SetComputeDescriptorTable(/*velocity slot*/ 8, m_velocitySrvHandle, cl);
+        // uses the same slot). The shader reads gVelocity UNCONDITIONALLY, so
+        // bind the zero-velocity fallback when no GBuffer velocity SRV exists —
+        // otherwise slot 8 is left uninitialized (GPU-Based Validation error
+        // every frame) and zero velocity correctly degrades to no reprojection.
+        gfx.SetComputeDescriptorTable(/*velocity slot*/ 8,
+            m_velocitySrvHandle ? m_velocitySrvHandle : m_zeroVelocitySrv, cl);
         // t5 space2 (root slot 6) = current-frame linearised depth pyramid.
         // Shader reads mip 0 via Load(int3(px, 0)) — the slot is morph-weights
         // in SceneVoxelize.cs but legal to repurpose (the runtime only

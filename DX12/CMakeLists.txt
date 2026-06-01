@@ -1,8 +1,14 @@
 # =============================================================================
-# DX12/CMakeLists.txt — actual target definitions.
+# DX12/CMakeLists.txt — target definitions.
 #
-# All paths in this file are relative to DX12/, so they line up 1:1 with the
-# existing .vcxproj source lists. CMake invocation lives at the project root.
+# Source lists are discovered with file(GLOB_RECURSE ... CONFIGURE_DEPENDS) so
+# that adding/removing a .cpp under src/ is picked up on the next build without
+# editing this file. The few files that must NOT land in EngineCore (app entry
+# points, editor-only tooling, per-target scenes, and superseded duplicates) are
+# filtered out explicitly and documented below.
+#
+# All paths are relative to DX12/, so they line up 1:1 with the source tree.
+# The CMake invocation itself lives at the project root.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -17,29 +23,40 @@ set(ENGINE_ASSETS   "${ENGINE_ROOT}/asset")
 
 # Note: the source tree contains a typo — "Resoruce" (not "Resource"). The
 # directory on disk really is src/Resoruce/, while headers live in include/Resource/.
-# Keep using src/Resoruce/ here so we match the .vcxproj exactly.
+# Keep using src/Resoruce/ here so we match the tree exactly.
+
+# -----------------------------------------------------------------------------
+# Small helper for the config-dependent prebuilt static libs shipped in external/
+# (separate Debug / Release .lib, with a single public include directory).
+# -----------------------------------------------------------------------------
+function(engine_import_static tgt dbg rel inc)
+    add_library(${tgt} STATIC IMPORTED GLOBAL)
+    set_target_properties(${tgt} PROPERTIES
+        IMPORTED_LOCATION_DEBUG          "${dbg}"
+        IMPORTED_LOCATION_RELEASE        "${rel}"
+        IMPORTED_LOCATION_RELWITHDEBINFO "${rel}"
+        IMPORTED_LOCATION_MINSIZEREL     "${rel}"
+        INTERFACE_INCLUDE_DIRECTORIES    "${inc}"
+    )
+endfunction()
 
 # =============================================================================
 # Third-party imported targets.
 #
-# All libs are prebuilt in external/<lib>/lib/ and shipped with the repo, except
+# Everything is prebuilt under external/<lib>/ and shipped with the repo, except
 # Assimp which comes from vcpkg.
 # =============================================================================
 
 # ----- Assimp (vcpkg) --------------------------------------------------------
 find_package(assimp CONFIG REQUIRED)
 
-# ----- DirectXTex (configuration-dependent prebuilt static lib) --------------
-add_library(dx12engine::DirectXTex STATIC IMPORTED GLOBAL)
-set_target_properties(dx12engine::DirectXTex PROPERTIES
-    IMPORTED_LOCATION_DEBUG          "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Debug.lib"
-    IMPORTED_LOCATION_RELEASE        "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Release.lib"
-    IMPORTED_LOCATION_RELWITHDEBINFO "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Release.lib"
-    IMPORTED_LOCATION_MINSIZEREL     "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Release.lib"
-    INTERFACE_INCLUDE_DIRECTORIES    "${ENGINE_EXTERNAL}/DirectXTex"
-)
+# ----- DirectXTex (config-dependent prebuilt static lib) ---------------------
+engine_import_static(dx12engine::DirectXTex
+    "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Debug.lib"
+    "${ENGINE_EXTERNAL}/DirectXTex/lib/DirectXTex_Release.lib"
+    "${ENGINE_EXTERNAL}/DirectXTex")
 
-# ----- Jolt (configuration-dependent prebuilt static lib) --------------------
+# ----- Jolt (config-dependent prebuilt static lib + compile defs) ------------
 add_library(dx12engine::Jolt STATIC IMPORTED GLOBAL)
 set_target_properties(dx12engine::Jolt PROPERTIES
     IMPORTED_LOCATION_DEBUG          "${ENGINE_EXTERNAL}/Jolt/lib/Jolt_Debug.lib"
@@ -69,6 +86,53 @@ set_target_properties(dx12engine::FreeType PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${ENGINE_EXTERNAL}/FreeType/include"
 )
 
+# ----- meshoptimizer (config-dependent prebuilt static lib) ------------------
+# Used by the collision-mesh baker (mesh simplify / optimize).
+engine_import_static(dx12engine::meshoptimizer
+    "${ENGINE_EXTERNAL}/meshoptimizer/Debug/meshoptimizer_debug.lib"
+    "${ENGINE_EXTERNAL}/meshoptimizer/Release/meshoptimizer_release.lib"
+    "${ENGINE_EXTERNAL}/meshoptimizer")
+
+# ----- Recast / Detour navigation (config-dependent prebuilt static libs) ----
+# Recast (navmesh bake) + Detour (query) + crowd + tile-cache.
+engine_import_static(dx12engine::Recast
+    "${ENGINE_EXTERNAL}/recastnavigation/Recast/Debug/Recast-d.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/Recast/Release/Recast.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/Recast/Include")
+engine_import_static(dx12engine::Detour
+    "${ENGINE_EXTERNAL}/recastnavigation/Detour/Debug/Detour-d.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/Detour/Release/Detour.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/Detour/Include")
+engine_import_static(dx12engine::DetourCrowd
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourCrowd/Debug/DetourCrowd-d.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourCrowd/Release/DetourCrowd.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourCrowd/Include")
+engine_import_static(dx12engine::DetourTileCache
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourTileCache/Debug/DetourTileCache-d.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourTileCache/Release/DetourTileCache.lib"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourTileCache/Include")
+add_library(dx12engine::Recastnavigation INTERFACE IMPORTED GLOBAL)
+set_target_properties(dx12engine::Recastnavigation PROPERTIES
+    INTERFACE_LINK_LIBRARIES "dx12engine::Recast;dx12engine::Detour;dx12engine::DetourCrowd;dx12engine::DetourTileCache"
+)
+
+# ----- FFmpeg (import libs + version-suffixed runtime DLLs) ------------------
+# Video subsystem: hardware (D3D12VA) decode via libav* + scaling via swscale.
+add_library(dx12engine::FFmpeg INTERFACE IMPORTED GLOBAL)
+set_target_properties(dx12engine::FFmpeg PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${ENGINE_EXTERNAL}/ffmpeg/include"
+    INTERFACE_LINK_LIBRARIES
+        "${ENGINE_EXTERNAL}/ffmpeg/lib/avcodec.lib;${ENGINE_EXTERNAL}/ffmpeg/lib/avformat.lib;${ENGINE_EXTERNAL}/ffmpeg/lib/avutil.lib;${ENGINE_EXTERNAL}/ffmpeg/lib/swscale.lib"
+)
+# Runtime DLLs live next to the engine working dir (DX12/); copy them by the engine.
+set(FFMPEG_RUNTIME_DLLS
+    "${ENGINE_ROOT}/avcodec-62.dll"
+    "${ENGINE_ROOT}/avformat-62.dll"
+    "${ENGINE_ROOT}/avutil-60.dll"
+    "${ENGINE_ROOT}/swresample-6.dll"   # transitive dependency of avcodec
+    "${ENGINE_ROOT}/swscale-9.dll"
+)
+
 # ----- DirectX 12 (system libs + Agility-style headers under external/DirectX12) -----
 add_library(dx12engine::DirectX12 INTERFACE IMPORTED GLOBAL)
 set_target_properties(dx12engine::DirectX12 PROPERTIES
@@ -78,199 +142,47 @@ set_target_properties(dx12engine::DirectX12 PROPERTIES
 
 # =============================================================================
 # EngineCore.lib — engine static library.
+#
+# Discovered by globbing src/**/*.cpp, then filtering out the files that belong
+# to a specific .exe target or are superseded duplicates.
 # =============================================================================
-set(ENGINECORE_SOURCES
-    # PCH (CMake auto-generates the create-side; we only list user .cpp here)
+file(GLOB_RECURSE ENGINECORE_SOURCES CONFIGURE_DEPENDS "${ENGINE_SRC}/*.cpp")
 
-    # Top-level
-    "${ENGINE_SRC}/SceneSerialization.cpp"
-
-    # AI
-    "${ENGINE_SRC}/AI/ActionRegistry.cpp"
-    "${ENGINE_SRC}/AI/AILODSystem.cpp"
-    "${ENGINE_SRC}/AI/AISystem.cpp"
-    "${ENGINE_SRC}/AI/BTAsset.cpp"
-    "${ENGINE_SRC}/AI/BTNodes.cpp"
-    "${ENGINE_SRC}/AI/LuaBTBindings.cpp"
-
-    # Audio
-    "${ENGINE_SRC}/Audio/Audio3DSystem.cpp"
-    "${ENGINE_SRC}/Audio/AudioClipLoader.cpp"
-    "${ENGINE_SRC}/Audio/AudioClipSystem.cpp"
-    "${ENGINE_SRC}/Audio/AudioEngine.cpp"
-    "${ENGINE_SRC}/Audio/AudioImporter.cpp"
-    "${ENGINE_SRC}/Audio/AudioSystem.cpp"
-
-    # ECS
-    "${ENGINE_SRC}/ECS/AnimationSystem.cpp"
-    "${ENGINE_SRC}/ECS/CameraSystem.cpp"
-    "${ENGINE_SRC}/ECS/CommandAPI.cpp"
-    "${ENGINE_SRC}/ECS/Components.cpp"
-    "${ENGINE_SRC}/ECS/DecalSpawner.cpp"
-    "${ENGINE_SRC}/ECS/DecalSystem.cpp"
-    "${ENGINE_SRC}/ECS/ECS.cpp"
-    "${ENGINE_SRC}/ECS/FollowSystem.cpp"
-    "${ENGINE_SRC}/ECS/IKSystem.cpp"
-    "${ENGINE_SRC}/ECS/MaterialReflectionSync.cpp"
-    "${ENGINE_SRC}/ECS/SocketSystem.cpp"
-
-    # Graphics
-    "${ENGINE_SRC}/Graphics/BeamSystem.cpp"
-    "${ENGINE_SRC}/Graphics/DDGISceneAS.cpp"
-    "${ENGINE_SRC}/Graphics/DDGIVolumeManager.cpp"
-    "${ENGINE_SRC}/Graphics/DescriptorHeapAllocator.cpp"
-    "${ENGINE_SRC}/Graphics/DxcCompiler.cpp"
-    "${ENGINE_SRC}/Graphics/GPUProfiler.cpp"
-    "${ENGINE_SRC}/Graphics/Graphics.cpp"
-    "${ENGINE_SRC}/Graphics/GraphicsDX12.cpp"
-    "${ENGINE_SRC}/Graphics/MaterialCBVRing.cpp"
-    "${ENGINE_SRC}/Graphics/MaterialSRVRing.cpp"
-    "${ENGINE_SRC}/Graphics/MeshDescriptorHeap.cpp"
-    "${ENGINE_SRC}/Graphics/MeshManager.cpp"
-    "${ENGINE_SRC}/Graphics/ParticleSystem.cpp"
-    "${ENGINE_SRC}/Graphics/PSOCache.cpp"
-    "${ENGINE_SRC}/Graphics/Raytracing.cpp"
-    "${ENGINE_SRC}/Graphics/ReflectionProbeManager.cpp"
-    "${ENGINE_SRC}/Graphics/Renderer.cpp"
-    "${ENGINE_SRC}/Graphics/RHICommandList.cpp"
-    "${ENGINE_SRC}/Graphics/SceneBVH.cpp"
-    "${ENGINE_SRC}/Graphics/ShaderLibrary.cpp"
-    "${ENGINE_SRC}/Graphics/ShaderReflection.cpp"
-    "${ENGINE_SRC}/Graphics/ShadingModel.cpp"
-    "${ENGINE_SRC}/Graphics/ShadowFrustumCompute.cpp"
-    "${ENGINE_SRC}/Graphics/ShadowSystem.cpp"
-    "${ENGINE_SRC}/Graphics/SkinnedMeshSubsystem.cpp"
-    "${ENGINE_SRC}/Graphics/SkinningBuffers.cpp"
-    "${ENGINE_SRC}/Graphics/TracerSystem.cpp"
-    "${ENGINE_SRC}/Graphics/TrailSystem.cpp"
-
-    # Physics
-    "${ENGINE_SRC}/Physics/ChainPhysicsSystem.cpp"
-    "${ENGINE_SRC}/Physics/PhysicsSystem.cpp"
-
-    # PostProcess
-    "${ENGINE_SRC}/PostProcess/BuiltinPostProcessEffects.cpp"
-    "${ENGINE_SRC}/PostProcess/EntityVolumeSource.cpp"
-    "${ENGINE_SRC}/PostProcess/ParameterBlender.cpp"
-    "${ENGINE_SRC}/PostProcess/PostProcessStack.cpp"
-    "${ENGINE_SRC}/PostProcess/ScriptedOverride.cpp"
-    "${ENGINE_SRC}/PostProcess/VolumeSystem.cpp"
-
-    # RenderGraph + RenderPass (27 passes)
-    "${ENGINE_SRC}/RenderGraph/RenderContext.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderGraph.cpp"
-    "${ENGINE_SRC}/RenderGraph/TestTrianglePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/AutoExposurePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/BeamSimPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/BloomPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/CASPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/ClusterPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/CullingPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/DDGIPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/DDGIProbeDebugPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/DebugWirePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/DecalPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/GBufferPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/GlassShatterPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/HiZPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/LensFlarePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/LightingPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/OutlinePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/ParticlePasses.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/PickingPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/ReflectionProbeCapturePass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SceneColorPyramidPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SceneVoxelPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/ShadowPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SkinningPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SkyboxPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SkyIBLPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SpotShadowPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SSRDepthHierarchyPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/SSRPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/TAAPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/TerrainPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/ToneMapPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/TracerPasses.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/TrailPasses.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/TransparentPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/UIPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/VolumetricFogPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/WorldUIBillboardPass.cpp"
-    "${ENGINE_SRC}/RenderGraph/RenderPass/XeGTAOPass.cpp"
-
-    # Resoruce  [sic — directory name on disk really is "Resoruce"]
-    "${ENGINE_SRC}/Resoruce/AnimationClipSystem.cpp"
-    "${ENGINE_SRC}/Resoruce/AnimationLoader.cpp"
-    "${ENGINE_SRC}/Resoruce/AssetFS.cpp"
-    "${ENGINE_SRC}/Resoruce/AssetManager.cpp"
-    "${ENGINE_SRC}/Resoruce/BCCompressor.cpp"
-    "${ENGINE_SRC}/Resoruce/ComponentSerializers.cpp"
-    "${ENGINE_SRC}/Resoruce/DDSTextureLoader.cpp"
-    "${ENGINE_SRC}/Resoruce/DecalMaterialAsset.cpp"
-    "${ENGINE_SRC}/Resoruce/DecalMaterialLibrary.cpp"
-    "${ENGINE_SRC}/Resoruce/DecalMaterialSerializer.cpp"
-    "${ENGINE_SRC}/Resoruce/MaterialLoader.cpp"
-    "${ENGINE_SRC}/Resoruce/MaterialSerializer.cpp"
-    "${ENGINE_SRC}/Resoruce/MaterialSystem.cpp"
-    "${ENGINE_SRC}/Resoruce/MeshLibrary.cpp"
-    "${ENGINE_SRC}/Resoruce/MeshSystem.cpp"
-    "${ENGINE_SRC}/Resoruce/PostProcessConfig.cpp"
-    "${ENGINE_SRC}/Resoruce/PrefabSerializer.cpp"
-    "${ENGINE_SRC}/Resoruce/ProceduralMesh.cpp"
-    "${ENGINE_SRC}/Resoruce/ResourceManager.cpp"
-    "${ENGINE_SRC}/Resoruce/ShaderLoader.cpp"
-    "${ENGINE_SRC}/Resoruce/TextureLoader.cpp"
-    "${ENGINE_SRC}/Resoruce/TextureSystem.cpp"
-    "${ENGINE_SRC}/Resoruce/WorldSerializer.cpp"
-
-    # Scene
-    "${ENGINE_SRC}/Scene/EndScene.cpp"
-    "${ENGINE_SRC}/Scene/GameScene.cpp"
-    "${ENGINE_SRC}/Scene/MeshSpawner.cpp"
-    "${ENGINE_SRC}/Scene/Ray.cpp"
-    "${ENGINE_SRC}/Scene/SceneInstanceLoader.cpp"
-    "${ENGINE_SRC}/Scene/SceneManager.cpp"
-    "${ENGINE_SRC}/Scene/TestScene.cpp"
-    "${ENGINE_SRC}/Scene/TitleScene.cpp"
-    "${ENGINE_SRC}/Scene/TransformSystem.cpp"
-
-    # Scripting
-    "${ENGINE_SRC}/Scripting/ScriptSystem.cpp"
-
-    # System
-    "${ENGINE_SRC}/System/Exception_handle.cpp"
-    "${ENGINE_SRC}/System/FileWatcher.cpp"
-    "${ENGINE_SRC}/System/Keyboard.cpp"
-    "${ENGINE_SRC}/System/Log.cpp"
-    "${ENGINE_SRC}/System/Mouse.cpp"
-    "${ENGINE_SRC}/System/TaskSystem.cpp"
-    "${ENGINE_SRC}/System/Timer.cpp"
-    "${ENGINE_SRC}/System/Window.cpp"
-
-    # UI
-    "${ENGINE_SRC}/UI/BasicWidgets.cpp"
-    "${ENGINE_SRC}/UI/Font.cpp"
-    "${ENGINE_SRC}/UI/LuaUIBindings.cpp"
-    "${ENGINE_SRC}/UI/Tween.cpp"
-    "${ENGINE_SRC}/UI/UIDrawList.cpp"
-    "${ENGINE_SRC}/UI/UISystem.cpp"
-    "${ENGINE_SRC}/UI/Widget.cpp"
-    "${ENGINE_SRC}/UI/WidgetRegistry.cpp"
-    "${ENGINE_SRC}/UI/WorldSpaceUISystem.cpp"
-
-    # Lua (compiled as C, no PCH)
-    "${ENGINE_EXTERNAL}/lua/onelua.c"
+# (1) App entry points + PCH stub — compiled per-exe / auto-generated by CMake.
+list(REMOVE_ITEM ENGINECORE_SOURCES
+    "${ENGINE_SRC}/main.cpp"
+    "${ENGINE_SRC}/App.cpp"
+    "${ENGINE_SRC}/pch.cpp"
 )
+# (2) Editor / ShaderLab-only sources (need ImGui + WITH_EDITOR) — added per-exe.
+list(REMOVE_ITEM ENGINECORE_SOURCES
+    "${ENGINE_SRC}/Reflection/ReflectionEditor.cpp"
+    "${ENGINE_SRC}/Scene/ShaderLabScene.cpp"   # ShaderLab.exe only
+    "${ENGINE_SRC}/Scene/NPRRampEditor.cpp"    # ShaderLab.exe only
+)
+list(FILTER ENGINECORE_SOURCES EXCLUDE REGEX "/src/Editor/")                 # all editor windows
+list(FILTER ENGINECORE_SOURCES EXCLUDE REGEX "/src/Resoruce/[^/]*Importer\\.cpp$")  # offline cookers (editor only)
+# (3) Game.exe-only source.
+list(REMOVE_ITEM ENGINECORE_SOURCES "${ENGINE_SRC}/Resoruce/SkeletonGrantTable.cpp")
+# (4) Superseded duplicates — the old monolithic SSR passes were replaced by the
+#     src/Graphics/SSR/ subsystem; compiling both would be a duplicate-symbol error.
+list(REMOVE_ITEM ENGINECORE_SOURCES
+    "${ENGINE_SRC}/RenderGraph/RenderPass/SSRPass.cpp"
+    "${ENGINE_SRC}/RenderGraph/RenderPass/SSRDepthHierarchyPass.cpp"
+    "${ENGINE_SRC}/RenderGraph/RenderPass/SceneColorPyramidPass.cpp"
+)
+# Lua amalgamation (compiled as C, no PCH).
+list(APPEND ENGINECORE_SOURCES "${ENGINE_EXTERNAL}/lua/onelua.c")
 
 add_library(EngineCore STATIC ${ENGINECORE_SOURCES})
 
 target_include_directories(EngineCore PUBLIC
     "${ENGINE_INCLUDE}"
-    "${ENGINE_EXTERNAL}"
+    "${ENGINE_EXTERNAL}"                 # nlohmann/json.hpp, DirectX12, Jolt root, ...
     "${ENGINE_EXTERNAL}/imgui"
     "${ENGINE_EXTERNAL}/lua"
     "${ENGINE_EXTERNAL}/sol2/include"
+    "${ENGINE_EXTERNAL}/ffmpeg/include"
 )
 target_include_directories(EngineCore PRIVATE
     "${ENGINE_EXTERNAL}/FreeType/include"
@@ -295,7 +207,7 @@ target_compile_options(EngineCore PUBLIC
     /permissive-   # ConformanceMode=true
 )
 
-# PCH — auto-generated by CMake from include/pch.h, mirrors the .vcxproj.
+# PCH — auto-generated by CMake from include/pch.h (mirrors src/pch.cpp).
 target_precompile_headers(EngineCore PRIVATE "${ENGINE_INCLUDE}/pch.h")
 
 # Lua's onelua.c is C and must NOT consume the C++ PCH.
@@ -311,16 +223,61 @@ target_link_libraries(EngineCore PUBLIC
     dx12engine::Jolt
     dx12engine::Dxc
     dx12engine::FreeType
+    dx12engine::meshoptimizer
+    dx12engine::Recastnavigation
+    dx12engine::FFmpeg
     assimp::assimp
-    # XAudio2 / X3DAudio (Windows SDK)
-    xaudio2
+    xaudio2            # XAudio2 / X3DAudio (Windows SDK)
 )
+
+# -----------------------------------------------------------------------------
+# Linker search paths for #pragma comment(lib, "...") directives.
+#
+# A lot of the engine declares its own link deps inline via bare-name pragmas
+# (DirectXTex_Release.lib, avformat.lib, Recast.lib, meshoptimizer_release.lib,
+# assimp-vc143-mt.lib, ...). Those /DEFAULTLIB directives only resolve if the
+# containing folder is on the linker search path, so mirror the .vcxproj's
+# AdditionalLibraryDirectories here. System pragmas (d3d11, Shcore, shell32,
+# comdlg32, xaudio2, d3d12, ...) resolve from the Windows SDK path automatically.
+# PUBLIC so the dirs propagate to the Editor / Game / ShaderLab link lines too
+# (the editor-only importers pragma-link assimp).
+# -----------------------------------------------------------------------------
+target_link_directories(EngineCore PUBLIC
+    "${ENGINE_EXTERNAL}/Jolt/lib"
+    "${ENGINE_EXTERNAL}/dxc/lib"
+    "${ENGINE_EXTERNAL}/FreeType/lib"
+    "${ENGINE_EXTERNAL}/DirectXTex/lib"
+    "${ENGINE_EXTERNAL}/ffmpeg/lib"
+    "${ENGINE_EXTERNAL}/meshoptimizer/Debug"
+    "${ENGINE_EXTERNAL}/meshoptimizer/Release"
+    "${ENGINE_EXTERNAL}/recastnavigation/Recast/Debug"
+    "${ENGINE_EXTERNAL}/recastnavigation/Recast/Release"
+    "${ENGINE_EXTERNAL}/recastnavigation/Detour/Debug"
+    "${ENGINE_EXTERNAL}/recastnavigation/Detour/Release"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourCrowd/Debug"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourCrowd/Release"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourTileCache/Debug"
+    "${ENGINE_EXTERNAL}/recastnavigation/DetourTileCache/Release"
+)
+
+# Assimp comes from vcpkg, so add its installed lib dir(s) to the search path as
+# well (the editor importers pragma-link assimp by bare name).
+get_target_property(_assimp_cfgs assimp::assimp IMPORTED_CONFIGURATIONS)
+if(_assimp_cfgs)
+    foreach(_cfg IN LISTS _assimp_cfgs)
+        get_target_property(_assimp_loc assimp::assimp IMPORTED_LOCATION_${_cfg})
+        if(_assimp_loc)
+            get_filename_component(_assimp_dir "${_assimp_loc}" DIRECTORY)
+            target_link_directories(EngineCore PUBLIC "${_assimp_dir}")
+        endif()
+    endforeach()
+endif()
 
 # Group sources nicely in the VS solution generated by CMake.
 source_group(TREE "${ENGINE_ROOT}" PREFIX "Source Files" FILES ${ENGINECORE_SOURCES})
 
 # =============================================================================
-# Editor / Game / ShaderLab — shared editor source list helper.
+# Editor / Game / ShaderLab — shared source helpers.
 # =============================================================================
 set(IMGUI_SOURCES
     "${ENGINE_EXTERNAL}/imgui/imgui.cpp"
@@ -333,27 +290,17 @@ set(IMGUI_SOURCES
     "${ENGINE_EXTERNAL}/imgui/ImGuizmo/ImGuizmo.cpp"
 )
 
-# Sources that Editor and ShaderLab both need (importers, EditorLayer, imgui).
+# Sources that Editor and ShaderLab both need: editor windows, the reflection
+# inspector, the offline asset importers, and imgui. Globbed so new editor
+# windows / importers are picked up automatically.
+file(GLOB EDITOR_WINDOW_SOURCES CONFIGURE_DEPENDS "${ENGINE_SRC}/Editor/*.cpp")
+file(GLOB IMPORTER_SOURCES      CONFIGURE_DEPENDS "${ENGINE_SRC}/Resoruce/*Importer.cpp")
 set(EDITOR_SHARED_SOURCES
     "${ENGINE_SRC}/main.cpp"
     "${ENGINE_SRC}/App.cpp"
-    "${ENGINE_SRC}/Editor/AnimationDebugWindow.cpp"
-    "${ENGINE_SRC}/Editor/EditorLayer.cpp"
-    "${ENGINE_SRC}/Editor/FontEditorWindow.cpp"
-    "${ENGINE_SRC}/Editor/ImGuiManager.cpp"
-    "${ENGINE_SRC}/Editor/SSRDebugWindow.cpp"
-    "${ENGINE_SRC}/Editor/TimelineEditor.cpp"
     "${ENGINE_SRC}/Reflection/ReflectionEditor.cpp"
-    "${ENGINE_SRC}/Resoruce/AnimationImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/MaterialImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/MeshImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/PmxImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/SceneImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/ShaderImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/SkeletonImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/TextureImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/VmdImporter.cpp"
-    "${ENGINE_SRC}/Resoruce/VrmImporter.cpp"
+    ${EDITOR_WINDOW_SOURCES}
+    ${IMPORTER_SOURCES}
     ${IMGUI_SOURCES}
 )
 
@@ -370,39 +317,37 @@ function(engine_configure_app target_name)
     # PCH — each .exe compiles its own pch since defines differ.
     target_precompile_headers(${target_name} PRIVATE "${ENGINE_INCLUDE}/pch.h")
 
-    # Copy DXC runtime DLLs next to the exe (engine compiles HLSL via DXC at runtime).
+    # Copy DXC runtime DLLs (engine compiles HLSL via DXC at runtime).
     add_custom_command(TARGET ${target_name} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 ${DXC_RUNTIME_DLLS}
                 $<TARGET_FILE_DIR:${target_name}>
-        COMMAND_EXPAND_LISTS
-        VERBATIM
-    )
+        COMMAND_EXPAND_LISTS VERBATIM)
+
+    # Copy FFmpeg runtime DLLs (video subsystem).
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${FFMPEG_RUNTIME_DLLS}
+                $<TARGET_FILE_DIR:${target_name}>
+        COMMAND_EXPAND_LISTS VERBATIM)
 
     # Copy Assimp + any other linked-lib runtime DLLs (vcpkg builds dynamic Assimp).
     add_custom_command(TARGET ${target_name} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 $<TARGET_RUNTIME_DLLS:${target_name}>
                 $<TARGET_FILE_DIR:${target_name}>
-        COMMAND_EXPAND_LISTS
-        VERBATIM
-    )
+        COMMAND_EXPAND_LISTS VERBATIM)
 
     # When launching from Visual Studio, run from DX12/ so the engine finds
-    # shaders/ and asset/ relative to cwd (matches the .vcxproj convention).
+    # shaders/ and asset/ relative to cwd.
     set_target_properties(${target_name} PROPERTIES
-        VS_DEBUGGER_WORKING_DIRECTORY "${ENGINE_ROOT}"
-    )
+        VS_DEBUGGER_WORKING_DIRECTORY "${ENGINE_ROOT}")
 endfunction()
 
-# Sources brought in by editor-mode builds must NOT inherit the EngineCore PCH
-# (imgui has its own conventions; CMake's per-target PCH already excludes them
-# via SKIP_PRECOMPILE_HEADERS below).
-function(engine_skip_pch_for_imgui)
-    foreach(src IN LISTS IMGUI_SOURCES)
-        set_source_files_properties(${src} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
-    endforeach()
-endfunction()
+# imgui sources keep their own conventions — never inherit the engine PCH.
+foreach(src IN LISTS IMGUI_SOURCES)
+    set_source_files_properties(${src} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
+endforeach()
 
 # -----------------------------------------------------------------------------
 # Editor.exe
@@ -413,8 +358,7 @@ if(ENGINE_BUILD_EDITOR)
     target_compile_definitions(Editor PRIVATE WITH_EDITOR)
     set_source_files_properties(${IMGUI_SOURCES}
         TARGET_DIRECTORY Editor
-        PROPERTIES SKIP_PRECOMPILE_HEADERS ON
-    )
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 # -----------------------------------------------------------------------------
@@ -442,8 +386,7 @@ if(ENGINE_BUILD_SHADERLAB)
     target_compile_definitions(ShaderLab PRIVATE WITH_EDITOR WITH_SHADERLAB)
     set_source_files_properties(${IMGUI_SOURCES}
         TARGET_DIRECTORY ShaderLab
-        PROPERTIES SKIP_PRECOMPILE_HEADERS ON
-    )
+        PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 endif()
 
 # Default startup project when CMake generates a .sln.
@@ -456,21 +399,17 @@ endif()
 # =============================================================================
 include(GNUInstallDirs)
 
-# Binaries → install/bin/<exe> (top-level ZIP root via CPACK_INCLUDE_TOPLEVEL_DIRECTORY).
 foreach(app IN ITEMS Editor Game ShaderLab)
     if(TARGET ${app})
         install(TARGETS ${app} RUNTIME DESTINATION ".")
-        # Also install dependent runtime DLLs (DXC, Assimp, ...).
         install(FILES $<TARGET_RUNTIME_DLLS:${app}>
-                DESTINATION "."
-                COMPONENT Runtime)
+                DESTINATION "." COMPONENT Runtime)
     endif()
 endforeach()
 
-# DXC runtime — bundle dxcompiler.dll + dxil.dll explicitly (DXC is loaded via
-# IMPORTED SHARED but $<TARGET_RUNTIME_DLLS> needs CMake to know the right
-# IMPORTED_LOCATION; pasting the files directly is unambiguous).
-install(FILES ${DXC_RUNTIME_DLLS} DESTINATION ".")
+# DXC + FFmpeg runtime — bundle explicitly (loaded via IMPORTED SHARED / plain files).
+install(FILES ${DXC_RUNTIME_DLLS}    DESTINATION ".")
+install(FILES ${FFMPEG_RUNTIME_DLLS} DESTINATION ".")
 
 # Shaders — runtime DXC compile expects them under cwd/shaders/.
 install(DIRECTORY "${ENGINE_SHADERS}/"
@@ -481,14 +420,13 @@ install(DIRECTORY "${ENGINE_SHADERS}/"
             PATTERN "shader_cache_dxil" EXCLUDE
 )
 
-# Lua scripts.
+# Lua scripts + AI behavior trees.
 install(DIRECTORY "${ENGINE_ASSETS}/scripts" DESTINATION "asset")
 install(DIRECTORY "${ENGINE_ASSETS}/ai"      DESTINATION "asset")
 
-# Assets — large; gated by option so the ZIP can stay small for CI / source-only releases.
+# Assets — large; gated by option so the ZIP can stay small for source-only releases.
 if(ENGINE_PACKAGE_ASSETS)
     install(DIRECTORY "${ENGINE_ASSETS}/"
             DESTINATION "asset"
-            PATTERN "scenes" EXCLUDE     # editor-temporary
-    )
+            PATTERN "scenes" EXCLUDE)     # editor-temporary
 endif()

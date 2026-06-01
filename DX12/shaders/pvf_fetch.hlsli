@@ -4,7 +4,7 @@
 // Provides format-dispatching helpers and the bindless ByteAddressBuffer array.
 //
 // Register layout (must match GraphicsDX12.cpp root signature):
-//   g_Buffers[] : register(t0, space1)  — bindless ByteAddressBuffer table (64 slots)
+//   g_Buffers[] : register(t0, space1)  — bindless ByteAddressBuffer table (16384 slots)
 
 #ifndef PVF_FETCH_HLSLI
 #define PVF_FETCH_HLSLI
@@ -19,7 +19,7 @@
 #define INVALID_BUFFER  0xFFFFFFFFu
 
 // ---- Bindless buffer array --------------------------------------------------
-ByteAddressBuffer g_Buffers[4096] : register(t0, space1);
+ByteAddressBuffer g_Buffers[16384] : register(t0, space1);
 
 // ---- HLSL MeshDescriptor structs (must exactly match C++ RHI::MeshDescriptor / 96 bytes) ---
 

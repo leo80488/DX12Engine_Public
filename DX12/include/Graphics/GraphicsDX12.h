@@ -8,7 +8,7 @@
 //   [8]    ROOT_SRV       t0 space0           → SetRootBufferSRV (InstanceBuffer)
 //   [9]    ROOT_SRV       t1 space0           → SetRootBufferSRV (MeshDescriptors)
 //   [10..13] DESC_TABLE   1 SRV t2-t5 space0 → BindResource(slot 0-3)
-//   [14]   DESC_TABLE     64 SRV t0 space1    → bindless g_Buffers[]
+//   [14]   DESC_TABLE     16384 SRV t0 space1 → bindless g_Buffers[] (kMaxBindlessBuffers)
 //   [15..18] DESC_TABLE   1 sampler s0-s3     → BindSampler(slot 0-3)
 //
 // Compute root signature layout (space2):
@@ -74,6 +74,11 @@
 #else
 #pragma comment(lib, "DirectXTex_Release.lib")
 #endif
+
+// ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+namespace RHI::DX12 { class VideoDecoderDX12; }
 
 // ---------------------------------------------------------------------------
 // ThrowIfFailed helper (used by GraphicsDX12 and RenderPass implementations)
@@ -177,12 +182,20 @@ public:
     // =========================================================================
     // IGraphicsDevice — frame lifecycle
     // =========================================================================
+    void             WaitForNextFrameSlot() override;
     RHI::CommandList BeginFrame() override;
     void             EndFrame()   override;
     void             FlushAndWait() override;
+    void             WaitIdleAndReleaseDeferred() override { WaitForPreviousFrame(); }
     bool             CaptureTextureToPNG(const RHI::Texture& tex,
                                          RHI::ResourceState  currentState,
                                          const char*         path) override;
+
+    // Lazy: first call constructs the DX12 video backend (QIs ID3D12VideoDevice,
+    // spins up the video queue/fence). Returns nullptr when the driver does
+    // not expose ID3D12VideoDevice or queue creation fails — callers should
+    // gracefully fall back to no-video.
+    RHI::IVideoDecoderBackend* GetVideoBackend() override;
 
     // =========================================================================
     // IGraphicsDevice — command list management
@@ -215,6 +228,10 @@ public:
     uint32_t GetHeight() const override { return m_height; }
     uint32_t GetRenderWidth()  const override { return m_hdrWidth  ? m_hdrWidth  : m_width;  }
     uint32_t GetRenderHeight() const override { return m_hdrHeight ? m_hdrHeight : m_height; }
+    uint32_t GetFrameIndex()   const override { return m_frameIndex; }
+    // Note: pre-existing static constexpr GetFrameCount() lives further down
+    // in this class; we don't shadow it with a virtual to keep the existing
+    // static call sites working. FrameCB.h hard-codes kFrameCount=3 to match.
     uint64_t GetHdrSceneSrvGpuHandle() const override;
     uint64_t GetHdrSceneUavGpuHandle() const override;
     void     CopyHdrSceneTo(const RHI::Texture& dst, RHI::CommandList cmd) override;
@@ -232,6 +249,11 @@ public:
     // Returns a UNORM alias SRV for SRGB textures (raw sRGB data, no linearization).
     // For editor texture previews rendered to a UNORM RTV.
     uint64_t GetTexturePreviewSrvGpuHandle(const RHI::Texture& texture) const override;
+    // Stencil-plane SRV for D24_UNORM_S8_UINT depth textures. Created lazily in
+    // CreateTexture alongside the depth-plane SRV. Returns 0 if the texture is
+    // not stencil-bearing. Sampled as Texture2D<uint2>; read .y for stencil.
+    uint64_t GetTextureStencilSRVGpuHandle(const RHI::Texture& texture) const override;
+    uint64_t GetTextureUVPlaneSRVGpuHandle(const RHI::Texture& texture) const override;
     uint64_t CreateDepthTextureSRVTable(const RHI::Texture* textures,
                                         uint32_t            count) override;
     void     FreeDescriptorTable(uint64_t gpuHandle) override;
@@ -251,6 +273,42 @@ public:
         const RHI::TextureDesc&     desc,
         RHI::Texture&               outTexture,
         const RHI::SubresourceData* initialData = nullptr) override;
+
+    // DX12-only: create a TRANSIENT 2D texture as a CreatePlacedResource at
+    // (heap, heapOffset) instead of its own committed heap, so lifetime-disjoint
+    // textures can alias the same heap bytes (transient render-target aliasing).
+    // Narrow on purpose — single-mip, single-slice, SHADER_RESOURCE (+optional
+    // UNORDERED_ACCESS) only; NO initialData / RT / DS / cube / depth / NV12.
+    // The resulting RHI::Texture is otherwise indistinguishable from a committed
+    // one (same SRV/UAV descriptors, same bindless slot). Caller owns the heap
+    // and must keep it alive until this texture's deferred release has drained.
+    bool CreateTexturePlaced(
+        const RHI::TextureDesc&     desc,
+        ID3D12Heap*                 heap,
+        UINT64                      heapOffset,
+        RHI::Texture&               outTexture);
+
+    bool UpdateTexture(
+        RHI::Texture&               texture,
+        const RHI::SubresourceData* planes,
+        uint32_t                    subresourceCount) override;
+
+    /** GPU-to-GPU copy of an external ID3D12Resource (e.g. FFmpeg's D3D12VA
+     *  hwaccel NV12 output) into a managed RHI::Texture. The graphics queue
+     *  inserts Wait(waitFence, waitValue) BEFORE the copy CL submission so
+     *  the producer's work is retired before we read. Then synchronously
+     *  waits for the copy to finish (FlushUploadAndWait-style) so the
+     *  destination is safe to sample from any subsequent CL.
+     *
+     *  Both resources must share the same format + dimensions (CopyResource
+     *  internally maps all subresources). Pass nullptr / 0 for waitFence to
+     *  skip the GPU wait (use only when the caller guarantees the producer
+     *  has already retired). Returns false when texture handle / src is
+     *  invalid. DX12-only; cast IGraphicsDevice& to GraphicsDX12& to call. */
+    bool CopyD3D12ResourceToTexture(RHI::Texture&    dst,
+                                     ID3D12Resource* src,
+                                     ID3D12Fence*    waitFence,
+                                     UINT64          waitFenceValue);
 
     bool CreateShader(
         RHI::ShaderStage stage,
@@ -443,6 +501,62 @@ public:
     void DestroyBuffer(RHI::GPUBuffer& buffer) override;
     void DestroyTexture(RHI::Texture& texture) override;
 
+    // Defer-release a raw ID3D12Resource (not pool-managed — e.g. DXR BLAS/TLAS
+    // result buffers owned by RT::BLAS / RT::TLAS). Queues the ComPtr into the
+    // current backbuffer's deferred-release slot so it outlives any command
+    // list recorded this frame; BeginFrame drains it after the GPU is idle.
+    // Use this instead of letting the owning ComPtr destruct inline whenever a
+    // resource may still be referenced by an in-flight / not-yet-submitted CL.
+    void DeferReleaseResource(Microsoft::WRL::ComPtr<ID3D12Resource> resource);
+
+    // Defer-release tied to a specific queue's fence value. Use when the
+    // 3-slot per-backbuffer release window isn't enough — e.g. async-compute
+    // BLAS work that may still be reading the resource long after the frame
+    // it was queued in (without this, MeshLibrary needs a two-stage lag and
+    // engine shutdown needs a full WaitForPreviousFrame stall). Resource is
+    // released the first BeginFrame after `m_queueFences[queueIndex]`'s
+    // completed value reaches `fenceValue`.
+    //
+    // queueIndex: 0 = graphics, 1 = compute, 2 = copy (matches
+    // RHI::QUEUE_TYPE enum). Pass the value returned by
+    // GetLastSignaledFenceValue() right AFTER the work using the resource
+    // was submitted — that's the fence value the GPU must reach before
+    // it's safe to free.
+    void DeferReleaseResource(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+                              uint32_t queueIndex,
+                              uint64_t fenceValue);
+
+    // Last value signaled on a queue's fence. Caller can stash this right
+    // after submitting work that references a resource, then pass it to
+    // DeferReleaseResource(resource, queue, fenceValue) to time the
+    // release precisely. queueIndex: 0/1/2 = graphics/compute/copy.
+    uint64_t GetLastSignaledFenceValue(uint32_t queueIndex) const;
+
+    // -------------------------------------------------------------------------
+    // Cubemap-array slice <-> .itex file I/O (reflection-probe bake persistence).
+    //
+    // Uses the engine's native .itex container — [AssetHeader][TextureMetadata]
+    // [DDS bytes] — exactly like TextureImporter / TextureLoader, so probe
+    // cubemaps are first-class engine assets (no bespoke on-disk format).
+    //
+    // Both operate on ONE cube (6 consecutive array slices, all mips) inside a
+    // TextureCubeArray — @p cubeIndex selects which probe; the touched array
+    // slices are [cubeIndex*6 .. cubeIndex*6+5]. @p currentState is the state
+    // the WHOLE array resource is in on entry (the reflection-probe array is
+    // uniformly SHADER_RESOURCE outside an in-flight bake CL). Both are
+    // synchronous: FlushAndWait + a dedicated one-shot CL + fence, mirroring
+    // CaptureTextureToPNG — call them at frame boundaries / tools events, not
+    // inside an open pass.
+    // -------------------------------------------------------------------------
+    bool SaveTextureCubeToITEX(const RHI::Texture& cubeArrayTex,
+                               uint32_t            cubeIndex,
+                               RHI::ResourceState  currentState,
+                               const char*         path);
+    bool LoadITEXIntoTextureCube(RHI::Texture&      cubeArrayTex,
+                                 uint32_t           cubeIndex,
+                                 RHI::ResourceState currentState,
+                                 const char*        path);
+
     bool InitPSOLibrary(const char* cacheFilePath) override;
     void SavePSOLibrary(const char* cacheFilePath) override;
 
@@ -524,6 +638,10 @@ private:
     // Shortcut: drain every slot (used after WaitForPreviousFrame fully idles the GPU).
     void ProcessAllDeferredReleases();
 
+    // Drain entries from m_fenceKeyedReleases whose queue fence has reached
+    // their target value. Called from BeginFrame after the slot-based drain.
+    void ProcessFenceKeyedReleases();
+
     // Resolve the pool entry for a CommandList handle
     CommandList_DX12& GetPoolEntry(RHI::CommandList cmd);
     const CommandList_DX12& GetPoolEntry(RHI::CommandList cmd) const;
@@ -572,6 +690,11 @@ private:
     HANDLE                                            m_fenceEvent { nullptr };
     uint64_t                                          m_fenceValue { 0 };
     uint32_t                                          m_frameIndex { 0 };
+    // Set true by WaitForNextFrameSlot, cleared by EndFrame. BeginFrame uses
+    // it to skip a duplicate slot-fence wait when the caller already prepared
+    // the slot early (so Animation phase can safely write per-frame upload
+    // buffers before BeginFrame). Idempotent within a single frame.
+    bool                                              m_frameSlotPrepared { false };
     bool                                              m_tearingSupported { false };
     bool                                              m_meshShaderSupported { false };
     bool                                              m_dxrSupported        { false };
@@ -595,6 +718,21 @@ private:
         std::vector<uint32_t>                               textureSlots;
     };
     DeferredReleaseList                               m_deferredRelease[FrameCount];
+
+    // Fence-keyed deferred-release queue. Each entry holds a queue index +
+    // fence value the GPU must reach before the resource is safe to free.
+    // Drained from BeginFrame after the slot-based queue, removing entries
+    // whose fence value <= m_queueFences[queueIndex]->GetCompletedValue().
+    // Used by DDGI's async-compute BLAS pipeline so resources can outlive
+    // FrameCount without the WaitForPreviousFrame blunt stall.
+    struct FenceKeyedRelease
+    {
+        uint32_t                                            queueIndex;
+        uint64_t                                            fenceValue;
+        Microsoft::WRL::ComPtr<ID3D12Resource>              resource;
+    };
+    std::deque<FenceKeyedRelease>                     m_fenceKeyedReleases;
+
     std::mutex                                        m_deferredMutex;
 public:
     bool     vsyncEnabled = true; // false = uncapped FPS with ALLOW_TEARING
@@ -692,14 +830,30 @@ private:
     // Command signature for ExecuteIndirect (root constants + DrawInstanced).
     Microsoft::WRL::ComPtr<ID3D12CommandSignature> m_indirectCommandSignature;
 
-    // Bindless texture table: contiguous GPU-visible SRV block.
-    // Index = texture pool handle_id. Bound at root param kBindlessTexSlot (space2).
-    static constexpr uint32_t kMaxBindlessTextures = 4096;
-    DescriptorAllocation m_bindlessTexTable;       // GPU-heap allocation for kMaxBindlessTextures SRVs
-    uint32_t             m_bindlessTexCount = 0;   // high-water mark
 public:
+    // Bindless texture table size — exposed publicly so passes with their own
+    // root signatures (DDGIPass, etc.) can size their bindless ranges to match
+    // without inlining a magic number.
+    //
+    // Sized for character-heavy AA: PBR materials carry 5-7 textures each
+    // (albedo / normal / orm / emissive / mask / detail), so 200 unique
+    // materials = ~1400 textures; add IBL probes, atlases, LUTs, UI sprites
+    // and a mid-size game easily reaches ~6-10k resident. 16k leaves comfortable
+    // headroom without needing aggressive streaming evictions. Must match
+    // g_AllTextures[N] array sizes in DDGIRayTrace.cs.hlsl (other shaders
+    // use unbounded `[]` and don't need updating).
+    static constexpr uint32_t kMaxBindlessTextures = 16384;
+
     D3D12_GPU_DESCRIPTOR_HANDLE GetBindlessTextureTableHandle() const { return m_bindlessTexTable.GetGpuHandle(); }
 private:
+    // Bindless texture table: contiguous GPU-visible SRV block.
+    // Index = texture pool handle_id. Bound at root param kBindlessTexSlot (space2).
+    // GPU-heap allocation for kMaxBindlessTextures SRVs. Slot index equals
+    // m_texturePool's handle_id, so recycling is handled by m_textureFreeList
+    // and the descriptor at a reused slot gets overwritten by CreateTexture's
+    // CopyDescriptorsSimple. No separate bindless allocator / high-water
+    // counter needed.
+    DescriptorAllocation m_bindlessTexTable;
 
     // ---- Present blit (non-ImGui fullscreen SRV → swap chain) ---------------
     // Lazily built on first CompositeTextureToSwapChain call. Used by game-mode
@@ -730,4 +884,11 @@ private:
     // D3D12 debug layer message callback cookie (0 = not registered)
     DWORD m_d3d12MessageCallbackCookie{ 0 };
 #endif
+
+    // Video decode backend — lazily constructed on first GetVideoBackend().
+    // Forward-declared at the top so we don't drag d3d12video.h into the
+    // public header; the destructor is defined in GraphicsDX12.cpp where the
+    // full VideoDecoderDX12 type is visible.
+    std::unique_ptr<RHI::DX12::VideoDecoderDX12> m_videoBackend;
+    std::mutex                                   m_videoBackendMutex;
 };

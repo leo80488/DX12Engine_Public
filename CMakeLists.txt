@@ -32,10 +32,15 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
 endif()
 
 project(DX12Engine
-    VERSION     1.0.0
+    VERSION     1.1.0
     LANGUAGES   CXX C
     DESCRIPTION "Direct3D 12 deferred renderer + ECS + editor"
 )
+
+# Third-party libraries are vendored prebuilt under DX12/external/ (DirectXTex,
+# Jolt, DXC, FreeType, Dear ImGui, Lua, sol2, nlohmann/json, meshoptimizer,
+# Recast/Detour, FFmpeg, DirectX-Headers). Only Assimp comes from vcpkg — see
+# vcpkg.json and DX12/CMakeLists.txt.
 
 # -----------------------------------------------------------------------------
 # Platform guard — Windows + MSVC + x64 only.

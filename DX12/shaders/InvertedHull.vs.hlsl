@@ -18,10 +18,13 @@ cbuffer PushConstants : register(b0, space0)
 StructuredBuffer<GPUInstanceData> InstanceBuffer  : register(t0, space0);
 StructuredBuffer<MeshDescriptor> MeshDescriptors : register(t1, space0);
 
+// Pre-TAA composite: outline rasterizes alongside the main pass at the same
+// JITTERED NDC, so TAA reprojects + history-blends both together — outline
+// never desyncs from the mesh in motion (Genshin / Honkai approach).
 cbuffer PerViewCB : register(b1, space0)
 {
-    float4x4 viewProj;
-    float4x4 prevViewProj;
+    float4x4 viewProj;       // current, jittered (matches GBuffer raster)
+    float4x4 prevViewProj;   // unused here
 };
 
 cbuffer OutlineCB : register(b2, space0)

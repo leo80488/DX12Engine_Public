@@ -111,6 +111,14 @@ namespace Resource
         return m_rm->Get<AnimationResource>(entryIt->second.rmHandle);
     }
 
+    AnimationResource* AnimationClipSystem::GetResourceMutable(AnimHandle handle)
+    {
+        // The resource is owned (non-const) by ResourceManager; GetResource
+        // only hands out const for safety. Editor authoring is an explicit
+        // opt-in to mutate the asset in memory before re-serializing.
+        return const_cast<AnimationResource*>(GetResource(handle));
+    }
+
     void AnimationClipSystem::Tick()
     {
         if (!m_rm) return;

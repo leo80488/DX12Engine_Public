@@ -11,6 +11,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include "RenderGraph/RenderPass/ColorGradingParams.h"
 
 class ToneMapPass : public RG::RenderPass
@@ -84,8 +85,18 @@ private:
     RHI::ResourceState  m_lutState{};
 
     // Per-dispatch CB (tonemap)
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
+    struct alignas(16) ToneMapCB
+    {
+        uint32_t width;
+        uint32_t height;
+        float    bloomStrength;
+        uint32_t enableLUT;
+        float    lensFlareStrength;
+        float    _pad0;
+        float    _pad1;
+        float    _pad2;
+    };
+    FrameCB<ToneMapCB> m_cb;
 
     // Per-dispatch CB (LUT bake)
     RHI::GPUBuffer m_gradingCb;

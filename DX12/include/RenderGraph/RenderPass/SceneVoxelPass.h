@@ -23,6 +23,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -127,8 +128,8 @@ private:
     RHI::ResourceState m_occupancyState = RHI::ResourceState::UNORDERED_ACCESS;
 
     // Per-frame CB ring — enough for kMaxDraws slots + 1 clear slot at slot 0.
-    RHI::GPUBuffer     m_cb;
-    void*              m_cbMapped = nullptr;
+    struct alignas(256) VoxelCBPool { uint8_t bytes[kCBSlotStride * (kMaxDraws + 1)]; };
+    FrameCB<VoxelCBPool> m_cb;
 
     DirectX::XMFLOAT3  m_gridMin { -32.f, -32.f, -32.f };
     DirectX::XMFLOAT3  m_gridMax {  32.f,  32.f,  32.f };

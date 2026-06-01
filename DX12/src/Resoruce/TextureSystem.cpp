@@ -330,19 +330,34 @@ namespace Resource
             gfx.DestroyTexture(tex);
         m_pendingDestroy.clear();
 
-        // Promote RM-ready entries to GPU.
+        // Promote RM-ready entries to GPU. Collect the ready entries first so the
+        // whole promotion burst shares ONE upload flush instead of a full
+        // FlushAndWait GPU drain per texture (CreateTexture honours the batch
+        // scope). Only open the batch when there is work — EndBufferUploadBatch
+        // always flushes on scope exit, so wrapping an empty pass would add a
+        // needless per-frame GPU stall.
+        std::vector<TextureEntry*> toPromote;
         for (auto& entry : m_slots)
         {
             if (entry.refCount == 0 || entry.gpuReady || !entry.rmHandle.IsValid())
                 continue;
             if (rm.GetState(entry.rmHandle) != ResourceState::Ready)
                 continue;
+            toPromote.push_back(&entry);
+        }
 
-            const auto* texRes = rm.Get<TextureResource>(entry.rmHandle);
-            if (texRes)
-                UploadToGPU(*texRes, entry, gfx);
-            else
-                LOG_WARNING("TextureSystem::Tick: resource is not a TextureResource");
+        if (!toPromote.empty())
+        {
+            gfx.BeginBufferUploadBatch();
+            for (TextureEntry* entry : toPromote)
+            {
+                const auto* texRes = rm.Get<TextureResource>(entry->rmHandle);
+                if (texRes)
+                    UploadToGPU(*texRes, *entry, gfx);
+                else
+                    LOG_WARNING("TextureSystem::Tick: resource is not a TextureResource");
+            }
+            gfx.EndBufferUploadBatch();
         }
     }
 

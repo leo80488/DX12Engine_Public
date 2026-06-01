@@ -28,6 +28,7 @@
 // LightCB — fullscreen lighting PS owns b1 (no PerViewCB on this draw).
 #define LIGHT_CB_REGISTER b1
 #include "light_cb.hlsli"
+#include "view_mode_common.hlsli"   // VIEW_MODE_* + WIREFRAME_COLOR (LightCB.viewMode)
 
 // GBuffer inputs
 Texture2D<float4> gAlbedo   : register(t2, space0);
@@ -155,6 +156,20 @@ float3 ReconstructWorldPos(float2 uv, float depth)
 float4 main(PSIn i) : SV_TARGET
 {
     float3 albedo    = gAlbedo.Sample(gSampler, i.uv).rgb;
+
+    // --- Global view-mode override (Unity/Unreal-style viewmode switch) ------
+    // Driven by LightCB.viewMode. Both branches bypass the BRDF entirely:
+    //   Unlit     → flat base color; its emissive still arrives via the pass's
+    //               additive blend onto the GBuffer-seeded HdrSceneColor.
+    //   Wireframe → constant teal. Geometry PSOs rasterize edges only
+    //               (FILL_MODE_WIREFRAME) and only edge pixels carry a stencil
+    //               id, so only edges reach this stencil-gated draw → teal
+    //               lines over the (skybox-suppressed) black background.
+    if (viewMode == VIEW_MODE_UNLIT)
+        return float4(albedo, 1.0);
+    if (viewMode == VIEW_MODE_WIREFRAME)
+        return float4(WIREFRAME_COLOR, 1.0);
+
     float4 normalRaw = gNormal.Sample(gSampler, i.uv);
     float3 N         = normalize(normalRaw.rgb * 2.0 - 1.0);
     // normal.a holds matIdx with its sign bit repurposed by GBuffer.ps.hlsl as
@@ -294,13 +309,17 @@ float4 main(PSIn i) : SV_TARGET
     // The shader composes them as (DDGI * coverage) + (SkyIBLDiff * (1 - coverage))
     // so a fully-covered point gets pure DDGI and a far-out point gets pure sky.
     //
-    // iblStrength semantics post-DDGI integration: SPECULAR-ONLY scalar.
-    // Diffuse strength is governed exclusively by ddgiDiffuseScale and
-    // skyIBLDiffuseScale (in IndirectLightingSettings); diffuse path is
-    // unaffected by iblStrength. The block stays gated on iblRadianceMips
-    // (specular path needs the radiance cube), but the diffuse computation
-    // runs even when iblStrength = 0 so DDGI/SH alone can still light the
-    // scene.
+    // Knob ownership (2026-05-23 — decoupled DDGI from iblStrength):
+    //   iblStrength         — master gate on SKY-DERIVED indirect only (sky
+    //                         IBL diffuse + reflection-probe/sky specular).
+    //                         Setting it to 0 removes the visible sky's
+    //                         contribution but DDGI keeps running.
+    //   ddgiDiffuseScale    — DDGI diffuse master. Independent of iblStrength.
+    //                         DDGI is its own indirect path; the sky's master
+    //                         gate must not silence it.
+    //   skyIBLDiffuseScale  — per-source weight on sky diffuse (composed
+    //                         before iblStrength, only applies where DDGI
+    //                         coverage < 1).
     float3 iblContrib = float3(0, 0, 0);
     if (iblRadianceMips > 0)
     {
@@ -347,8 +366,10 @@ float4 main(PSIn i) : SV_TARGET
         // only — Sky-IBL fallback keeps full AO since SH/cube-irradiance has
         // no built-in visibility.
         float ddgiAO = lerp(1.0, ao, saturate(ddgiAONearFieldStrength));
+        // iblStrength only gates SKY-derived contributions; DDGI controls its
+        // own intensity via ddgiDiffuseScale (decoupled from the sky master gate).
         float3 ddgiDiffPart = ddgiIrradiance * ddgiDiffuseScale * ddgiCoverage * ddgiAO;
-        float3 skyDiffPart  = skyDiff * skyIBLDiffuseScale * saturate(1.0 - ddgiCoverage) * ao;
+        float3 skyDiffPart  = skyDiff * skyIBLDiffuseScale * saturate(1.0 - ddgiCoverage) * ao * iblStrength;
         float3 iblDiffuse   = ddgiDiffPart + skyDiffPart;
         float3 R            = reflect(-V, N);
         float  mip          = roughness * float(iblRadianceMips - 1);
@@ -402,12 +423,12 @@ float4 main(PSIn i) : SV_TARGET
         float2 envBRDF = gBRDFLUT.Sample(gIBLSampler, float2(NdotV, roughness));
         float3 specIBL = iblSpecular * (Fibl * envBRDF.x + envBRDF.y);
 
-        float3 kDibl   = (1.0 - Fibl) * (1.0 - metalness);
-        // Diffuse: AO is already baked into iblDiffuse (split DDGI/Sky paths
-        // above). iblStrength is intentionally NOT applied here — diffuse
-        // strength lives on ddgiDiffuseScale + skyIBLDiffuseScale.
-        float3 diffIBL = kDibl * albedo * iblDiffuse;
-        // Specular: receives full screen AO + the global iblStrength scale.
+        float3 kDibl     = (1.0 - Fibl) * (1.0 - metalness);
+        // Diffuse IBL: AO + per-source scale + iblStrength on sky portion are
+        // all already baked into iblDiffuse (split DDGI/Sky paths above).
+        // Specular IBL: applies iblStrength here (reflection-probe + sky
+        // specular are both sky-derived, no DDGI specular today).
+        float3 diffIBL   = kDibl * albedo * iblDiffuse;
         float3 specIBLAO = specIBL * ao * iblStrength;
 
         iblContrib = diffIBL + specIBLAO;
@@ -416,22 +437,12 @@ float4 main(PSIn i) : SV_TARGET
         // IBL diffuse kept as a VECTOR (preserves environment color). Apply to
         // albedo directly at composite time, bypassing the ramp — ambient light
         // is omnidirectional so it shouldn't be shaded by NdotL ramp anyway.
-        // AO is already split per-path inside iblDiffuse; iblStrength stays on
-        // the specular path only.
+        // iblStrength is already baked into iblDiffuse (sky portion) and
+        // specIBLAO (sky/probe specular).
         nprAmbientColor  += kDibl * iblDiffuse;
         nprSpecularAccum += specIBLAO;
 #endif
     }
-
-    // ---- Flat ambient base --------------------------------------------------
-    // Small constant ambient term (driven by LightCB::ambient, typically a
-    // faint blue-grey sky colour). We no longer gate it on (1 - iblStrength)
-    // because that produced a non-monotonic brightness curve once auto-
-    // exposure started compensating: dropping iblStrength below 1 would
-    // dim the HDR scene, AE would over-expose to compensate, and the image
-    // paradoxically got brighter. Keeping flatAmbient as a fixed low base
-    // makes iblStrength a clean linear scale on IBL contribution only.
-    float3 flatAmbient = albedo * ambient * ao;
 
     // Emissive is NOT in this output — it was written directly to
     // HdrSceneColor (RT5) by GBufferPass (Unreal-style). The PSO's additive
@@ -439,7 +450,7 @@ float4 main(PSIn i) : SV_TARGET
     // final SceneColor = lighting + emissive without emissive ever passing
     // through the BRDF. RT4 (gExtraGBuffer) is reserved for shading-model
     // scratch (SSS thickness, clearcoat data, …).
-    float3 color = Lo + iblContrib + flatAmbient;
+    float3 color = Lo + iblContrib;
 
     // ---- Subsurface Scattering (Phase F) -----------------------------------
     // Simple wrap-lit diffuse lobe tinted by a per-material SubsurfaceColor.
@@ -565,11 +576,10 @@ float4 main(PSIn i) : SV_TARGET
     float3 nprDiffuse = albedo * rampColor * lightE
                       + albedo * nprAmbientColor;
 
-    // Step 5: final composite — specular stays PBR, flat ambient untouched.
-    // Emissive arrives via additive blend from the GBuffer-seeded
-    // HdrSceneColor (Unreal-style direct emissive write) — no additive
-    // term here.
-    color = nprDiffuse + nprSpecularAccum + flatAmbient;
+    // Step 5: final composite — specular stays PBR. Emissive arrives via
+    // additive blend from the GBuffer-seeded HdrSceneColor (Unreal-style
+    // direct emissive write) — no additive term here.
+    color = nprDiffuse + nprSpecularAccum;
 
     // Step 6: rim light — per-material rimPower + rimStrength.
     // NPR_COLOR uses the diffuse-ramp color as rim tint; NPR_RAMP keeps the texture-driven rim.

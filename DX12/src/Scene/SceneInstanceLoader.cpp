@@ -233,7 +233,7 @@ namespace
 
         world.AddComponent<LocalTransform> (nodeEnt, lt);
         world.AddComponent<GlobalTransform>(nodeEnt, GlobalTransform{});
-        world.AddComponent<Visibility>     (nodeEnt, Visibility{});
+        world.AddComponent<VisibilityComponent>(nodeEnt, VisibilityComponent{});
         world.AddComponent<RenderLayer>    (nodeEnt, RenderLayer{});
         world.AddComponent<SceneNodeTag>   (nodeEnt, SceneNodeTag{});
         world.AddComponent<Children>       (nodeEnt, Children{});
@@ -277,7 +277,7 @@ namespace
             meshAabb.max = fiAabbMax[fi];
             world.AddComponent<LocalAabb>      (meshEnt, LocalAabb{ meshAabb.min, meshAabb.max });
             world.AddComponent<WorldAabb>      (meshEnt, meshAabb);
-            world.AddComponent<Visibility>     (meshEnt, Visibility{});
+            world.AddComponent<VisibilityComponent>(meshEnt, VisibilityComponent{});
             world.AddComponent<RenderLayer>    (meshEnt, RenderLayer{});
             world.AddComponent<Parent>         (meshEnt, Parent{ nodeEnt });
             // Load material from .imat if referenced in the F line, else default.
@@ -778,6 +778,14 @@ SceneInstanceLoader::LoadResult SceneInstanceLoader::Load(const std::string&    
     std::vector<std::string>       meshAbsPaths  (fileRecords.size());
 
     uint32_t failedCount = 0;
+    // Batch all per-library VB/IB uploads. Each MeshLibrary::Load issues 2
+    // CreateBuffer(DEFAULT) calls, which outside a batch scope each do a full
+    // synchronous FlushAndWait GPU drain (Close->Execute->FlushAndWait->Reset).
+    // Wrapping the whole resolve loop coalesces every library's uploads into
+    // batched flushes (mid-batch auto-flush capped by kBatchFlushBytes/Count),
+    // turning 2*N drains into a handful. EndBufferUploadBatch uses FlushAndWait
+    // (not WaitForPreviousFrame), so this is safe regardless of frame phase.
+    gfx.BeginBufferUploadBatch();
     for (int fi = 0; fi < static_cast<int>(fileRecords.size()); ++fi)
     {
         const auto& fr       = fileRecords[fi];
@@ -793,6 +801,12 @@ SceneInstanceLoader::LoadResult SceneInstanceLoader::Load(const std::string&    
         {
             libH = meshLib.Load(meshAbsPaths[fi], gfx);
             libByPath.emplace(meshAbsPaths[fi], libH);
+            // Hand ownership of the freshly-loaded library to Renderer so the
+            // next OnWorldClear releases it.  Without this, every world reload
+            // leaks one VB+IB pair per referenced .meshlib (Load does not
+            // dedupe by path; see MeshLibrary.h comment).
+            if (renderer && libH.IsValid())
+                renderer->TrackWorldMeshLibrary(libH);
         }
 
         if (!libH.IsValid())
@@ -817,6 +831,7 @@ SceneInstanceLoader::LoadResult SceneInstanceLoader::Load(const std::string&    
         fiIndexCount[fi]  = entry->indexCount;
         fiVertexCount[fi] = entry->vertexCount;
     }
+    gfx.EndBufferUploadBatch();
     if (failedCount > 0)
         LOG_WARNING("SceneInstanceLoader: %u/%zu mesh refs failed to resolve",
                     failedCount, fileRecords.size());

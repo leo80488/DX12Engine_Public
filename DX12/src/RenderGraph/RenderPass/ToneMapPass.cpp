@@ -16,18 +16,6 @@ static constexpr uint32_t kSRV3    = 7;  // SRV  t3 space2 — lens flare additi
 
 static constexpr uint32_t kLutSize = 32;
 
-struct ToneMapCB
-{
-    uint32_t width;
-    uint32_t height;
-    float    bloomStrength;
-    uint32_t enableLUT;
-    float    lensFlareStrength;
-    float    _pad0;
-    float    _pad1;
-    float    _pad2;
-};
-
 // ---------------------------------------------------------------------------
 void ToneMapPass::Init(IGraphicsDevice& gfx)
 {
@@ -58,14 +46,7 @@ void ToneMapPass::Init(IGraphicsDevice& gfx)
     { LOG_ERROR("ToneMapPass: LUT PSO failed"); return; }
 
     // Tonemap CB
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = (sizeof(ToneMapCB) + 255) & ~255u;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cb))
-            m_cbMapped = gfx.MapBuffer(m_cb);
-    }
+    m_cb.Create(gfx, "ToneMap.CB");
 
     // Color grading CB
     {
@@ -195,15 +176,15 @@ RHI::CommandList ToneMapPass::Execute(RHI::CommandList cl)
         BakeLUT(cl);
 
     // ---- Step 2: Tonemap dispatch ----
-    if (m_cbMapped)
+    if (auto* slot = m_cb.Current(gfx))
     {
-        ToneMapCB cb{};
+        ToneMapPass::ToneMapCB cb{};
         cb.width             = m_vpW;
         cb.height            = m_vpH;
         cb.bloomStrength     = m_bloomStrength;
         cb.enableLUT         = (m_colorGradingEnabled && m_lutTexture.IsValid()) ? 1u : 0u;
         cb.lensFlareStrength = (m_lensFlareSrvHandle != 0) ? m_lensFlareStrength : 0.0f;
-        std::memcpy(m_cbMapped, &cb, sizeof(cb));
+        *slot = cb;
     }
 
     // Transition final output to UAV
@@ -215,7 +196,7 @@ RHI::CommandList ToneMapPass::Execute(RHI::CommandList cl)
     }
 
     gfx.BindComputePipelineState(m_pso, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cb, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
     gfx.SetComputeDescriptorTable(kSRV0, m_hdrSrvHandle, cl);
     gfx.SetComputeDescriptorTable(kSRV1, m_bloomSrvHandle, cl);
     gfx.SetComputeDescriptorTable(kSRV2, m_exposureSrvHandle, cl);

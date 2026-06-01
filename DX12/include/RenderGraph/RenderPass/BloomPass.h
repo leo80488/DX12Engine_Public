@@ -10,6 +10,7 @@
 #include "RenderGraph/RenderGraph.h"
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 class BloomPass : public RG::RenderPass
 {
@@ -40,9 +41,14 @@ private:
     RHI::PipelineState m_upsamplePSO;
     ShaderLibrary       m_shaderLib;
 
-    // Per-dispatch CB (UPLOAD, persistently mapped)
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
+    // Per-dispatch CB (UPLOAD, persistently mapped). 10 × 256-byte slots
+    // (kSteps × 2: one per downsample, one per upsample) — each dispatch must
+    // read its own slot, otherwise CPU writes for the next step clobber what
+    // the GPU has yet to consume.
+    static constexpr uint32_t kBloomCBStride = 256;
+    static constexpr uint32_t kBloomCBSlots  = kSteps * 2;
+    struct alignas(256) BloomCBPool { uint8_t bytes[kBloomCBStride * kBloomCBSlots]; };
+    FrameCB<BloomCBPool> m_cb;
 
     uint64_t m_hdrSrvHandle = 0;
     uint32_t m_vpW = 0;

@@ -13,6 +13,7 @@
 
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 
 class IGraphicsDevice;
 
@@ -48,12 +49,19 @@ public:
 private:
     void RebuildTextures();
 
+    struct alignas(16) CASCB
+    {
+        uint32_t width;
+        uint32_t height;
+        float    sharpness;
+        float    _pad;
+    };
+
     IGraphicsDevice*    m_gfx = nullptr;
     ShaderLibrary       m_shaderLib;
     RHI::PipelineState  m_pso;
 
-    RHI::GPUBuffer  m_cb;
-    void*           m_cbMapped = nullptr;
+    FrameCB<CASCB>      m_cb;
 
     RHI::Texture       m_output;
     RHI::ResourceState m_outputState = RHI::ResourceState::UNORDERED_ACCESS;
@@ -62,12 +70,4 @@ private:
     uint32_t m_vpW = 0, m_vpH = 0;
     bool     m_texDirty = true;
     bool     m_enabled  = true;
-
-    struct alignas(16) CASCB
-    {
-        uint32_t width;
-        uint32_t height;
-        float    sharpness;
-        float    _pad;
-    };
 };

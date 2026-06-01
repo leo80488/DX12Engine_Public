@@ -12,6 +12,7 @@
 
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include <DirectXMath.h>
 
 class IGraphicsDevice;
@@ -84,9 +85,11 @@ private:
     RHI::PipelineState m_denoisePSO;
     RHI::PipelineState m_prefilterPSO;  // 16x16 groupshared 5-mip prefilter
 
-    // Persistent constant buffer (UPLOAD, mapped).
-    RHI::GPUBuffer m_cb;
-    void*          m_cbMapped = nullptr;
+    // Persistent constant buffer — partitioned 8 × 256-byte slots, indexed by
+    // dispatch type (see kCBOffset* in .cpp).
+    static constexpr uint32_t kCBTotalSize = 256 * 8;
+    struct alignas(256) GTAOCBPool { uint8_t bytes[kCBTotalSize]; };
+    FrameCB<GTAOCBPool> m_cb;
 
     // 5-mip linear depth pyramid — written by the prefilter's single dispatch
     // (mips 0..4 bound as u0..u4 space2). Main pass samples the pyramid with
@@ -110,6 +113,14 @@ private:
     // pixel/frame. Lifetime = pass lifetime (data never changes).
     RHI::Texture       m_hilbertLUT;
     uint64_t           m_hilbertLUTSrv = 0;
+
+    // 1x1 zero-velocity fallback bound to the velocity slot (t4 space2, root 8)
+    // whenever no GBuffer velocity SRV is available. XeGTAOTemporal.cs reads
+    // gVelocity unconditionally, so the slot must never be left unbound or
+    // GPU-Based Validation reports "uninitialized root argument accessed" every
+    // frame. Zero velocity == no reprojection (the intended "no history" case).
+    RHI::Texture       m_zeroVelocityTex;
+    uint64_t           m_zeroVelocitySrv = 0;
 
     // AO-only temporal history — ping-pong between two buffers. Each frame
     // reads from readIdx (last frame's write), writes to writeIdx. After
@@ -139,6 +150,16 @@ private:
                                                  //   Equal to the previous Execute's
                                                  //   writeIdx (set at end of Execute).
     bool               m_historyValid    = false;   // false until after first Execute
+    // External hard-cut signal driven by the camera-stack pipeline (LiveCamera.
+    // historyValid). When false this frame, temporal sampling falls through to
+    // the "no history" branch even if m_historyValid is true. AND'd with the
+    // internal flag so resize / first-frame / explicit cut all funnel through
+    // one gate in the shader CB fill.
+    bool               m_externalHistoryValid = true;
+
+public:
+    void SetExternalHistoryValid(bool b) { m_externalHistoryValid = b; }
+private:
 
     // Per-frame inputs (set by Renderer).
     uint64_t m_depthSrvHandle    = 0;

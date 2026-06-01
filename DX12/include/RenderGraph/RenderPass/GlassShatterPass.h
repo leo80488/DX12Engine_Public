@@ -30,6 +30,7 @@
 
 #include "Graphics/ShaderLibrary.h"
 #include "Graphics/GraphicsStruct.h"
+#include "Graphics/FrameCB.h"
 #include <DirectXMath.h>
 #include <cstdint>
 
@@ -148,8 +149,7 @@ private:
     RHI::ResourceState m_shatterSourceState = RHI::ResourceState::COPY_DST;
     uint32_t           m_sourceW = 0, m_sourceH = 0;
 
-    RHI::GPUBuffer m_paramsCB;
-    void*          m_paramsCBMapped = nullptr;
+    FrameCB<ShatterCB> m_paramsCB;
 
     uint32_t m_shardCount = 0;
 

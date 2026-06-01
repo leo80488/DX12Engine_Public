@@ -34,7 +34,6 @@ public:
         DirectX::XMFLOAT3       probePos           { 0, 0, 0 }; // capture origin
         DirectX::XMFLOAT3       sunDir             { 0, -1, 0 };
         DirectX::XMFLOAT3       sunColor           { 1, 1, 1 };
-        DirectX::XMFLOAT3       ambient            { 0, 0, 0 };
         uint64_t                skySHSrv           = 0;        // t19 space0
         uint64_t                materialBufSrv     = 0;        // t2 space0
         uint64_t                bindlessTexTable   = 0;        // t0 space2

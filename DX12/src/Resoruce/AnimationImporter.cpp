@@ -322,17 +322,19 @@ namespace Resource
         const char* hint = ext.empty() ? "" : ext.c_str() + 1;
 
         Assimp::Importer importer;
+        // Animation-only FBX has no meshes — drop mesh-targeted steps
+        // (Triangulate/LimitBoneWeights/GenNormals). Those silently flag the
+        // scene as AI_SCENE_FLAGS_INCOMPLETE on a meshless file.
         constexpr unsigned int flags =
-            aiProcess_ConvertToLeftHanded | 
-            aiProcess_Triangulate |        
-            aiProcess_LimitBoneWeights |    
-            aiProcess_PopulateArmatureData |
-            aiProcess_GenNormals;          
-        // aiProcess_Triangulate is minimal; mesh data is not needed but safe to skip.
+            aiProcess_ConvertToLeftHanded |
+            aiProcess_PopulateArmatureData;
         const aiScene* scene = importer.ReadFileFromMemory(
             sourceData.data(), sourceData.size(), flags, hint);
 
-        if (!scene || (scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE) || !scene->mRootNode)
+        // Do NOT reject on AI_SCENE_FLAGS_INCOMPLETE — for animation-only files
+        // the missing mesh/material data is expected, and Assimp sets the flag
+        // without writing an error string.
+        if (!scene || !scene->mRootNode)
         {
             LOG_ERROR("AnimationImporter: Assimp failed on '%s': %s",
                       sourcePath.c_str(), importer.GetErrorString());

@@ -68,17 +68,21 @@ void ClusterPass::Init(IGraphicsDevice& gfx)
 
     // ---- Create GPU buffers ------------------------------------------------
 
-    // Light buffer (UPLOAD, CPU writes each frame)
+    // Light buffer (UPLOAD, CPU writes each frame) — triple-buffered ring so
+    // the CPU's frame N+1 write can't stomp the GPU's frame N read.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxLights) * sizeof(GPULightGPU);
         bd.stride     = sizeof(GPULightGPU);
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
-        if (gfx.CreateBuffer(bd, m_lightBuffer))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_lightMapped = gfx.MapBuffer(m_lightBuffer);
-            m_lightsSRV   = gfx.GetBufferSRVGpuHandle(m_lightBuffer);
+            if (gfx.CreateBuffer(bd, m_lightBuffer[i]))
+            {
+                m_lightMapped[i] = gfx.MapBuffer(m_lightBuffer[i]);
+                m_lightsSRV[i]   = gfx.GetBufferSRVGpuHandle(m_lightBuffer[i]);
+            }
         }
     }
 
@@ -163,15 +167,9 @@ void ClusterPass::Init(IGraphicsDevice& gfx)
             m_counterUAV = gfx.GetBufferUAVGpuHandle(m_counterBuffer);
     }
 
-    // Constant buffer (UPLOAD, mapped)
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = 256;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_clusterCB))
-            m_clusterCBMapped = gfx.MapBuffer(m_clusterCB);
-    }
+    // Constant buffer (UPLOAD) — triple-buffered FrameCB.
+    if (!m_clusterCB.Create(gfx, "ClusterPass.CB"))
+        LOG_ERROR("ClusterPass: cluster CB create failed");
 
     // Counter reset buffer (4 bytes UPLOAD, contains a single 0 for copy-to-counter)
     {
@@ -195,9 +193,11 @@ void ClusterPass::Init(IGraphicsDevice& gfx)
 void ClusterPass::SetLights(const std::vector<ResolvedLight>& lights)
 {
     m_lightCount = std::min(static_cast<uint32_t>(lights.size()), kMaxLights);
-    if (!m_lightMapped || m_lightCount == 0) return;
+    if (!m_gfx || m_lightCount == 0) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot >= kFrameCount || !m_lightMapped[frameSlot]) return;
 
-    auto* dst = static_cast<GPULightGPU*>(m_lightMapped);
+    auto* dst = static_cast<GPULightGPU*>(m_lightMapped[frameSlot]);
     for (uint32_t i = 0; i < m_lightCount; ++i)
     {
         const ResolvedLight& src = lights[i];
@@ -254,15 +254,18 @@ void ClusterPass::Execute(RHI::CommandList cl)
     // it here so the dispatched ClusterCullProbes sees the latest value.
     m_cbData.probeCount = m_probeCount;
 
-    // Upload CB
-    if (m_clusterCBMapped)
-        std::memcpy(m_clusterCBMapped, &m_cbData, sizeof(m_cbData));
+    // Upload CB into this frame's slot.
+    if (auto* p = m_clusterCB.Current(gfx))
+        *p = m_cbData;
+
+    const uint32_t frameSlot = gfx.GetFrameIndex();
+    const RHI::GPUBuffer& cbBuf = m_clusterCB.CurrentBuffer(gfx);
 
     // ---- Pass 1: Build cluster AABBs (only on resize) ----
     if (m_needsRebuild)
     {
         gfx.BindComputePipelineState(m_buildPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot0, m_clusterCB, 0, cl);
+        gfx.SetComputeRootCBV(kCBSlot0, cbBuf, 0, cl);
         gfx.SetComputeDescriptorTable(kUAV0, m_clusterAABBUAV, cl);
 
         gfx.DispatchCompute(kTileX, kTileY, kSlices, cl);
@@ -277,10 +280,10 @@ void ClusterPass::Execute(RHI::CommandList cl)
         // Fixed-layout culling: each cluster writes to its own pre-allocated slice.
         // No atomic counter needed — each thread is independent.
         gfx.BindComputePipelineState(m_cullPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot0, m_clusterCB, 0, cl);
+        gfx.SetComputeRootCBV(kCBSlot0, cbBuf, 0, cl);
 
         gfx.SetComputeDescriptorTable(kSRV0, m_clusterAABBSRV, cl);
-        gfx.SetComputeDescriptorTable(kSRV1, m_lightsSRV, cl);
+        gfx.SetComputeDescriptorTable(kSRV1, m_lightsSRV[frameSlot], cl);
         gfx.SetComputeDescriptorTable(kUAV0, m_lightIndexUAV, cl);
         gfx.SetComputeDescriptorTable(kUAV1, m_lightGridUAV, cl);
 
@@ -297,7 +300,7 @@ void ClusterPass::Execute(RHI::CommandList cl)
     if (m_probeCullPSO.IsValid() && m_probeCount > 0 && m_probeBufferSRV != 0)
     {
         gfx.BindComputePipelineState(m_probeCullPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot0, m_clusterCB, 0, cl);
+        gfx.SetComputeRootCBV(kCBSlot0, cbBuf, 0, cl);
 
         // Reuse t0 (cluster AABBs) and rebind t2 to the probe buffer; UAVs
         // u0 / u1 swap from light grid to probe grid.
@@ -311,4 +314,14 @@ void ClusterPass::Execute(RHI::CommandList cl)
         gfx.PushBarrier(RHI::GPUBarrier::Memory(&m_probeIndexBuffer), cl);
         gfx.PushBarrier(RHI::GPUBarrier::Memory(&m_probeGridBuffer), cl);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame SRV accessor — returns the slot matching gfx.GetFrameIndex() so
+// LightingPass / DDGIPass / etc. always sample the buffer the CPU just wrote.
+uint64_t ClusterPass::GetLightsSRVHandle() const
+{
+    if (!m_gfx) return 0;
+    const uint32_t s = m_gfx->GetFrameIndex();
+    return (s < kFrameCount) ? m_lightsSRV[s] : 0;
 }

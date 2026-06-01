@@ -156,8 +156,15 @@ struct IndirectLightingSettingsComponent
     bool   ddgiEnabled               = true;
 
     // Global scale on DDGI diffuse contribution. NPR skin materials should
-    // use a per-material override (0.3..0.5) — this knob is the engine-wide one.
-    float  ddgiDiffuseScale          = 1.0f;
+    // use a per-material override (0.3..0.5 of this) — this knob is the
+    // engine-wide one.
+    //
+    // Default = π: compensates the 2026-05-23 DDGI evaluator basis change
+    // (c0=π·Y00 → c0=Y00 in DDGICommon.hlsli::DDGI_SH_Irradiance) so visual
+    // magnitude matches the pre-change calibration at the default slider.
+    // Existing scenes with this serialized as 1.0 will appear π× dimmer for
+    // DDGI than before — re-tune via the editor after pulling this change.
+    float  ddgiDiffuseScale          = 3.14159265f;
 
     // Sky IBL diffuse scale (used as fallback when no DDGI volume covers the
     // shading point). Acts as a global ambient cap.

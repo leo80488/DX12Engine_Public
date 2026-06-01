@@ -34,7 +34,7 @@
 //   t4 space0 — irradiance atlas SRV   (multi-bounce read)
 //   t5 space0 — depth atlas SRV        (multi-bounce read)
 //   t6 space0 — probe data SRV         (multi-bounce read)
-//   t0 space1 — bindless ByteAddressBuffer table (4096 slots)
+//   t0 space1 — bindless ByteAddressBuffer table (16384 slots)
 //   s0 space0 — linear sampler
 
 ConstantBuffer<DDGIVolumeGPU>      g_Vol      : register(b0, space0);
@@ -71,12 +71,12 @@ StructuredBuffer<GPULight>         g_Lights         : register(t7, space0);
 RWStructuredBuffer<uint>           g_RayCount       : register(u2, space0);
 RWStructuredBuffer<uint>           g_RayAlloc       : register(u3, space0);
 
-ByteAddressBuffer g_DDGIBuffers[4096] : register(t0, space1);
+ByteAddressBuffer g_DDGIBuffers[16384] : register(t0, space1);
 
 // Engine-wide bindless texture table (matches GraphicsDX12::kMaxBindlessTextures
-// = 4096). Used by closest-hit to sample emissive textures so glowing surfaces
+// = 16384). Used by closest-hit to sample emissive textures so glowing surfaces
 // (lamps, neon signs, screens, etc.) light up the SH probes via DDGI.
-Texture2D                          g_AllTextures[4096] : register(t0, space2);
+Texture2D                          g_AllTextures[16384] : register(t0, space2);
 
 SamplerState                       g_LinearSampler : register(s0, space0);
 
@@ -273,7 +273,16 @@ void main(uint3 DTid : SV_DispatchThreadID)
     // scenes only after profiling rules out TDR.
     ray.TMax      = 50.0;
 
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_CULL_BACK_FACING_TRIANGLES> q;
+    // Backface culling INTENTIONALLY OFF — we need to SEE backface hits so we
+    // can detect probes that are buried in solid geometry (or sitting on the
+    // wrong side of a thin wall, the indoor↔outdoor leak vector). With cull
+    // on, those rays pass straight through walls into the sky and pollute the
+    // probe's SH with whatever's on the other side. With cull off, we get
+    // CommittedTriangleFrontFace() = false for those hits and we can route
+    // them to a separate "this direction is buried" path (zero radiance,
+    // backface-sentinel hitDistance) read by Relight's depth atlas + Relocate's
+    // probe-classification pass.
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> q;
     q.TraceRayInline(g_TLAS, RAY_FLAG_NONE, 0xFF, ray);
     q.Proceed();
 
@@ -287,9 +296,29 @@ void main(uint3 DTid : SV_DispatchThreadID)
         radiance    = min(sky, float3(10.0, 10.0, 10.0));
         hitDistance = -1.0;
     }
+    else if (!q.CommittedTriangleFrontFace())
+    {
+        // ---- Backface hit ---------------------------------------------------
+        // Probe is on the SOLID side of this surface along this ray direction.
+        // Do NOT integrate "what's behind the wall" — that's exactly how
+        // outdoor sky leaks into indoor probes through thin walls.
+        //
+        // Encoding contract (see DDGIRelight.cs / DDGIProbeRelocate.cs):
+        //   hitDistance > 0       : frontface hit at this distance
+        //   hitDistance == -1.0   : miss (no hit)
+        //   hitDistance < -1.5    : backface hit, real t = -(hitDistance + 2.0)
+        //
+        // The -2.0 offset keeps backface values strictly below -1.5 so the
+        // miss sentinel (-1.0) sits in an unambiguous gap, while the actual
+        // distance to the wall is preserved for Chebyshev (depth atlas
+        // records the wall as a near occluder).
+        const float t = q.CommittedRayT();
+        radiance    = float3(0, 0, 0);
+        hitDistance = -(t + 2.0);
+    }
     else
     {
-        // ---- Hit (folds the old DDGIClosestHit in-place) --------------------
+        // ---- Frontface hit (folds the old DDGIClosestHit in-place) ---------
         const uint  instId    = q.CommittedInstanceID();
         const uint  primIdx   = q.CommittedPrimitiveIndex();
         const float t         = q.CommittedRayT();

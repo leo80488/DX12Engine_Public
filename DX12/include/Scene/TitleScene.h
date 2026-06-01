@@ -10,16 +10,16 @@
 //   App pushes this as the initial scene in Game builds. Editor builds use
 //   TestScene instead so the editor's level-editing flow stays direct.
 
-#include "Scene/IScene.h"
+#include "Scene/IGameMode.h"
 
 #include <vector>
 
-class TitleScene : public IScene
+class TitleScene : public IGameMode
 {
 public:
     const char* GetName() const override { return "TitleScene"; }
 
-    void Init    (SceneContext* ctx) override;
+    void Init    (GameModeContext* ctx) override;
     void Update  (float dt) override;
     void Shutdown() override;
 

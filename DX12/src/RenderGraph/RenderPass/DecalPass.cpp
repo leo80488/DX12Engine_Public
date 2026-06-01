@@ -112,17 +112,20 @@ void DecalPass::Init(IGraphicsDevice& gfx)
             LOG_ERROR("DecalPass: apply PSO creation failed");
     }
 
-    // Decal buffer (UPLOAD)
+    // Decal buffer (UPLOAD) — triple-buffered ring.
     {
         RHI::GPUBufferDesc bd{};
         bd.size       = static_cast<uint64_t>(kMaxDecals) * sizeof(GPUDecalUpload);
         bd.stride     = sizeof(GPUDecalUpload);
         bd.usage      = RHI::Usage::UPLOAD;
         bd.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
-        if (gfx.CreateBuffer(bd, m_decalBuffer))
+        for (uint32_t i = 0; i < kFrameCount; ++i)
         {
-            m_decalMapped = gfx.MapBuffer(m_decalBuffer);
-            m_decalsSRV   = gfx.GetBufferSRVGpuHandle(m_decalBuffer);
+            if (gfx.CreateBuffer(bd, m_decalBuffer[i]))
+            {
+                m_decalMapped[i] = gfx.MapBuffer(m_decalBuffer[i]);
+                m_decalsSRV[i]   = gfx.GetBufferSRVGpuHandle(m_decalBuffer[i]);
+            }
         }
     }
 
@@ -155,15 +158,11 @@ void DecalPass::Init(IGraphicsDevice& gfx)
         }
     }
 
-    // Constant buffers (UPLOAD)
-    {
-        RHI::GPUBufferDesc bd{};
-        bd.size       = 256;
-        bd.usage      = RHI::Usage::UPLOAD;
-        bd.bind_flags = RHI::BindFlag::CONSTANT_BUFFER;
-        if (gfx.CreateBuffer(bd, m_cullCB))  m_cullCBMapped  = gfx.MapBuffer(m_cullCB);
-        if (gfx.CreateBuffer(bd, m_applyCB)) m_applyCBMapped = gfx.MapBuffer(m_applyCB);
-    }
+    // Constant buffers (UPLOAD) — triple-buffered.
+    if (!m_cullCB.Create(gfx, "DecalPass.CullCB"))
+        LOG_ERROR("DecalPass: cull CB create failed");
+    if (!m_applyCB.Create(gfx, "DecalPass.ApplyCB"))
+        LOG_ERROR("DecalPass: apply CB create failed");
 
     // Cache the bindless texture table GPU handle (persistent — allocated once
     // at GraphicsDX12 init). Used each frame for the new compute slot 17.
@@ -178,9 +177,11 @@ void DecalPass::Init(IGraphicsDevice& gfx)
 void DecalPass::SetDecals(const std::vector<ResolvedDecal>& decals)
 {
     m_decalCount = std::min<uint32_t>(static_cast<uint32_t>(decals.size()), kMaxDecals);
-    if (!m_decalMapped || m_decalCount == 0) return;
+    if (!m_gfx || m_decalCount == 0) return;
+    const uint32_t frameSlot = m_gfx->GetFrameIndex();
+    if (frameSlot >= kFrameCount || !m_decalMapped[frameSlot]) return;
 
-    auto* dst = static_cast<GPUDecalUpload*>(m_decalMapped);
+    auto* dst = static_cast<GPUDecalUpload*>(m_decalMapped[frameSlot]);
     for (uint32_t i = 0; i < m_decalCount; ++i)
     {
         const ResolvedDecal& src = decals[i];
@@ -262,13 +263,16 @@ RHI::CommandList DecalPass::Execute(RHI::CommandList cl)
         return cl;
 
     auto& gfx  = static_cast<GraphicsDX12&>(*m_gfx);
+    const uint32_t frameSlot = gfx.GetFrameIndex();
 
-    // Refresh CB data written to the persistently-mapped upload buffers.
+    // Refresh CB data written to the per-frame UPLOAD slots.
     m_cullCB_data.decalCount  = m_decalCount;
     m_applyCB_data.decalCount = m_decalCount;
     m_applyCB_data.debugMode  = m_debugHeatmap ? 1u : 0u;
-    if (m_cullCBMapped)  std::memcpy(m_cullCBMapped,  &m_cullCB_data,  sizeof(m_cullCB_data));
-    if (m_applyCBMapped) std::memcpy(m_applyCBMapped, &m_applyCB_data, sizeof(m_applyCB_data));
+    if (auto* slot = m_cullCB.Current(gfx))  *slot = m_cullCB_data;
+    if (auto* slot = m_applyCB.Current(gfx)) *slot = m_applyCB_data;
+
+    const uint64_t decalsSRV = m_decalsSRV[frameSlot];
 
     // ---- Pass 1: Cluster cull ------------------------------------------------
     // Skipped when:
@@ -280,9 +284,9 @@ RHI::CommandList DecalPass::Execute(RHI::CommandList cl)
     if (m_decalCount > 0 && !m_externalCullDone)
     {
         gfx.BindComputePipelineState(m_cullPSO, cl);
-        gfx.SetComputeRootCBV(kCBSlot, m_cullCB, 0, cl);
+        gfx.SetComputeRootCBV(kCBSlot, m_cullCB.CurrentBuffer(gfx), 0, cl);
         gfx.SetComputeDescriptorTable(kSRV0_ClusterAABB, m_clusterAABBSRV, cl);
-        gfx.SetComputeDescriptorTable(kSRV1_Decals,      m_decalsSRV,      cl);
+        gfx.SetComputeDescriptorTable(kSRV1_Decals,      decalsSRV,        cl);
         gfx.SetComputeDescriptorTable(kUAV0_IndexList,   m_decalIndexUAV,  cl);
         gfx.SetComputeDescriptorTable(kUAV1_Grid,        m_decalGridUAV,   cl);
 
@@ -297,9 +301,9 @@ RHI::CommandList DecalPass::Execute(RHI::CommandList cl)
 
     // ---- Pass 2: Apply to GBuffer -------------------------------------------
     gfx.BindComputePipelineState(m_applyPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_applyCB, 0, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_applyCB.CurrentBuffer(gfx), 0, cl);
 
-    gfx.SetComputeDescriptorTable(kSRV1_Decals,     m_decalsSRV,     cl);
+    gfx.SetComputeDescriptorTable(kSRV1_Decals,     decalsSRV,       cl);
 
     // Depth SRV — resolve current physical texture's SRV handle.
     const auto& ctx = cl.GetContext();
@@ -366,13 +370,12 @@ void DecalPass::DispatchCull(RHI::CommandList cl)
 
     // Refresh cull-side CB — camera was set in SetCamera(), decalCount is live.
     m_cullCB_data.decalCount = m_decalCount;
-    if (m_cullCBMapped)
-        std::memcpy(m_cullCBMapped, &m_cullCB_data, sizeof(m_cullCB_data));
+    if (auto* slot = m_cullCB.Current(gfx)) *slot = m_cullCB_data;
 
     gfx.BindComputePipelineState(m_cullPSO, cl);
-    gfx.SetComputeRootCBV(kCBSlot, m_cullCB, 0, cl);
+    gfx.SetComputeRootCBV(kCBSlot, m_cullCB.CurrentBuffer(gfx), 0, cl);
     gfx.SetComputeDescriptorTable(kSRV0_ClusterAABB, m_clusterAABBSRV, cl);
-    gfx.SetComputeDescriptorTable(kSRV1_Decals,      m_decalsSRV,      cl);
+    gfx.SetComputeDescriptorTable(kSRV1_Decals,      m_decalsSRV[gfx.GetFrameIndex()], cl);
     gfx.SetComputeDescriptorTable(kUAV0_IndexList,   m_decalIndexUAV,  cl);
     gfx.SetComputeDescriptorTable(kUAV1_Grid,        m_decalGridUAV,   cl);
 

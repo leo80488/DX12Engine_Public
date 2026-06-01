@@ -186,6 +186,15 @@ namespace AI
             if constexpr (!std::is_same_v<A, B>) return false;
             else if constexpr (std::is_same_v<A, DirectX::XMFLOAT3>)
                 return a.x == b.x && a.y == b.y && a.z == b.z;
+            else if constexpr (std::is_same_v<A, std::vector<DirectX::XMFLOAT3>>)
+            {
+                // std::vector<XMFLOAT3> has no operator== (XMFLOAT3 lacks one).
+                if (a.size() != b.size()) return false;
+                for (size_t i = 0; i < a.size(); ++i)
+                    if (a[i].x != b[i].x || a[i].y != b[i].y || a[i].z != b[i].z)
+                        return false;
+                return true;
+            }
             else
                 return a == b;
         }, it->second, *expected);
