@@ -1,3 +1,5 @@
+**English** | [日本語](CREDITS.ja.md)
+
 # Credits & References
 
 ## Acknowledgments

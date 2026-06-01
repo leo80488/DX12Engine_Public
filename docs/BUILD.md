@@ -1,3 +1,5 @@
+**English** | [日本語](BUILD.ja.md)
+
 # Build
 
 > Built against Visual Studio 2022, Windows 10 SDK (10.0.26100.0), MSVC v143, C++20.

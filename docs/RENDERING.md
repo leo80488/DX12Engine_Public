@@ -1,3 +1,5 @@
+**English** | [日本語](RENDERING.ja.md)
+
 # Rendering Pipeline
 
 ## Geometry / Visibility

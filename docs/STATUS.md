@@ -1,3 +1,5 @@
+**English** | [日本語](STATUS.ja.md)
+
 # Status & Limitations
 
 - Single-window, single-viewport.
