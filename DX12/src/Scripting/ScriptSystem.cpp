@@ -24,6 +24,41 @@
 using namespace DirectX;
 namespace fs = std::filesystem;
 
+// ---------------------------------------------------------------------------
+// Per-entity Lua instance storage helpers.
+//
+// Each entity's logic instances live as a Lua array at
+// (*m_lua)["__logic_instances"][entityId]. Slots are stored 1-based
+// ([slot + 1]) so they read back as a clean Lua array. These helpers keep the
+// nested lookup in one place; callers guard on the returned table's .valid().
+// ---------------------------------------------------------------------------
+namespace
+{
+    // Returns the per-entity instance array, creating it on demand when
+    // `create` is set. When `create` is false and none exists, returns an
+    // invalid (nil) table.
+    sol::table GetInstanceArray(sol::state& lua, uint32_t e, bool create)
+    {
+        sol::object o = lua["__logic_instances"][e];
+        if (o.get_type() == sol::type::table) return o.as<sol::table>();
+        if (!create) return sol::table{};
+        sol::table t = lua.create_table();
+        lua["__logic_instances"][e] = t;
+        return t;
+    }
+
+    // Returns the slot's instance table, or an invalid (nil) table if the
+    // entity has no array or the slot is empty.
+    sol::table GetInstance(sol::state& lua, uint32_t e, std::size_t slot)
+    {
+        sol::object arr = lua["__logic_instances"][e];
+        if (arr.get_type() != sol::type::table) return sol::table{};
+        sol::object inst = arr.as<sol::table>()[slot + 1];
+        if (inst.get_type() != sol::type::table) return sol::table{};
+        return inst.as<sol::table>();
+    }
+}
+
 // ===========================================================================
 // LuaBus (pImpl) — string-keyed Lua event queue.
 //
@@ -450,11 +485,25 @@ void ScriptSystem::RegisterBindings()
         [this](uint32_t id, const std::string& path) -> bool
         {
             if (!m_world) return false;
-            if (!m_world->IsAlive(static_cast<Entity>(id))) return false;
-            ScriptComponent sc;
-            sc.scriptPath = path;
-            sc.enabled    = true;
-            m_world->AddComponent(static_cast<Entity>(id), sc);
+            const Entity e = static_cast<Entity>(id);
+            if (!m_world->IsAlive(e)) return false;
+
+            // Append a slot — never clobber scripts already attached. The new
+            // slot is picked up (template loaded, OnSpawn fired) on the next
+            // ScriptSystem::Update when the reconcile loop sees the longer
+            // ScriptComponent::scripts vector.
+            ScriptComponent* sc = m_world->GetComponent<ScriptComponent>(e);
+            if (!sc)
+            {
+                m_world->AddComponent<ScriptComponent>(e, {});
+                sc = m_world->GetComponent<ScriptComponent>(e);
+            }
+            if (!sc) return false;
+
+            ScriptInstance si;
+            si.scriptPath = path;
+            si.enabled    = true;
+            sc->scripts.push_back(std::move(si));
             return true;
         });
 
@@ -733,18 +782,23 @@ void ScriptSystem::RegisterBindings()
         [this](uint32_t selfId, uint32_t otherId)
         {
             auto sIt = m_states.find(static_cast<Entity>(selfId));
-            if (sIt == m_states.end() || !sIt->second.initCalled) return;
-            sol::table inst = (*m_lua)["__logic_instances"][selfId];
-            if (!inst.valid()) return;
-            sol::protected_function fn = inst["OnEnter"];
-            if (!fn.valid()) return;
-            // No point/normal for manual triggers — pass nil so scripts can
+            if (sIt == m_states.end()) return;
+            // Fire OnEnter on every slot whose instance defines it. No
+            // point/normal for manual triggers — pass nil so scripts can
             // distinguish (or just ignore). Same arg shape as the physics path.
-            auto res = fn(inst, otherId, sol::lua_nil, sol::lua_nil);
-            if (!res.valid()) {
-                sol::error err = res;
-                LOG_ERROR("Lua OnEnter error [%s] entity %u: %s",
-                          sIt->second.path.c_str(), selfId, err.what());
+            for (std::size_t i = 0; i < sIt->second.slots.size(); ++i)
+            {
+                if (!sIt->second.slots[i].initCalled) continue;
+                sol::table inst = GetInstance(*m_lua, selfId, i);
+                if (!inst.valid()) continue;
+                sol::protected_function fn = inst["OnEnter"];
+                if (!fn.valid()) continue;
+                auto res = fn(inst, otherId, sol::lua_nil, sol::lua_nil);
+                if (!res.valid()) {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnEnter error [%s] entity %u slot %zu: %s",
+                              sIt->second.slots[i].path.c_str(), selfId, i, err.what());
+                }
             }
         });
 
@@ -752,19 +806,24 @@ void ScriptSystem::RegisterBindings()
         [this](uint32_t entityId, const std::string& name, sol::object payload)
         {
             auto sIt = m_states.find(static_cast<Entity>(entityId));
-            if (sIt == m_states.end() || !sIt->second.initCalled) return;
-            sol::table inst = (*m_lua)["__logic_instances"][entityId];
-            if (!inst.valid()) return;
-            sol::protected_function fn = inst["OnAnimEvent"];
-            if (!fn.valid()) return;
+            if (sIt == m_states.end()) return;
             // Forward payload as-is (table, number, string, nil — script's
-            // contract). Engine doesn't synthesize an empty table here.
-            auto res = fn(inst, name, payload);
-            if (!res.valid()) {
-                sol::error err = res;
-                LOG_ERROR("Lua OnAnimEvent error [%s] entity %u name=%s: %s",
-                          sIt->second.path.c_str(), entityId,
-                          name.c_str(), err.what());
+            // contract). Engine doesn't synthesize an empty table here. Fire on
+            // every slot whose instance defines OnAnimEvent.
+            for (std::size_t i = 0; i < sIt->second.slots.size(); ++i)
+            {
+                if (!sIt->second.slots[i].initCalled) continue;
+                sol::table inst = GetInstance(*m_lua, entityId, i);
+                if (!inst.valid()) continue;
+                sol::protected_function fn = inst["OnAnimEvent"];
+                if (!fn.valid()) continue;
+                auto res = fn(inst, name, payload);
+                if (!res.valid()) {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnAnimEvent error [%s] entity %u slot %zu name=%s: %s",
+                              sIt->second.slots[i].path.c_str(), entityId, i,
+                              name.c_str(), err.what());
+                }
             }
         });
 
@@ -882,10 +941,10 @@ bool ScriptSystem::LoadLogicTemplate(const std::string& path)
 }
 
 // ---------------------------------------------------------------------------
-// EnsureLogicInstance — create a per-entity instance from the template,
-// install metatable inheritance, and fire OnSpawn(self, entity).
+// EnsureLogicInstance — create one slot's instance from the template, install
+// metatable inheritance, and fire OnSpawn(self, entity).
 // ---------------------------------------------------------------------------
-bool ScriptSystem::EnsureLogicInstance(Entity e, const std::string& path,
+bool ScriptSystem::EnsureLogicInstance(Entity e, std::size_t slot, const std::string& path,
                                        const std::unordered_map<std::string, ScriptVarValue>* overrides)
 {
     auto tmplIt = m_logicTemplates.find(path);
@@ -899,15 +958,18 @@ bool ScriptSystem::EnsureLogicInstance(Entity e, const std::string& path,
     mt["__index"]   = tmpl;
     inst[sol::metatable_key] = mt;
 
-    // Convenience: every instance has self.entity pre-set.
+    // Convenience: every instance has self.entity and self.slot pre-set so a
+    // script can tell which entity it is bound to and which slot it occupies.
     inst["entity"] = static_cast<uint32_t>(e);
+    inst["slot"]   = static_cast<uint32_t>(slot);
 
-    (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)] = inst;
+    sol::table arr = GetInstanceArray(*m_lua, static_cast<uint32_t>(e), /*create*/ true);
+    arr[slot + 1] = inst;
 
-    // Inject editor-exposed variables (schema defaults + per-entity overrides)
+    // Inject editor-exposed variables (schema defaults + per-slot overrides)
     // onto the instance table BEFORE OnSpawn so the script reads them as
     // self.<name> on its very first tick.
-    InjectExposedVars(e, path, overrides);
+    InjectExposedVars(e, slot, path, overrides);
 
     if (tmplIt->second.hasSpawn)
     {
@@ -915,41 +977,79 @@ bool ScriptSystem::EnsureLogicInstance(Entity e, const std::string& path,
         auto res = fn(inst, static_cast<uint32_t>(e));
         if (!res.valid()) {
             sol::error err = res;
-            LOG_ERROR("Lua OnSpawn error [%s] entity %u: %s",
-                      path.c_str(), e, err.what());
+            LOG_ERROR("Lua OnSpawn error [%s] entity %u slot %zu: %s",
+                      path.c_str(), e, slot, err.what());
         }
     }
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// DestroyLogicInstance — fire OnDestroy(self) and drop the instance table.
+// FireSlotDestroy — fire OnDestroy(self) on one slot and drop its Lua table.
+//
+// Takes the slot metadata BY VALUE-equivalent (copied locally up front) so it
+// never touches m_states after the callback — the OnDestroy handler is free to
+// destroy entities, which mutates m_states. Crucially it NILS the registry slot
+// BEFORE invoking OnDestroy (holding a local ref so `self` stays valid): a
+// re-entrant teardown of the same slot — e.g. an OnDestroy that destroys its own
+// entity — then sees the slot already gone and cannot double-fire.
 // ---------------------------------------------------------------------------
-void ScriptSystem::DestroyLogicInstance(Entity e)
+void ScriptSystem::FireSlotDestroy(Entity e, std::size_t slot, const LogicSlot& ls)
 {
-    auto sIt = m_states.find(e);
-    if (sIt == m_states.end()) return;
+    const std::string path       = ls.path;        // copy — `ls` may be erased
+    const bool        initCalled = ls.initCalled;  // out from under us by OnDestroy
 
-    auto tmplIt = m_logicTemplates.find(sIt->second.path);
-    if (tmplIt != m_logicTemplates.end() &&
-        tmplIt->second.hasDestroy &&
-        sIt->second.initCalled)
+    sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(e), slot);
+
+    // Detach from the registry first so re-entrant teardown is a no-op. `inst`
+    // keeps the table alive across the OnDestroy call.
+    sol::table arr = GetInstanceArray(*m_lua, static_cast<uint32_t>(e), /*create*/ false);
+    if (arr.valid()) arr[slot + 1] = sol::lua_nil;
+
+    if (!inst.valid()) return;
+
+    auto tmplIt = m_logicTemplates.find(path);
+    if (tmplIt != m_logicTemplates.end() && tmplIt->second.hasDestroy && initCalled)
     {
-        sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
-        if (inst.valid())
+        sol::protected_function fn = inst["OnDestroy"];
+        if (fn.valid())
         {
-            sol::protected_function fn = inst["OnDestroy"];
-            if (fn.valid())
-            {
-                auto res = fn(inst);
-                if (!res.valid()) {
-                    sol::error err = res;
-                    LOG_ERROR("Lua OnDestroy error [%s] entity %u: %s",
-                              sIt->second.path.c_str(), e, err.what());
-                }
+            auto res = fn(inst);
+            if (!res.valid()) {
+                sol::error err = res;
+                LOG_ERROR("Lua OnDestroy error [%s] entity %u slot %zu: %s",
+                          path.c_str(), e, slot, err.what());
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DestroyLogicInstance — tear down ONE slot's instance while keeping the
+// entity's state (used by the Update reconcile on shrink / path change). The
+// caller must re-find m_states[e] afterwards: OnDestroy may have erased it.
+// ---------------------------------------------------------------------------
+void ScriptSystem::DestroyLogicInstance(Entity e, std::size_t slot)
+{
+    auto sIt = m_states.find(e);
+    if (sIt == m_states.end() || slot >= sIt->second.slots.size()) return;
+    FireSlotDestroy(e, slot, sIt->second.slots[slot]);
+}
+
+// ---------------------------------------------------------------------------
+// TeardownEntity — destroy every slot of an entity and drop its whole instance
+// array. Used on entity destruction / sweep. Erases the m_states entry FIRST
+// (working from a moved-out copy of the slots) so a re-entrant DestroyEntity
+// from within an OnDestroy callback finds nothing and cannot double-tear-down.
+// ---------------------------------------------------------------------------
+void ScriptSystem::TeardownEntity(Entity e)
+{
+    auto it = m_states.find(e);
+    if (it == m_states.end()) return;
+    const std::vector<LogicSlot> slots = std::move(it->second.slots);
+    m_states.erase(it);
+    for (std::size_t i = 0; i < slots.size(); ++i)
+        FireSlotDestroy(e, i, slots[i]);
     (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)] = sol::lua_nil;
 }
 
@@ -1060,7 +1160,7 @@ const std::vector<ScriptVarDesc>& ScriptSystem::GetExposedSchema(const std::stri
 // present, else default) onto the entity's live instance table. Float3/Color
 // land as Vec3 userdata (self.v.x/.y/.z); strings/assets as plain strings.
 // ---------------------------------------------------------------------------
-void ScriptSystem::InjectExposedVars(Entity e, const std::string& path,
+void ScriptSystem::InjectExposedVars(Entity e, std::size_t slot, const std::string& path,
                                      const std::unordered_map<std::string, ScriptVarValue>* overrides)
 {
     auto it = m_logicTemplates.find(path);
@@ -1068,7 +1168,7 @@ void ScriptSystem::InjectExposedVars(Entity e, const std::string& path,
     const std::vector<ScriptVarDesc>& schema = it->second.exposed;
     if (schema.empty()) return;
 
-    sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
+    sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(e), slot);
     if (!inst.valid()) return;
 
     static const std::unordered_map<std::string, ScriptVarValue> kEmpty;
@@ -1092,16 +1192,18 @@ void ScriptSystem::InjectExposedVars(Entity e, const std::string& path,
 }
 
 // ---------------------------------------------------------------------------
-// ApplyExposedVars — push the component's current var values onto the live
-// instance (editor calls this during Play so slider drags show immediately).
+// ApplyExposedVars — push one slot's current var values onto its live instance
+// (editor calls this during Play so slider drags show immediately).
 // ---------------------------------------------------------------------------
-void ScriptSystem::ApplyExposedVars(Entity e,
+void ScriptSystem::ApplyExposedVars(Entity e, std::size_t slot,
                                     const std::unordered_map<std::string, ScriptVarValue>& overrides)
 {
     if (!m_lua) return;
     auto sIt = m_states.find(e);
-    if (sIt == m_states.end() || sIt->second.path.empty()) return;
-    InjectExposedVars(e, sIt->second.path, &overrides);
+    if (sIt == m_states.end() || slot >= sIt->second.slots.size()) return;
+    const std::string& path = sIt->second.slots[slot].path;
+    if (path.empty()) return;
+    InjectExposedVars(e, slot, path, &overrides);
 }
 
 // ===========================================================================
@@ -1284,16 +1386,20 @@ bool ScriptSystem::LoadUIScript(const std::string& path)
 void ScriptSystem::DispatchAnimEvent(Entity e, const std::string& name)
 {
     auto sIt = m_states.find(e);
-    if (sIt == m_states.end() || !sIt->second.initCalled) return;
-    sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
-    if (!inst.valid()) return;
-    sol::protected_function fn = inst["OnAnimEvent"];
-    if (!fn.valid()) return;
-    auto res = fn(inst, name, sol::lua_nil);
-    if (!res.valid()) {
-        sol::error err = res;
-        LOG_ERROR("Lua OnAnimEvent error [%s] entity %u name=%s: %s",
-                  sIt->second.path.c_str(), e, name.c_str(), err.what());
+    if (sIt == m_states.end()) return;
+    for (std::size_t i = 0; i < sIt->second.slots.size(); ++i)
+    {
+        if (!sIt->second.slots[i].initCalled) continue;
+        sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(e), i);
+        if (!inst.valid()) continue;
+        sol::protected_function fn = inst["OnAnimEvent"];
+        if (!fn.valid()) continue;
+        auto res = fn(inst, name, sol::lua_nil);
+        if (!res.valid()) {
+            sol::error err = res;
+            LOG_ERROR("Lua OnAnimEvent error [%s] entity %u slot %zu name=%s: %s",
+                      sIt->second.slots[i].path.c_str(), e, i, name.c_str(), err.what());
+        }
     }
 }
 
@@ -1356,22 +1462,21 @@ void ScriptSystem::UnbindWorld()
 
 void ScriptSystem::OnEntityDestroyed(World& /*world*/, Entity e)
 {
-    auto it = m_states.find(e);
-    if (it == m_states.end()) return;
-    DestroyLogicInstance(e);
-    m_states.erase(it);
+    TeardownEntity(e);   // erase-first + re-entrancy-safe (see TeardownEntity)
 }
 
 void ScriptSystem::SweepDestroyed(World& world)
 {
-    for (auto it = m_states.begin(); it != m_states.end(); )
-    {
-        const Entity e = it->first;
-        const bool gone = !world.IsAlive(e) || !world.HasComponent<ScriptComponent>(e);
-        if (!gone) { ++it; continue; }
-        DestroyLogicInstance(e);
-        it = m_states.erase(it);
-    }
+    // Collect dead entities first, then tear down: FireSlotDestroy runs OnDestroy
+    // (Lua), which can mutate m_states and invalidate iterators. TeardownEntity
+    // re-finds each entry, so an entry already cleaned by a prior callback is a
+    // harmless no-op.
+    std::vector<Entity> dead;
+    for (auto& [e, st] : m_states)
+        if (!world.IsAlive(e) || !world.HasComponent<ScriptComponent>(e))
+            dead.push_back(e);
+    for (Entity e : dead)
+        TeardownEntity(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,17 +1563,20 @@ void ScriptSystem::RegisterCppEventBridges()
                 auto fire = [&](Entity self, Entity other)
                 {
                     auto sIt = m_states.find(self);
-                    if (sIt == m_states.end() || !sIt->second.initCalled) return;
-                    sol::table inst = (*m_lua)["__logic_instances"]
-                        [static_cast<uint32_t>(self)];
-                    if (!inst.valid()) return;
-                    sol::protected_function fn = inst["OnEnter"];
-                    if (!fn.valid()) return;
-                    auto res = fn(inst, static_cast<uint32_t>(other), point, normal);
-                    if (!res.valid()) {
-                        sol::error err = res;
-                        LOG_ERROR("Lua OnEnter error [%s] entity %u: %s",
-                                  sIt->second.path.c_str(), self, err.what());
+                    if (sIt == m_states.end()) return;
+                    for (std::size_t i = 0; i < sIt->second.slots.size(); ++i)
+                    {
+                        if (!sIt->second.slots[i].initCalled) continue;
+                        sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(self), i);
+                        if (!inst.valid()) continue;
+                        sol::protected_function fn = inst["OnEnter"];
+                        if (!fn.valid()) continue;
+                        auto res = fn(inst, static_cast<uint32_t>(other), point, normal);
+                        if (!res.valid()) {
+                            sol::error err = res;
+                            LOG_ERROR("Lua OnEnter error [%s] entity %u slot %zu: %s",
+                                      sIt->second.slots[i].path.c_str(), self, i, err.what());
+                        }
                     }
                 };
                 fire(e.bodyA.entity, e.bodyB.entity);
@@ -1537,63 +1645,123 @@ void ScriptSystem::Update(World& world, float dt)
     const std::vector<Entity> entitiesSnapshot(
         scPool->Entities().begin(), scPool->Entities().end());
 
+    // Every Lua callback below (OnSpawn / OnUpdate / teardown OnDestroy) can,
+    // via Engine.DestroyEntity, synchronously erase this entity's m_states entry
+    // (World fires destroy-listeners inline) or reallocate sc->scripts (a script
+    // that AttachScripts to itself). So we hold NO long-lived references across a
+    // callback: the component pointer and the m_states iterator are re-fetched
+    // after every step, and scalar fields are copied out before use.
     for (Entity e : entitiesSnapshot)
     {
         if (!world.IsAlive(e)) continue;
         auto* sc = scPool->Get(e);
-        if (!sc || sc->scriptPath.empty() || !sc->enabled) continue;
+        if (!sc) continue;
 
-        auto& st = m_states[e];
-
-        // Lazy load template / re-load on path change.
-        if (st.path != sc->scriptPath)
+        // Ensure per-entity state + capture baseline transform once (shared by
+        // all scripts). No Lua runs here, so this short-lived ref is safe.
         {
-            // Path changed (or first sight). Tear down old instance if any.
-            if (!st.path.empty()) DestroyLogicInstance(e);
-            st = {};                           // reset metadata
-            st.path = sc->scriptPath;
+            auto& st = m_states[e];
+            if (!st.baseCaptured)
+            {
+                if (const LocalTransform* lt = world.GetComponent<LocalTransform>(e))
+                    st.baseTransform = *lt;
+                st.baseCaptured = true;
+            }
         }
 
-        // Ensure template loaded.
-        if (m_logicTemplates.find(sc->scriptPath) == m_logicTemplates.end())
+        const std::size_t n = sc->scripts.size();
+
+        // Reconcile slot count. Tearing down trailing slots fires OnDestroy,
+        // which may destroy this entity — re-find after each and bail if gone.
         {
-            if (!LoadLogicTemplate(sc->scriptPath)) continue;
+            auto it = m_states.find(e);
+            if (it == m_states.end()) continue;
+            if (it->second.slots.size() > n)
+            {
+                const std::size_t old = it->second.slots.size();
+                for (std::size_t i = n; i < old; ++i)
+                {
+                    DestroyLogicInstance(e, i);
+                    if (m_states.find(e) == m_states.end()) break;  // self-destroyed
+                }
+                it = m_states.find(e);
+                if (it == m_states.end()) continue;
+                it->second.slots.resize(n);
+            }
+            else if (it->second.slots.size() < n)
+            {
+                it->second.slots.resize(n);
+            }
         }
-        st.loaded = true;
 
-        // Snapshot baseline LocalTransform once. Done BEFORE OnSpawn so the
-        // script can read GetBasePosition() inside OnSpawn.
-        if (!st.baseCaptured)
+        // Drive each slot independently.
+        for (std::size_t i = 0; i < n; ++i)
         {
-            if (const LocalTransform* lt = world.GetComponent<LocalTransform>(e))
-                st.baseTransform = *lt;
-            st.baseCaptured = true;
-        }
+            sc = scPool->Get(e);
+            auto it = m_states.find(e);
+            if (!sc || it == m_states.end()) break;             // entity gone
+            if (i >= sc->scripts.size() || i >= it->second.slots.size()) break;
 
-        // Ensure instance + fire OnSpawn once.
-        if (!st.initCalled)
-        {
-            if (!EnsureLogicInstance(e, sc->scriptPath, &sc->vars)) continue;
-            st.initCalled = true;
-        }
+            const std::string path    = sc->scripts[i].scriptPath;  // copy
+            const bool        enabled = sc->scripts[i].enabled;
 
-        // Per-frame OnUpdate(self, dt).
-        const auto& tmpl = m_logicTemplates[sc->scriptPath];
-        if (tmpl.hasUpdate)
-        {
-            sol::table inst = (*m_lua)["__logic_instances"][static_cast<uint32_t>(e)];
-            if (!inst.valid()) continue;
+            // Path changed at this slot (first sight, edited path, or a Remove
+            // shifted entries up) → tear down the old instance and reset meta.
+            if (it->second.slots[i].path != path)
+            {
+                if (!it->second.slots[i].path.empty())
+                {
+                    DestroyLogicInstance(e, i);            // fires OnDestroy (Lua)
+                    it = m_states.find(e);
+                    if (it == m_states.end()) break;
+                    if (i >= it->second.slots.size()) break;
+                }
+                it->second.slots[i] = {};
+                it->second.slots[i].path = path;
+            }
 
-            sol::protected_function fn = inst["OnUpdate"];
-            auto res = fn(inst, dt);
-            if (!res.valid()) {
-                sol::error err = res;
-                LOG_ERROR("Lua OnUpdate error [%s] entity %u: %s",
-                          st.path.c_str(), e, err.what());
-                // Disable this entity's update to stop spamming. Mark template
-                // hasUpdate = false would disable for ALL entities — wrong.
-                // Cheap workaround: clear path so next frame skips load.
-                sc->enabled = false;
+            if (path.empty() || !enabled) continue;
+
+            // Ensure template loaded.
+            if (m_logicTemplates.find(path) == m_logicTemplates.end())
+            {
+                if (!LoadLogicTemplate(path)) continue;
+            }
+
+            // Ensure instance + fire OnSpawn once for this slot. The vars
+            // pointer is consumed (InjectExposedVars) before OnSpawn runs, so it
+            // is safe even though OnSpawn may later reallocate the vector. A
+            // failed spawn leaves initCalled=false (retry next frame) and skips
+            // OnUpdate this frame.
+            if (!it->second.slots[i].initCalled)
+            {
+                const bool ok = EnsureLogicInstance(e, i, path, &sc->scripts[i].vars);
+                it = m_states.find(e);
+                if (it == m_states.end()) break;          // OnSpawn destroyed e
+                if (i >= it->second.slots.size()) break;
+                if (!ok) continue;
+                it->second.slots[i].initCalled = true;
+            }
+
+            // Per-frame OnUpdate(self, dt).
+            auto tmplIt = m_logicTemplates.find(path);
+            if (tmplIt != m_logicTemplates.end() && tmplIt->second.hasUpdate)
+            {
+                sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(e), i);
+                if (!inst.valid()) continue;
+
+                sol::protected_function fn = inst["OnUpdate"];
+                auto res = fn(inst, dt);
+                if (!res.valid()) {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnUpdate error [%s] entity %u slot %zu: %s",
+                              path.c_str(), e, i, err.what());
+                    // Disable only this slot to stop spamming — other scripts on
+                    // the same entity keep running. Re-fetch in case OnUpdate
+                    // moved the component / destroyed the entity, and bounds-check.
+                    sc = scPool->Get(e);
+                    if (sc && i < sc->scripts.size()) sc->scripts[i].enabled = false;
+                }
             }
         }
     }
@@ -1624,18 +1792,21 @@ void ScriptSystem::CheckHotReload(World& /*world*/)
                 LOG_INFO("ScriptSystem: hot-reload logic template [%s]", path.c_str());
                 if (!LoadLogicTemplate(path)) continue;
                 // Re-point every live instance's metatable.__index at the
-                // freshly loaded template. Per-entity self.entity / cached
-                // fields survive untouched.
+                // freshly loaded template. Per-slot self.entity / self.slot /
+                // cached fields survive untouched. An entity may have several
+                // slots bound to the same template — re-point each.
                 sol::table newTmpl = (*m_lua)["__logic_templates"][path];
                 for (auto& [entity, st] : m_states)
                 {
-                    if (st.path != path) continue;
-                    sol::table inst = (*m_lua)["__logic_instances"]
-                        [static_cast<uint32_t>(entity)];
-                    if (!inst.valid()) continue;
-                    sol::table mt = m_lua->create_table();
-                    mt["__index"] = newTmpl;
-                    inst[sol::metatable_key] = mt;
+                    for (std::size_t i = 0; i < st.slots.size(); ++i)
+                    {
+                        if (st.slots[i].path != path) continue;
+                        sol::table inst = GetInstance(*m_lua, static_cast<uint32_t>(entity), i);
+                        if (!inst.valid()) continue;
+                        sol::table mt = m_lua->create_table();
+                        mt["__index"] = newTmpl;
+                        inst[sol::metatable_key] = mt;
+                    }
                 }
                 continue;
             }

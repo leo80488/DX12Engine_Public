@@ -330,7 +330,9 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 " ex=%.4f ey=%.4f ez=%.4f"
                 " px=%u py=%u pz=%u rays=%u"
                 " hyst=%.4f nb=%.4f vb=%.4f bfr=%.4f"
-                " reloc=%u classify=%u prio=%d cascade=%u dbg=%u"
+                // NOTE: debugDraw is intentionally NOT serialized — it is an
+                // editor-only debug toggle, not gameplay/authoring data.
+                " reloc=%u classify=%u prio=%d cascade=%u"
                 " tx=%.4f ty=%.4f tz=%.4f tscale=%.4f\n",
                 v->origin.x, v->origin.y, v->origin.z,
                 v->extent.x, v->extent.y, v->extent.z,
@@ -339,7 +341,6 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 v->enableRelocation     ? 1u : 0u,
                 v->enableClassification ? 1u : 0u,
                 v->priority, v->cascadeLevel,
-                v->debugDraw            ? 1u : 0u,
                 v->diffuseTint.x, v->diffuseTint.y, v->diffuseTint.z, v->diffuseScale);
             ss << buf;
         },
@@ -359,7 +360,8 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             v.enableClassification = GetI(kv, "classify", v.enableClassification ? 1 : 0) != 0;
             v.priority      = GetI(kv, "prio",    v.priority);
             v.cascadeLevel  = static_cast<uint32_t>(GetI(kv, "cascade", static_cast<int>(v.cascadeLevel)));
-            v.debugDraw     = GetI(kv, "dbg",     v.debugDraw ? 1 : 0) != 0;
+            // debugDraw is editor-only and no longer persisted (legacy "dbg="
+            // tokens in old scenes are simply ignored → defaults to false).
             v.diffuseTint   = { GetF(kv, "tx", v.diffuseTint.x),
                                 GetF(kv, "ty", v.diffuseTint.y),
                                 GetF(kv, "tz", v.diffuseTint.z) };
@@ -900,18 +902,20 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
         [](World& w, Entity e, std::ostringstream& ss) {
             const auto* c = w.GetComponent<CameraControllerComponent>(e);
             if (!c) return;
-            char buf[256];
+            char buf[320];
             snprintf(buf, sizeof(buf),
                 "  CameraController: yaw=%.4f pitch=%.4f"
                 " mouseSensitivity=%.5f moveSpeed=%.4f mode=%d"
                 " tpDist=%.3f hx=%.3f hy=%.3f hz=%.3f"
-                " sx=%.3f sy=%.3f sz=%.3f camCol=%d camProbe=%.3f",
+                " sx=%.3f sy=%.3f sz=%.3f camCol=%d camProbe=%.3f"
+                " fLag=%.4f dLag=%.4f",
                 c->yaw, c->pitch, c->mouseSensitivity, c->moveSpeed,
                 (int)c->mode,
                 c->thirdPersonDistance,
                 c->headOffset.x, c->headOffset.y, c->headOffset.z,
                 c->shoulderOffset.x, c->shoulderOffset.y, c->shoulderOffset.z,
-                (int)c->cameraCollisionEnabled, c->cameraProbeRadius);
+                (int)c->cameraCollisionEnabled, c->cameraProbeRadius,
+                c->followLag, c->distanceLag);
             ss << buf;
             WriteAttachmentRef(ss, "followTarget", w, c->followTarget);
             ss << '\n';
@@ -929,6 +933,8 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             c.shoulderOffset          = { GetF(kv,"sx",0.30f), GetF(kv,"sy",1.60f), GetF(kv,"sz",0.f) };
             c.cameraCollisionEnabled  = GetI(kv, "camCol",   1) != 0;
             c.cameraProbeRadius       = GetF(kv, "camProbe", 0.20f);
+            c.followLag               = GetF(kv, "fLag",     0.0f);
+            c.distanceLag             = GetF(kv, "dLag",     0.0f);
             ReadAttachmentRef(kv, "followTarget", "followTarget", w, e, c.followTarget);
             w.AddComponent<CameraControllerComponent>(e, c);
         }
@@ -2031,39 +2037,63 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
         }
     });
 
-    // ==== ScriptComponent (INLINE) ====
+    // ==== ScriptComponent (INLINE — one "Script:" line per attached slot) ====
+    // An entity may have several scripts. We emit one indented "Script:" line
+    // per slot; on load the scene/prefab dispatcher calls our deserialize once
+    // per line (see SceneSerializer dispatch loop), so each line APPENDS a slot
+    // to the entity's ScriptComponent. Old single-line saves load unchanged as
+    // a one-slot component. An empty component emits a "slots=0" marker line so
+    // it survives a round-trip.
     reg.Register(std::type_index(typeid(ScriptComponent)), {
         "Script",
         [](World& w, Entity e) { return w.GetComponent<ScriptComponent>(e) != nullptr; },
         [](World& w, Entity e, std::ostringstream& ss) {
             const auto* sc = w.GetComponent<ScriptComponent>(e);
             if (!sc) return;
-            ss << "  Script: path=" << PercentEncode(sc->scriptPath)
-               << " enabled=" << (sc->enabled ? 1 : 0);
-            // Exposed-variable overrides — one `var.<name>=<typechar>:<val>`
-            // token per entry (mirrors the MaterialOverride inline format).
-            for (const auto& [name, val] : sc->vars)
+            if (sc->scripts.empty())
             {
-                ss << " var." << PercentEncode(name) << "=" << ScriptVarTypeToChar(val.type) << ":";
-                switch (val.type)
-                {
-                case ScriptVarType::Float:  ss << val.data.f; break;
-                case ScriptVarType::Int:    ss << val.data.i; break;
-                case ScriptVarType::Bool:   ss << (val.data.b ? 1 : 0); break;
-                case ScriptVarType::Float3:
-                case ScriptVarType::Color:  ss << val.data.v3[0] << "_" << val.data.v3[1]
-                                               << "_" << val.data.v3[2]; break;
-                case ScriptVarType::Entity: ss << val.data.entity; break;
-                case ScriptVarType::String:
-                case ScriptVarType::Asset:  ss << PercentEncode(val.str); break;
-                }
+                ss << "  Script: slots=0\n";  // marker — keep the (inert) component on reload
+                return;
             }
-            ss << "\n";
+            for (const auto& si : sc->scripts)
+            {
+                ss << "  Script: path=" << PercentEncode(si.scriptPath)
+                   << " enabled=" << (si.enabled ? 1 : 0);
+                // Exposed-variable overrides — one `var.<name>=<typechar>:<val>`
+                // token per entry (mirrors the MaterialOverride inline format).
+                for (const auto& [name, val] : si.vars)
+                {
+                    ss << " var." << PercentEncode(name) << "=" << ScriptVarTypeToChar(val.type) << ":";
+                    switch (val.type)
+                    {
+                    case ScriptVarType::Float:  ss << val.data.f; break;
+                    case ScriptVarType::Int:    ss << val.data.i; break;
+                    case ScriptVarType::Bool:   ss << (val.data.b ? 1 : 0); break;
+                    case ScriptVarType::Float3:
+                    case ScriptVarType::Color:  ss << val.data.v3[0] << "_" << val.data.v3[1]
+                                                   << "_" << val.data.v3[2]; break;
+                    case ScriptVarType::Entity: ss << val.data.entity; break;
+                    case ScriptVarType::String:
+                    case ScriptVarType::Asset:  ss << PercentEncode(val.str); break;
+                    }
+                }
+                ss << "\n";
+            }
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
-            ScriptComponent sc;
-            sc.scriptPath = PercentDecode(GetS(kv, "path", ""));
-            sc.enabled    = GetI(kv, "enabled", 1) != 0;
+            // Get-or-create the component, then append this line's slot. Calling
+            // AddComponent fresh would clobber slots appended by earlier lines.
+            ScriptComponent* sc = w.GetComponent<ScriptComponent>(e);
+            if (!sc) { w.AddComponent<ScriptComponent>(e, {}); sc = w.GetComponent<ScriptComponent>(e); }
+            if (!sc) return;
+
+            // Marker line for an empty component (no "path" key) → no slot.
+            auto pathIt = kv.find("path");
+            if (pathIt == kv.end()) return;
+
+            ScriptInstance si;
+            si.scriptPath = PercentDecode(pathIt->second);
+            si.enabled    = GetI(kv, "enabled", 1) != 0;
             // Parse exposed-variable override tokens (`var.<name>=<typechar>:<val>`).
             // Absent in old scenes → empty bag (script defaults apply).
             for (const auto& [rawKey, rawVal] : kv)
@@ -2077,25 +2107,25 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 try {
                     switch (type)
                     {
-                    case ScriptVarType::Float:  sc.vars[name] = ScriptVarValue::MakeFloat(std::stof(vs)); break;
-                    case ScriptVarType::Int:    sc.vars[name] = ScriptVarValue::MakeInt(std::stoi(vs));   break;
-                    case ScriptVarType::Bool:   sc.vars[name] = ScriptVarValue::MakeBool(vs != "0");      break;
+                    case ScriptVarType::Float:  si.vars[name] = ScriptVarValue::MakeFloat(std::stof(vs)); break;
+                    case ScriptVarType::Int:    si.vars[name] = ScriptVarValue::MakeInt(std::stoi(vs));   break;
+                    case ScriptVarType::Bool:   si.vars[name] = ScriptVarValue::MakeBool(vs != "0");      break;
                     case ScriptVarType::Float3:
                     case ScriptVarType::Color:
                     {
                         float x = 0.f, y = 0.f, z = 0.f;
                         sscanf_s(vs.c_str(), "%f_%f_%f", &x, &y, &z);
-                        sc.vars[name] = (type == ScriptVarType::Color)
+                        si.vars[name] = (type == ScriptVarType::Color)
                             ? ScriptVarValue::MakeColor (x, y, z)
                             : ScriptVarValue::MakeFloat3(x, y, z);
                     } break;
-                    case ScriptVarType::Entity: sc.vars[name] = ScriptVarValue::MakeEntity((uint32_t)std::stoul(vs)); break;
-                    case ScriptVarType::String: sc.vars[name] = ScriptVarValue::MakeString(PercentDecode(vs)); break;
-                    case ScriptVarType::Asset:  sc.vars[name] = ScriptVarValue::MakeAsset (PercentDecode(vs)); break;
+                    case ScriptVarType::Entity: si.vars[name] = ScriptVarValue::MakeEntity((uint32_t)std::stoul(vs)); break;
+                    case ScriptVarType::String: si.vars[name] = ScriptVarValue::MakeString(PercentDecode(vs)); break;
+                    case ScriptVarType::Asset:  si.vars[name] = ScriptVarValue::MakeAsset (PercentDecode(vs)); break;
                     }
                 } catch (...) {}
             }
-            w.AddComponent<ScriptComponent>(e, std::move(sc));
+            sc->scripts.push_back(std::move(si));
         }
     });
 

@@ -4,6 +4,11 @@
 #ifdef WITH_EDITOR
 #include "Editor/EditorLayer.h"
 #endif
+// DebugDrawSystem is plain engine driver code (compiled into EngineCore — see
+// DX12/CMakeLists.txt). The App::m_debugDraw member is always present so Game
+// builds compile too; only the call sites are WITH_EDITOR-gated. Hence this
+// include must stay OUTSIDE the WITH_EDITOR block.
+#include "Editor/DebugDrawSystem.h"
 #include "Scene/GameModeStack.h"
 
 // ---- Resource systems --------------------------------------------------
@@ -95,6 +100,10 @@ private:
     AI::AILODSystem             m_aiLODSystem;
     DX12Physics::PhysicsSystem  m_physicsSystem;
     Nav::NavMeshSystem          m_navSystem;
+    // Editor-only single submission point for debug visuals (wireframes +
+    // light icons). Driven from the render lambda under WITH_EDITOR; harmless
+    // and untouched in Game builds.
+    DebugDrawSystem             m_debugDraw;
     Audio::AudioEngine          m_audioEngine;
     Audio::AudioSystem          m_audioSystem;
     Audio::Audio3DSystem        m_audio3DSystem;

@@ -104,8 +104,9 @@ LocalTransform CameraSystem::MakeTransform(const CameraControllerComponent& ctrl
 }
 
 void CameraSystem::ResolveFollowing(World& world,
-                                    const CameraControllerComponent& ctrl,
+                                    CameraControllerComponent& ctrl,
                                     LocalTransform& xform,
+                                    float dt,
                                     DX12Physics::PhysicsSystem* physics)
 {
     using Mode = CameraControllerComponent::Mode;
@@ -138,10 +139,14 @@ void CameraSystem::ResolveFollowing(World& world,
         // Glue camera at target + headOffset (head offset is in world axes
         // for simplicity — a target-local offset would need the target's
         // rotation, which we deliberately ignore). Camera position has no
-        // distance term.
+        // distance term. First-person is intentionally rigid (smoothing the
+        // eye would induce lag/nausea); reset the smoothing state so a later
+        // switch to ThirdPerson re-snaps instead of gliding from a stale focus.
         worldPos.x = targetPos.x + ctrl.headOffset.x;
         worldPos.y = targetPos.y + ctrl.headOffset.y;
         worldPos.z = targetPos.z + ctrl.headOffset.z;
+        ctrl.followSmoothInit = false;
+        ctrl.smoothedDistance = 0.f;
     }
     else // ThirdPerson
     {
@@ -152,7 +157,31 @@ void CameraSystem::ResolveFollowing(World& world,
         const XMVECTOR focusV =
             XMVectorAdd(vTrans, XMVectorSet(0.f, ctrl.shoulderOffset.y, 0.f, 0.f));
         const XMVECTOR sideV  = XMVectorScale(camRight, ctrl.shoulderOffset.x);
-        const XMVECTOR focusWithShoulder = XMVectorAdd(focusV, sideV);
+        const XMVECTOR desiredFocus = XMVectorAdd(focusV, sideV);
+
+        // --- Frame-rate-independent focus smoothing -----------------------
+        // Low-pass the orbit pivot so target jitter / 60 Hz interpolation
+        // aliasing doesn't pass straight through to the camera as shake/blur.
+        // We smooth the FOCUS (not the final camera position), so changing
+        // yaw/pitch re-orbits instantly without rubber-banding the radius.
+        // dt<=0 (paused / hit-stop / editor-stopped) snaps so the camera
+        // never glides while the sim is frozen. A large per-frame jump snaps
+        // too, so respawns / warps don't produce a long glide.
+        const bool firstResolve = !ctrl.followSmoothInit;
+        XMVECTOR focusWithShoulder = desiredFocus;
+        if (!firstResolve)
+        {
+            const XMVECTOR prevFocus = XMLoadFloat3(&ctrl.smoothedFocus);
+            const float jump = XMVectorGetX(
+                XMVector3Length(XMVectorSubtract(desiredFocus, prevFocus)));
+            constexpr float kTeleportSnap = 25.0f;  // metres in one frame
+            if (dt > 0.f && ctrl.followLag > 1e-4f && jump < kTeleportSnap)
+            {
+                const float a = 1.f - std::exp(-dt / ctrl.followLag);
+                focusWithShoulder = XMVectorLerp(prevFocus, desiredFocus, a);
+            }
+        }
+        XMStoreFloat3(&ctrl.smoothedFocus, focusWithShoulder);
 
         // Spring-arm collision probe. Sweep a sphere from the focus point
         // (player's chest/shoulder) toward the desired camera pose; on hit,
@@ -160,7 +189,7 @@ void CameraSystem::ResolveFollowing(World& world,
         // No body filter: the CharacterVirtual doesn't register a body in
         // the broadphase by default, so it can't hit itself; if you add an
         // inner body via CCC later, plumb its ID through here.
-        float clampedDistance = ctrl.thirdPersonDistance;
+        float targetDistance = ctrl.thirdPersonDistance;
         if (physics && ctrl.cameraCollisionEnabled && ctrl.thirdPersonDistance > 0.f)
         {
             XMFLOAT3 fromPt; XMStoreFloat3(&fromPt, focusWithShoulder);
@@ -174,9 +203,32 @@ void CameraSystem::ResolveFollowing(World& world,
                 // Pull in to just-before-the-wall. The shrink keeps the camera
                 // outside the wall by the probe radius (Jolt already inset by
                 // the sphere radius via mFraction, so we don't double-inset).
-                clampedDistance = std::max(0.05f, hit.distance);
+                targetDistance = std::max(0.05f, hit.distance);
             }
         }
+
+        // --- Asymmetric distance damping (anti-flicker spring arm) ---------
+        // Pull IN instantly (never let the camera sit inside a wall) but ease
+        // OUT slowly. Without this, an intermittent probe hit (grazing a
+        // corner / ground / railing) toggles the clamp on and off frame-to-
+        // frame and punches the camera in and out along the view axis.
+        float clampedDistance = targetDistance;
+        if (firstResolve || ctrl.smoothedDistance <= 0.f)
+        {
+            clampedDistance = targetDistance;                 // snap on first frame
+        }
+        else if (targetDistance < ctrl.smoothedDistance)
+        {
+            clampedDistance = targetDistance;                 // closer wall: pull in now
+        }
+        else if (dt > 0.f && ctrl.distanceLag > 1e-4f)
+        {
+            const float a = 1.f - std::exp(-dt / ctrl.distanceLag);
+            clampedDistance = ctrl.smoothedDistance +
+                              (targetDistance - ctrl.smoothedDistance) * a;  // ease out
+        }
+        ctrl.smoothedDistance = clampedDistance;
+        ctrl.followSmoothInit = true;
 
         const XMVECTOR backV  = XMVectorScale(camFwd, -clampedDistance);
         const XMVECTOR posV   = XMVectorAdd(focusWithShoulder, backV);

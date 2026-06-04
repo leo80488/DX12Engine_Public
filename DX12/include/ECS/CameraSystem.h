@@ -43,9 +43,17 @@ public:
     // desired camera pose and clamps `thirdPersonDistance` short of any
     // hit — prevents the camera poking through walls. Pass null for a
     // collision-free preview cam (or set cameraCollisionEnabled = false).
+    //
+    // @p dt is the gameplay delta-time (seconds) used for frame-rate
+    // independent ThirdPerson follow smoothing (ctrl.followLag / distanceLag).
+    // Pass 0 to snap rigidly to the target this frame (paused / hit-stop /
+    // editor-stopped) — that also keeps the smoothing state from gliding while
+    // the simulation is frozen. ctrl is non-const because the smoothing carries
+    // transient state (smoothedFocus / smoothedDistance / followSmoothInit).
     static void ResolveFollowing(World& world,
-                                 const CameraControllerComponent& ctrl,
+                                 CameraControllerComponent& ctrl,
                                  LocalTransform& xform,
+                                 float dt = 0.0f,
                                  DX12Physics::PhysicsSystem* physics = nullptr);
 
     // Re-seed the controller's yaw/pitch from an existing LocalTransform

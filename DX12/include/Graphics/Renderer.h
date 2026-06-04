@@ -103,6 +103,7 @@ class DDGIPass;
 class DDGIProbeDebugPass;
 class UIPass;
 class WorldUIBillboardPass;
+class DebugIconPass;
 
 // CPU-side cbuffer mirrors used by Renderer's per-frame UPLOAD-heap CBs.
 // Public so FrameCB<T> can be instantiated in Renderer.h; layouts MUST stay
@@ -321,6 +322,13 @@ public:
     // ===== Pass accessors — UI =====
     UIPass*               GetUIPass()      { return m_uiPass.get(); }
     WorldUIBillboardPass* GetWorldUIPass() { return m_worldUIPass.get(); }
+    // Editor-only debug billboard icons (light/camera gizmos). DebugDrawSystem
+    // fills it each frame via AddIcon(); empty (no draw) in Game builds.
+    DebugIconPass*        GetDebugIconPass() { return m_debugIconPass.get(); }
+    // Lazy-load (and cache) a debug-icon texture by asset path and return its
+    // bindless table index (== handle_id), or 0xFFFFFFFF if missing / not ready.
+    // Generic so any debug icon kind works by just passing its texture path.
+    uint32_t              GetDebugIconBindless(const char* path);
 
     // ===== Final viewport output =====
     // SRV GPU handle of the final tone-mapped LDR output (use as editor viewport tex).
@@ -456,7 +464,10 @@ private:
     bool m_ssrEnabled         = true;
     bool m_useIndirectDraw    = false;
     bool m_gpuCullingEnabled  = true;
-    bool m_lightBillboardsVisible = true;
+    // Default OFF: light icons are an editor debug gizmo driven by the editor's
+    // DebugDrawSystem (Lights debug category), which sets this true each frame.
+    // Game builds never touch it, so light icons are stripped from shipping.
+    bool m_lightBillboardsVisible = false;
 
     // ===== Viewport / window tracking =====
     uint32_t m_vpWidth     = 0;
@@ -564,8 +575,10 @@ private:
     uint64_t       m_skyRadianceSrvForDDGI  = 0; // DDGI miss shader; 0 if no skybox
 
     // ===== Lazy-loaded misc textures =====
-    Resource::TextureHandle m_lightIconHandle = Resource::kInvalidTextureHandle;
-    uint64_t                m_lightIconSRV    = 0;
+    // Generic debug-icon texture cache, keyed by asset path. One Acquire per
+    // unique path; GetDebugIconBindless() returns the bindless index. Adding a
+    // new debug icon kind is just a new path — no new member needed here.
+    std::unordered_map<std::string, Resource::TextureHandle> m_debugIconTex;
     Resource::TextureHandle m_moonHandle      = Resource::kInvalidTextureHandle;
     uint64_t                m_moonSRV         = 0;
     uint64_t                m_nprRampTexHandle = 0;
@@ -622,6 +635,7 @@ private:
 
     // ===== Render passes — debug & UI =====
     std::unique_ptr<DebugWirePass>         m_debugWirePass;
+    std::unique_ptr<DebugIconPass>         m_debugIconPass;
     std::unique_ptr<UIPass>                m_uiPass;
     std::unique_ptr<WorldUIBillboardPass>  m_worldUIPass;
 

@@ -492,6 +492,7 @@ void App::WireEditor(IGraphicsDevice& backend, Renderer& renderer, GameModeConte
     m_editorLayer.SetNavMeshSystem(&m_navSystem);
     m_editorLayer.SetAISystem(&m_aiSystem);
     m_editorLayer.SetScriptSystem(&m_scriptSystem);   // exposed-var inspector
+    m_editorLayer.SetDebugDrawSystem(&m_debugDraw);   // debug category toggles
     m_editorLayer.RegisterDefaultEditors();   // must be after SetRenderer()
     m_editorLayer.SetAssetDirectory("asset/");
     m_editorLayer.SetGPUProfiler(&static_cast<GraphicsDX12&>(backend).GetGPUProfiler());
@@ -717,31 +718,21 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
 
 #ifdef WITH_EDITOR
         renderer.SetPickingOutlineEntity(m_editorLayer.GetSelectedEntity());
+        // Push the editor's debug category toggles onto the renderer-owned
+        // buckets BEFORE BeginFrame's wire-gather reads them. Editor-only:
+        // Game builds never enable debug visuals.
+        m_debugDraw.ApplyTo(renderer, m_navSystem);
 #endif
         renderer.BeginFrame(world, ctx.frame, ctx.deltaTime,
                             ctx.viewportW, ctx.viewportH);
 
-        // Debug wireframe — must run AFTER Renderer::BeginFrame (DebugWirePass::Clear)
-        // and BEFORE renderer.Render (submits the wire buffer). Toggled per-branch.
-        if (auto* dbg = renderer.GetDebugWirePass(); dbg && dbg->enabled)
-        {
-            if (m_navSystem.debugDraw)
-                m_navSystem.EmitDebugLines(*dbg);
-
-            if (dbg->showCollision)
-            {
-                // `collisionMaxDistance <= 0` = unlimited; Debug menu dials it down.
-                const Entity camEnt = static_cast<Entity>(frameCtx.cameraEntity);
-                if (auto* gt = world.GetComponent<GlobalTransform>(camEnt))
-                {
-                    const DirectX::XMFLOAT3 camPos{
-                        gt->matrix._41, gt->matrix._42, gt->matrix._43 };
-                    Tools::CollisionMesh::EmitDebugWireframe(
-                        world, camPos, dbg->collisionMaxDistance,
-                        *dbg, m_physicsSystem);
-                }
-            }
-        }
+#ifdef WITH_EDITOR
+        // Single editor-only debug submission point — emits the external
+        // wireframes (collision mesh, navmesh) for enabled categories. Must run
+        // AFTER BeginFrame (DebugWirePass ring slot is live) and BEFORE
+        // renderer.Render (which uploads + draws the wire buffer).
+        m_debugDraw.Submit(renderer, world, frameCtx, m_physicsSystem, m_navSystem);
+#endif
 
         pumpUIInput();
         RHI::CommandList lastPassCL = renderer.Render();

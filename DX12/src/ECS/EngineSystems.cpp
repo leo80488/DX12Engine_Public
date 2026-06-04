@@ -182,7 +182,15 @@ void CameraFollowResolveSystem::Update(World& world, const FrameContext& ctx)
     // ResolveFollowing reads the followTarget's freshly-propagated world
     // pose — that's why this system lives AFTER TransformPropagate in the
     // same phase.
-    CameraSystem::ResolveFollowing(world, *ctrl, *lt, &m_physics);
+    //
+    // dt drives the ThirdPerson follow smoothing. Use scaled gameplay time so
+    // the camera lag freezes consistently with the (time-scaled) target it
+    // tracks. When the sim isn't running (editor Stopped/Paused) pass 0 so the
+    // camera snaps to the target instead of gliding — this system is NOT
+    // runUpdate-gated, so without this it would drift toward a gizmo-dragged
+    // target while paused.
+    const float followDt = ctx.runUpdate ? ctx.scaledDeltaTime : 0.0f;
+    CameraSystem::ResolveFollowing(world, *ctrl, *lt, followDt, &m_physics);
 
     // Camera is a root entity → its world matrix is just its local matrix.
     // Patch GlobalTransform inline so this same frame's RenderSystem sees
@@ -195,11 +203,24 @@ void CameraFollowResolveSystem::Update(World& world, const FrameContext& ctx)
 
 void RendererAnimationChainSystem::Update(World& world, const FrameContext& ctx)
 {
-    // Always-on (no runUpdate gate) — matches pre-refactor behaviour where
-    // this chain lived inside Renderer::BeginFrame and ran every frame.
-    // dt is REAL (unscaled) per-frame delta, NOT scaledDeltaTime: animation
-    // shouldn't freeze when ScriptSystem.SetTimeScale(0) freezes gameplay.
-    m_renderer.TickAnimationChain(world, ctx.frameIndex, ctx.deltaTime);
+    // The chain itself is ALWAYS run (skinning/pose buffers must be rebuilt for
+    // this frame's GPU slot every frame, or a frozen character renders with a
+    // stale/invalid pose slot). What we gate is only the *time advance*:
+    //
+    //   animDt = runUpdate ? deltaTime : 0
+    //
+    // so in the editor, animation playback follows the Start/Pause/Stop state
+    // (runUpdate is false while Stopped/Paused, true while Playing or on a
+    // single Step where deltaTime is 1/60). In a Game build runUpdate is always
+    // true, so animation always plays. AnimationSystem::Update samples the clip
+    // every call regardless of dt and only advances primaryTime when dt>0, so
+    // dt=0 freezes the pose in place while still rendering it correctly.
+    //
+    // dt stays REAL (unscaled) deltaTime, NOT scaledDeltaTime: animation should
+    // keep playing through a ScriptSystem.SetTimeScale(0) gameplay hit-stop —
+    // that is a gameplay-time freeze, distinct from the editor play-state gate.
+    const float animDt = ctx.runUpdate ? ctx.deltaTime : 0.0f;
+    m_renderer.TickAnimationChain(world, ctx.frameIndex, animDt);
 }
 
 // ===== PreRender ========================================================

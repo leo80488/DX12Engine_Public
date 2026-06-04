@@ -8,6 +8,7 @@
 #include "ECS/VideoHelpers.h"
 #include "ECS/Mp4FrameSource.h"
 #include "Scene/MeshSpawner.h"
+#include "Scripting/ScriptComponent.h"
 #include "System/Log.h"
 
 void TestScene::Init(GameModeContext* ctx)
@@ -144,6 +145,41 @@ void TestScene::Init(GameModeContext* ctx)
     // currently-active world; we don't track it here because gameplay tests
     // typically want it to persist through scene-pop (this is the demo cube).
     MeshSpawner::Spawn(0, world);
+
+    // ---- MULTI-SCRIPT demo --------------------------------------------------
+    // One cube driven by TWO independent Lua Logic scripts at once: Bob.lua
+    // oscillates it vertically while Spin.lua yaws it. Each slot gets its own
+    // Lua instance, OnSpawn/OnUpdate lifecycle, and exposed-variable overrides
+    // — exercising ScriptComponent's new std::vector<ScriptInstance> list. Open
+    // the Script component in the Inspector to add/remove/tweak either slot.
+    {
+        Entity demo = MeshSpawner::Spawn(0, world);   // 0 = Cube
+        if (demo != NullEntity)
+        {
+            world.SetName(demo, "Multi-Script Cube");
+            if (LocalTransform* lt = world.GetComponent<LocalTransform>(demo))
+                lt->translation = { 2.5f, 0.0f, 0.0f };   // beside the default cube
+
+            ScriptComponent sc;
+            {
+                ScriptInstance bob;
+                bob.scriptPath = "asset/scripts/logic/demo/Bob.lua";
+                bob.enabled    = true;
+                sc.scripts.push_back(std::move(bob));
+            }
+            {
+                ScriptInstance spin;
+                spin.scriptPath = "asset/scripts/logic/demo/Spin.lua";
+                spin.enabled    = true;
+                sc.scripts.push_back(std::move(spin));
+            }
+            world.AddComponent<ScriptComponent>(demo, std::move(sc));
+
+            m_spawnedEntities.push_back(demo);
+            LOG_SUCCESS("TestScene: spawned 'Multi-Script Cube' with %zu scripts (Bob + Spin)",
+                        world.GetComponent<ScriptComponent>(demo)->scripts.size());
+        }
+    }
 
     // ---- TEST: world-space video plane ------------------------------------
     // Spawns a 2 m × 2 m quad standing next to the demo cube and uses a

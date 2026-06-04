@@ -55,6 +55,7 @@
 #include "RenderGraph/RenderPass/DebugWirePass.h"
 #include "RenderGraph/RenderPass/UIPass.h"
 #include "RenderGraph/RenderPass/WorldUIBillboardPass.h"
+#include "RenderGraph/RenderPass/DebugIconPass.h"
 #include "RenderGraph/RenderPass/CloudPass.h"
 #include "RenderGraph/RenderPass/VideoPass.h"
 #include "RenderGraph/RenderPass/VideoQuadPass.h"
@@ -1111,6 +1112,7 @@ void Renderer::ReloadShaders()
     if (m_ddgiPass)   m_ddgiPass->ReloadShaders(m_gfx);
     if (m_uiPass)         m_uiPass->ReloadShaders();
     if (m_worldUIPass)    m_worldUIPass->ReloadShaders();
+    if (m_debugIconPass)  m_debugIconPass->ReloadShaders();
     // SSR sub-passes live behind the subsystem; this re-fetches all 7
     // compute shaders + rebuilds PSOs + resets temporal history.
     if (m_ssrSubsystem) m_ssrSubsystem->ReloadShaders(m_gfx);
@@ -2060,6 +2062,24 @@ RHI::CommandList Renderer::Render()
             m_toneMapPass->SetFinalOutputState(RHI::ResourceState::SHADER_RESOURCE);
         }
 
+        // Editor-only debug billboard icons (light/camera gizmos) — drawn after
+        // world UI, before screen-space HUD. DebugDrawSystem fills the queue;
+        // empty (skipped) in Game builds.
+        if (m_debugIconPass && m_debugIconPass->enabled &&
+            m_debugIconPass->HasIcons() && m_toneMapPass)
+        {
+            const RHI::ResourceState entry = m_toneMapPass->GetFinalOutputState();
+            uint32_t r = m_gfx.BeginGPUTimestamp(restoreCL, "DebugIcons");
+            m_debugIconPass->Execute(restoreCL,
+                                     m_view.viewProjMatrixNoJitter,
+                                     m_view.viewMatrix,
+                                     m_toneMapPass->GetFinalOutputTexture(),
+                                     entry,
+                                     m_vpWidth, m_vpHeight);
+            m_gfx.EndGPUTimestamp(restoreCL, r);
+            m_toneMapPass->SetFinalOutputState(RHI::ResourceState::SHADER_RESOURCE);
+        }
+
         if (m_uiPass && m_uiPass->enabled && m_toneMapPass
             && !m_uiPass->GetDrawList().IsEmpty())
         {
@@ -2594,6 +2614,10 @@ void Renderer::InitSkinningSystems()
     // ---- WorldUIBillboardPass (world-space UI: HP bars / names) ----
     m_worldUIPass = std::make_unique<WorldUIBillboardPass>();
     m_worldUIPass->Init(m_gfx);
+
+    // ---- DebugIconPass (editor-only light/camera gizmo icons) ----
+    m_debugIconPass = std::make_unique<DebugIconPass>();
+    m_debugIconPass->Init(m_gfx);
 
     m_meshMgr.InitBillboardQuad();
 

@@ -703,4 +703,31 @@ struct CameraControllerComponent
     // before clipping the wall. Match this to a typical near-plane buffer
     // (~10-30 cm) so the near-clip never enters the wall.
     float cameraProbeRadius     = 0.20f;
+
+    // ---- Third-person follow smoothing (spring-arm damping) -------------
+    // The camera eases toward the target instead of rigidly snapping every
+    // frame, low-pass-filtering the high-frequency shake/blur seen while
+    // tracking a moving object. Frame-rate independent: alpha = 1-exp(-dt/lag).
+    // Only the FOCUS point (orbit pivot) is smoothed, never the yaw/pitch, so
+    // mouse-look stays instant (no rubber-band on rotation).
+    // followLag   — focus position smoothing time-constant, seconds.
+    //               0 = instant / rigid (DEFAULT — exact original feel); set
+    //               ~0.1 for an optional cinematic trailing-camera lag.
+    // distanceLag — spring-arm collision distance ease-OUT time-constant.
+    //               0 = instant (DEFAULT). >0 eases the pull-OUT so an
+    //               intermittent wall probe can't punch the camera in/out.
+    // NOTE: these are OPTIONAL polish, OFF by default. They are NOT the fix for
+    // follow jitter caused by a child mesh missing physics interpolation — that
+    // is handled in PhysicsSystem::ApplyRenderInterpolation via PropagateSubtree.
+    float followLag   = 0.0f;
+    float distanceLag = 0.0f;
+
+    // ---- Transient runtime smoothing state (NOT serialized) ------------
+    // followSmoothInit=false → snap on the first resolve (spawn / world load /
+    // mode switch). smoothedFocus/Distance carry the filtered values across
+    // frames. These are runtime-only; serialization deliberately omits them so
+    // a freshly-loaded controller always re-snaps.
+    DirectX::XMFLOAT3 smoothedFocus    = { 0.f, 0.f, 0.f };
+    float             smoothedDistance = 0.f;
+    bool              followSmoothInit = false;
 };

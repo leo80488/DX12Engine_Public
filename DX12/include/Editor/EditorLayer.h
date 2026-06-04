@@ -25,6 +25,7 @@ class IGraphicsDevice;
 class Renderer;
 class AnimationSystem;
 class ScriptSystem;
+class DebugDrawSystem;
 struct GPUProfiler;
 struct ScriptComponent;
 namespace Resource { class TextureSystem; class ResourceManager; class AssetManager; class AnimationClipSystem; }
@@ -80,6 +81,8 @@ public:
     // `exposed` variable schema and push edited values onto the live Lua
     // instance during Play. Optional — exposed-var UI is hidden if null.
     void SetScriptSystem(ScriptSystem* sys)                  { m_scriptSys = sys; }
+    // Editor-only debug-visual toggles (categories). Debug menu drives this.
+    void SetDebugDrawSystem(DebugDrawSystem* sys)            { m_debugDraw = sys; }
     void SetResourceSystems(Resource::TextureSystem* texSys, Resource::ResourceManager* rm)
     {
         m_textureSys  = texSys;
@@ -244,11 +247,16 @@ private:
 
     // Per-frame helpers.
     void RenderMaterialInspector(struct MaterialComponent& mat);
-    // Inspector block for a Script component's editor-exposed variables. Reads
-    // the schema from m_scriptSys, renders one typed ImGui widget per variable,
-    // and writes edits into the component's per-entity override map (pushing
-    // live during Play). No-op without a ScriptSystem or an `exposed` table.
-    void DrawScriptExposedVars(ScriptComponent& sc, World* world, Entity e);
+    // Full inspector for a ScriptComponent: one collapsible section per attached
+    // script slot (path drag-drop + enabled + exposed vars + remove), plus an
+    // "+ Add Script" button. Replaces the static reflected UI now that the
+    // component holds a dynamic list of scripts.
+    void DrawScriptComponentSlots(ScriptComponent& sc, World* world, Entity e);
+    // Inspector block for ONE script slot's editor-exposed variables. Reads the
+    // schema from m_scriptSys for that slot's path, renders one typed ImGui
+    // widget per variable, and writes edits into that slot's override map
+    // (pushing live during Play). No-op without a ScriptSystem or `exposed` table.
+    void DrawScriptVarWidgets(ScriptComponent& sc, std::size_t slot, World* world, Entity e);
     // Left-click pick + left-hold drag inside the viewport.
     void HandleViewportPicking(float imageMinX, float imageMinY,
                                float contentW,  float contentH,
@@ -271,6 +279,7 @@ private:
     GPUProfiler*                   m_gpuProfiler  = nullptr;
     DX12Physics::PhysicsSystem*    m_physicsSys   = nullptr;
     Nav::NavMeshSystem*            m_navSys       = nullptr;
+    DebugDrawSystem*               m_debugDraw    = nullptr;
     AI::AISystem*                  m_aiSys        = nullptr;
     ScriptSystem*                  m_scriptSys    = nullptr;
 

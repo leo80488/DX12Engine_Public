@@ -19,4 +19,19 @@ class TransformSystem
 {
 public:
     static void Propagate(World& world);
+
+    // Re-propagate ONLY the descendants of @p root, assuming @p root's own
+    // GlobalTransform is already current. Use this after something overwrites a
+    // single entity's GlobalTransform *out of band* (i.e. after the global
+    // Propagate has already run) and that entity has children that must follow.
+    //
+    // The motivating case: PhysicsSystem::ApplyRenderInterpolation overwrites a
+    // physics body's GlobalTransform with the render-interpolated pose AFTER the
+    // frame's Propagate. Without this, a child entity (e.g. the visible skinned
+    // mesh parented under a CharacterController capsule) keeps the stale,
+    // non-interpolated world transform the earlier Propagate composed — so it
+    // renders one physics-step behind the body the camera follows, which reads
+    // as jitter that gets worse the closer the camera is. No-op if @p root has
+    // no Children. Does NOT recompute @p root itself.
+    static void PropagateSubtree(World& world, unsigned int root);
 };

@@ -157,3 +157,108 @@ void TransformSystem::Propagate(World& world)
         }
     }
 }
+
+void TransformSystem::PropagateSubtree(World& world, unsigned int rootU)
+{
+    using namespace DirectX;
+    const Entity root = static_cast<Entity>(rootU);
+
+    auto* poolGT       = world.GetPool<GlobalTransform>();
+    auto* poolChildren = world.GetPool<Children>();
+    if (!poolGT || !poolChildren)
+        return;
+
+    // Nothing to do unless the root actually has descendants. The common case
+    // (a dynamic prop with no children) early-outs here after two lookups.
+    const Children* rootChildren = poolChildren->Get(root);
+    if (!rootChildren || rootChildren->entities.empty())
+        return;
+    if (!poolGT->Get(root))   // root must already have a current GlobalTransform
+        return;
+
+    auto* poolLT    = world.GetPool<LocalTransform>();
+    auto* poolVis   = world.GetPool<VisibilityComponent>();
+    auto* poolLAabb = world.GetPool<LocalAabb>();
+    auto* poolWAabb = world.GetPool<WorldAabb>();
+
+    // BFS over descendants only — root's GlobalTransform is taken as authoritative
+    // (it was just overwritten by the caller). Mirrors Pass 2 of Propagate().
+    thread_local std::vector<Entity> s_subQueue;
+    s_subQueue.clear();
+    size_t head = 0;
+    s_subQueue.push_back(root);
+
+    while (head < s_subQueue.size())
+    {
+        const Entity current = s_subQueue[head++];
+
+        const GlobalTransform*     parentGT  = poolGT->Get(current);
+        const VisibilityComponent* parentVis = poolVis ? poolVis->Get(current) : nullptr;
+        const Children*            children  = poolChildren->Get(current);
+
+        if (!children || !parentGT)
+            continue;
+
+        const XMMATRIX parentMat    = XMLoadFloat4x4(&parentGT->matrix);
+        const bool     parentHidden = parentVis && !parentVis->IsEffectivelyVisible();
+
+        for (Entity child : children->entities)
+        {
+            if (!world.IsAlive(child))
+                continue;
+
+            const LocalTransform* lt = poolLT ? poolLT->Get(child) : nullptr;
+            if (lt)
+            {
+                GlobalTransform gt;
+                XMStoreFloat4x4(&gt.matrix, lt->ToMatrix() * parentMat);
+                poolGT->Add(child, gt);
+            }
+
+            if (poolVis)
+            {
+                if (VisibilityComponent* v = poolVis->Get(child))
+                {
+                    const bool ancestorHidden = parentHidden
+                        || (parentVis && parentVis->inheritedHidden);
+                    v->inheritedHidden = ancestorHidden;
+                }
+            }
+
+            const LocalAabb* localAabb = poolLAabb ? poolLAabb->Get(child) : nullptr;
+            WorldAabb*       worldAabb = poolWAabb ? poolWAabb->Get(child) : nullptr;
+            if (localAabb && worldAabb)
+            {
+                const GlobalTransform* childGT = poolGT->Get(child);
+                if (childGT)
+                {
+                    const XMMATRIX M = XMLoadFloat4x4(&childGT->matrix);
+                    const float corners[8][3] =
+                    {
+                        {localAabb->min.x, localAabb->min.y, localAabb->min.z},
+                        {localAabb->max.x, localAabb->min.y, localAabb->min.z},
+                        {localAabb->min.x, localAabb->max.y, localAabb->min.z},
+                        {localAabb->max.x, localAabb->max.y, localAabb->min.z},
+                        {localAabb->min.x, localAabb->min.y, localAabb->max.z},
+                        {localAabb->max.x, localAabb->min.y, localAabb->max.z},
+                        {localAabb->min.x, localAabb->max.y, localAabb->max.z},
+                        {localAabb->max.x, localAabb->max.y, localAabb->max.z},
+                    };
+                    XMVECTOR vmin = XMVectorSet(FLT_MAX,  FLT_MAX,  FLT_MAX,  0.f);
+                    XMVECTOR vmax = XMVectorSet(-FLT_MAX, -FLT_MAX, -FLT_MAX, 0.f);
+                    for (const auto& c : corners)
+                    {
+                        XMVECTOR v = XMVector3TransformCoord(
+                            XMVectorSet(c[0], c[1], c[2], 1.f), M);
+                        vmin = XMVectorMin(vmin, v);
+                        vmax = XMVectorMax(vmax, v);
+                    }
+                    XMStoreFloat3(&worldAabb->min, vmin);
+                    XMStoreFloat3(&worldAabb->max, vmax);
+                }
+            }
+
+            s_subQueue.push_back(child);
+        }
+    }
+}

@@ -86,30 +86,39 @@ public:
     // empty vector for scripts with no `exposed` table (or on load failure).
     const std::vector<ScriptVarDesc>& GetExposedSchema(const std::string& path);
 
-    // Push per-entity exposed-var values onto the entity's LIVE Lua instance
+    // Push one script slot's exposed-var values onto its LIVE Lua instance
     // (used by the editor to reflect inspector edits during Play). No-op if the
-    // entity has no live instance yet (edit mode) — values still persist on the
-    // ScriptComponent and get injected at spawn. `overrides` is the component's
+    // slot has no live instance yet (edit mode) — values still persist on the
+    // ScriptComponent and get injected at spawn. `overrides` is that slot's
     // var map; absent keys fall back to schema defaults.
-    void ApplyExposedVars(Entity e,
+    void ApplyExposedVars(Entity e, std::size_t slot,
                           const std::unordered_map<std::string, ScriptVarValue>& overrides);
 
 private:
-    // Per-entity Logic state. The actual instance sol::table lives in
-    // (*m_lua)["__logic_instances"][entity]; this struct is just metadata.
+    // Per-slot Logic state — one entry per attached script on an entity. The
+    // actual instance sol::table lives in
+    // (*m_lua)["__logic_instances"][entity][slot+1]; this struct is metadata.
+    struct LogicSlot
+    {
+        bool        initCalled = false;     // OnSpawn fired for this slot
+        std::string path;                   // which template this slot's instance came from
+        std::string lastError;
+    };
+
+    // Per-entity Logic state. The baseline transform is shared across all of
+    // the entity's scripts; each attached script has its own LogicSlot.
     struct LogicState
     {
-        bool        loaded     = false;     // template loaded for this path
-        bool        initCalled = false;     // OnSpawn fired
-        std::string path;                   // which template this instance came from
-        std::string lastError;
-
         // Baseline snapshot of the entity's LocalTransform captured the first
-        // time its script runs. Lua scripts that oscillate around a rest pose
-        // (sin-wave bob, orbit, breathe…) should read GetBasePosition() and
-        // write absolute values, NOT integrate. Preserved across hot reloads.
+        // time any of its scripts runs. Lua scripts that oscillate around a
+        // rest pose (sin-wave bob, orbit, breathe…) should read
+        // GetBasePosition() and write absolute values, NOT integrate. Shared
+        // by every slot; preserved across hot reloads.
         LocalTransform baseTransform;
         bool           baseCaptured = false;
+
+        // One slot per ScriptComponent::scripts entry, index-aligned with it.
+        std::vector<LogicSlot> slots;
     };
 
     // Per-path template metadata. Prototype table lives in
@@ -153,18 +162,23 @@ private:
 
     // Logic template / instance plumbing.
     bool LoadLogicTemplate(const std::string& path);
-    // creates instance via metatable, injects exposed vars, fires OnSpawn.
-    // `overrides` (may be null) supplies per-entity exposed-var values.
-    bool EnsureLogicInstance(Entity e, const std::string& path,
+    // creates the slot's instance via metatable, injects exposed vars, fires
+    // OnSpawn. `overrides` (may be null) supplies that slot's exposed-var values.
+    bool EnsureLogicInstance(Entity e, std::size_t slot, const std::string& path,
                              const std::unordered_map<std::string, ScriptVarValue>* overrides);
-    void DestroyLogicInstance(Entity e);                          // fires OnDestroy, drops instance
+    void DestroyLogicInstance(Entity e, std::size_t slot);       // fires OnDestroy, drops the slot's instance
+    // Fire OnDestroy + nil the Lua table for one slot, using copied metadata so
+    // it is safe after m_states has been erased and re-entrancy-safe (nils
+    // before firing). Shared by DestroyLogicInstance and TeardownEntity.
+    void FireSlotDestroy(Entity e, std::size_t slot, const LogicSlot& ls);
+    void TeardownEntity(Entity e);                               // tears down every slot, drops the entity's array
 
     // Parse a template table's `exposed` field into a ScriptVarDesc vector.
     // sol-typed body lives in the .cpp. Called from LoadLogicTemplate.
     void ParseExposedSchema(const std::string& path, std::vector<ScriptVarDesc>& out);
     // Write the resolved exposed-var values (default or override) onto a live
-    // instance table. Shared by EnsureLogicInstance and ApplyExposedVars.
-    void InjectExposedVars(Entity e, const std::string& path,
+    // slot instance table. Shared by EnsureLogicInstance and ApplyExposedVars.
+    void InjectExposedVars(Entity e, std::size_t slot, const std::string& path,
                            const std::unordered_map<std::string, ScriptVarValue>* overrides);
 
     void SweepDestroyed(World& world);     // run OnDestroy for dead/detached entities

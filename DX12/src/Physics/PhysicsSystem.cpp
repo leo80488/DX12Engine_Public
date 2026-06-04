@@ -15,6 +15,7 @@
 #include "ECS/HierarchyComponents.h"
 #include "ECS/PhysicsComponents.h"
 #include "ECS/CharacterControllerComponent.h"
+#include "Scene/TransformSystem.h"   // PropagateSubtree — push interp pose to child meshes
 #include "Resource/AssetFS.h"      // mesh-collider source decode (read .meshlib / .imsh blobs)
 #include "Resource/AssetHeader.h"
 #include "System/Log.h"
@@ -2068,6 +2069,12 @@ void PhysicsSystem::ApplyRenderInterpolation(World& world, float renderAlpha)
         const XMMATRIX R = XMMatrixRotationQuaternion(XMLoadFloat4(&rotF));
         const XMMATRIX T = XMMatrixTranslationFromVector(XMLoadFloat3(&posF));
         XMStoreFloat4x4(&gt->matrix, S * R * T);
+
+        // Push the interpolated pose down to children. The frame's Propagate ran
+        // BEFORE this and composed their GlobalTransform from the body's pre-
+        // interpolation pose; without re-propagation a child mesh parented under
+        // this body renders one physics step behind → jitter (worse up close).
+        TransformSystem::PropagateSubtree(world, rbEntities[i]);
     }
 
     // ---- CharacterController (KCC) — interpolate POSITION only -------------
@@ -2097,6 +2104,14 @@ void PhysicsSystem::ApplyRenderInterpolation(World& world, float renderAlpha)
             gt->matrix._41 = ip.GetX();
             gt->matrix._42 = ip.GetY();
             gt->matrix._43 = ip.GetZ();
+
+            // Push the interpolated capsule pose to children — the visible
+            // (often skinned) character mesh is typically parented under the
+            // CharacterController capsule. Without this it tracks the stale,
+            // non-interpolated pose and visibly jitters relative to the camera,
+            // which follows the interpolated capsule. This is the actual cause
+            // of "third-person camera shake worse when close" — not the camera.
+            TransformSystem::PropagateSubtree(world, e);
         }
     }
 }

@@ -161,6 +161,14 @@ list(REMOVE_ITEM ENGINECORE_SOURCES
     "${ENGINE_SRC}/Scene/NPRRampEditor.cpp"    # ShaderLab.exe only
 )
 list(FILTER ENGINECORE_SOURCES EXCLUDE REGEX "/src/Editor/")                 # all editor windows
+# Exception to the src/Editor/ exclude above: DebugDrawSystem is plain engine
+# driver code (no ImGui, no WITH_EDITOR) that just happens to live under
+# src/Editor/ for organisation. Its header comment says it must "live in
+# EngineCore so every exe links it" — App::m_debugDraw is an always-present member
+# and only the App call sites are WITH_EDITOR-gated, so Game.exe must link it too.
+# Re-add it here; it is dropped from the editor-window glob below to avoid a
+# duplicate-symbol link in Editor.exe / ShaderLab.exe.
+list(APPEND ENGINECORE_SOURCES "${ENGINE_SRC}/Editor/DebugDrawSystem.cpp")
 list(FILTER ENGINECORE_SOURCES EXCLUDE REGEX "/src/Resoruce/[^/]*Importer\\.cpp$")  # offline cookers (editor only)
 # (3) Game.exe-only source.
 list(REMOVE_ITEM ENGINECORE_SOURCES "${ENGINE_SRC}/Resoruce/SkeletonGrantTable.cpp")
@@ -294,6 +302,10 @@ set(IMGUI_SOURCES
 # inspector, the offline asset importers, and imgui. Globbed so new editor
 # windows / importers are picked up automatically.
 file(GLOB EDITOR_WINDOW_SOURCES CONFIGURE_DEPENDS "${ENGINE_SRC}/Editor/*.cpp")
+# DebugDrawSystem.cpp is compiled into EngineCore (see the exception above), so drop
+# it from the editor-window glob — otherwise Editor.exe / ShaderLab.exe would define
+# its symbols twice (once via EngineCore.lib, once here) and fail to link (LNK2005).
+list(REMOVE_ITEM EDITOR_WINDOW_SOURCES "${ENGINE_SRC}/Editor/DebugDrawSystem.cpp")
 file(GLOB IMPORTER_SOURCES      CONFIGURE_DEPENDS "${ENGINE_SRC}/Resoruce/*Importer.cpp")
 set(EDITOR_SHARED_SOURCES
     "${ENGINE_SRC}/main.cpp"

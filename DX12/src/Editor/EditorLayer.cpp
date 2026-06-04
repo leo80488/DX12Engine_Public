@@ -93,6 +93,7 @@
 #include "ECS/DDGIComponents.h"
 #include "Physics/ChainPhysicsSystem.h"
 #include "Scripting/ScriptComponent.h"
+#include "Editor/DebugDrawSystem.h"
 #include "Scripting/ScriptSystem.h"     // exposed-var schema + live push
 #include "Math/MathUtils.h"
 #include "Graphics/IGraphicsDevice.h"
@@ -1861,29 +1862,38 @@ void EditorLayer::RenderMenuBar()
         // empty unless `Debug Wireframes` is checked.
         if (m_renderer)
         {
-            if (auto* dbg = m_renderer->GetDebugWirePass())
+            // All wireframe overlays are now driven by the editor-only
+            // DebugDrawSystem's central category bitmask (the single source of
+            // truth that App pushes onto the renderer each frame), instead of
+            // poking DebugWirePass / NavMeshSystem flags directly.
+            if (DebugDrawSystem* dd = m_debugDraw)
             {
-                ImGui::MenuItem("Debug Wireframes", nullptr, &dbg->enabled);
-                if (dbg->enabled)
+                ImGui::MenuItem("Debug Wireframes", nullptr, &dd->masterEnabled);
+                if (dd->masterEnabled)
                 {
-                    ImGui::MenuItem("  Show AABBs",             nullptr, &dbg->showAABBs);
-                    ImGui::MenuItem("  Show Frustum",           nullptr, &dbg->showFrustum);
-                    ImGui::MenuItem("  Show Capsules",          nullptr, &dbg->showCapsules);
-                    ImGui::MenuItem("  Show Reflection Probes", nullptr, &dbg->showReflectionProbes);
-                    ImGui::MenuItem("  Show DDGI Volumes",      nullptr, &dbg->showDDGIVolumes);
-                    ImGui::MenuItem("  Show Collision",         nullptr, &dbg->showCollision);
-                    if (dbg->showCollision)
+                    auto catItem = [&](const char* label, DebugCategory cat)
+                    {
+                        bool on = DebugCatEnabled(dd->categoryMask, cat);
+                        if (ImGui::MenuItem(label, nullptr, &on))
+                            DebugCatSet(dd->categoryMask, cat, on);
+                    };
+                    catItem("  Show AABBs",             DebugCategory::AABB);
+                    catItem("  Show Frustum",           DebugCategory::Frustum);
+                    catItem("  Show Capsules",          DebugCategory::Capsules);
+                    catItem("  Show Reflection Probes", DebugCategory::ReflectionProbes);
+                    catItem("  Show DDGI Volumes",      DebugCategory::DDGIVolumes);
+                    catItem("  Show Collision",         DebugCategory::Collision);
+                    if (DebugCatEnabled(dd->categoryMask, DebugCategory::Collision))
                     {
                         // 0 = unlimited (every Mesh collider in the world).
                         // Dial down when the wire buffer fills (look at the
                         // log — AddLine bails silently past kMaxVertices).
                         ImGui::SetNextItemWidth(180);
                         ImGui::SliderFloat("    Max distance (0 = unlimited)",
-                                            &dbg->collisionMaxDistance,
+                                            &dd->collisionMaxDistance,
                                             0.0f, 200.0f, "%.0f m");
                     }
-                    if (m_navSys)
-                        ImGui::MenuItem("  Show NavMesh",       nullptr, &m_navSys->debugDraw);
+                    catItem("  Show NavMesh",           DebugCategory::NavMesh);
                 }
             }
             if (auto* pdbg = m_renderer->GetDDGIProbeDebugPass())
@@ -1908,11 +1918,19 @@ void EditorLayer::RenderMenuBar()
             ImGui::Separator();
             // Toggles VisibilityComponent.flags.Visible on all "ReflectionProbe"-tagged entities (capture continues regardless).
             ImGui::MenuItem("Reflection Probe Viz", nullptr, &m_showProbeVizSpheres);
-            // Hide every light-icon billboard at once (Renderer skips their
-            // DrawCandidate emission). Useful for clean screenshots.
-            bool lightIcons = m_renderer->AreLightBillboardsVisible();
-            if (ImGui::MenuItem("Light Icons", nullptr, &lightIcons))
-                m_renderer->SetLightBillboardsVisible(lightIcons);
+            // Debug icon gizmos — one toggle per registered icon kind. This is
+            // data-driven: adding a kind to DebugDrawSystem's kIconKinds[] adds
+            // its toggle here automatically (no edit needed in this menu).
+            if (DebugDrawSystem* dd = m_debugDraw)
+            {
+                for (int i = 0; i < DebugDrawSystem::IconKindCount(); ++i)
+                {
+                    const DebugDrawSystem::IconKindInfo info = DebugDrawSystem::GetIconKindInfo(i);
+                    bool on = DebugCatEnabled(dd->categoryMask, info.category);
+                    if (ImGui::MenuItem(info.name, nullptr, &on))
+                        DebugCatSet(dd->categoryMask, info.category, on);
+                }
+            }
 
             ImGui::Separator();
         }
@@ -6293,17 +6311,20 @@ namespace
 } // namespace
 
 // ---------------------------------------------------------------------------
-// DrawScriptExposedVars — runtime-generated inspector for a Logic script's
+// DrawScriptVarWidgets — runtime-generated inspector for ONE script slot's
 // editor-exposed variables. The schema (types/defaults/ranges) comes from the
-// script's `exposed` table via ScriptSystem; the per-entity values live on the
-// ScriptComponent's `vars` override map and serialize with the scene. Edits in
-// Play mode are pushed onto the live Lua instance immediately.
+// slot's `exposed` table via ScriptSystem; the per-entity values live on that
+// slot's `vars` override map and serialize with the scene. Edits in Play mode
+// are pushed onto the live Lua instance immediately.
 // ---------------------------------------------------------------------------
-void EditorLayer::DrawScriptExposedVars(ScriptComponent& sc, World* /*world*/, Entity e)
+void EditorLayer::DrawScriptVarWidgets(ScriptComponent& sc, std::size_t slot, World* /*world*/, Entity e)
 {
-    if (!m_scriptSys || sc.scriptPath.empty()) return;
+    if (!m_scriptSys || slot >= sc.scripts.size()) return;
+    ScriptInstance& si = sc.scripts[slot];
+    auto& vars = si.vars;
+    if (si.scriptPath.empty()) return;
 
-    const std::vector<ScriptVarDesc>& schema = m_scriptSys->GetExposedSchema(sc.scriptPath);
+    const std::vector<ScriptVarDesc>& schema = m_scriptSys->GetExposedSchema(si.scriptPath);
 
     ImGui::Separator();
     if (schema.empty())
@@ -6336,8 +6357,8 @@ void EditorLayer::DrawScriptExposedVars(ScriptComponent& sc, World* /*world*/, E
     {
         ImGui::PushID(d.name.c_str());
 
-        const bool        overridden = (sc.vars.find(d.name) != sc.vars.end());
-        const ScriptVarValue cur     = ResolveScriptVar(d, sc.vars);
+        const bool        overridden = (vars.find(d.name) != vars.end());
+        const ScriptVarValue cur     = ResolveScriptVar(d, vars);
         const char* label = d.label.empty() ? d.name.c_str() : d.label.c_str();
 
         ScriptVarValue next    = cur;
@@ -6459,18 +6480,98 @@ void EditorLayer::DrawScriptExposedVars(ScriptComponent& sc, World* /*world*/, E
 
         if (changed)            // widget edit → store / refresh the per-entity override
         {
-            sc.vars[d.name] = next;
+            vars[d.name] = next;
             anyChanged = true;
         }
         else if (resetClicked)  // drop the override → falls back to schema default
         {
-            sc.vars.erase(d.name);
+            vars.erase(d.name);
             anyChanged = true;
         }
     }
 
     if (anyChanged && playing)
-        m_scriptSys->ApplyExposedVars(e, sc.vars);
+        m_scriptSys->ApplyExposedVars(e, slot, vars);
+}
+
+// ---------------------------------------------------------------------------
+// DrawScriptComponentSlots — full inspector for a ScriptComponent's list of
+// attached scripts. One collapsible section per slot (enabled toggle, .lua
+// path with drag-drop, and that slot's exposed-variable widgets), plus Remove
+// per slot and a trailing "+ Add Script". Mirrors the SocketComponent dynamic-
+// list pattern. Slot teardown/spawn on add/remove is handled by ScriptSystem's
+// reconcile loop next frame (it diffs scripts.size() against its slot vector).
+// ---------------------------------------------------------------------------
+void EditorLayer::DrawScriptComponentSlots(ScriptComponent& sc, World* world, Entity e)
+{
+    int removeIdx = -1;
+
+    for (std::size_t i = 0; i < sc.scripts.size(); ++i)
+    {
+        ImGui::PushID(static_cast<int>(i));
+        ScriptInstance& si = sc.scripts[i];
+
+        // Header shows the index + file stem so reordering stays legible.
+        std::string stem = si.scriptPath;
+        if (auto p = stem.find_last_of("/\\"); p != std::string::npos)
+            stem = stem.substr(p + 1);
+        char hdr[192];
+        snprintf(hdr, sizeof(hdr), "%zu: %s%s###scriptslot%zu",
+                 i, stem.empty() ? "(no script)" : stem.c_str(),
+                 si.enabled ? "" : " (disabled)", i);
+
+        // Distinct per-slot header tint so multiple scripts are easy to tell
+        // apart at a glance. Hue is spread by the golden ratio (0.618) for good
+        // separation between adjacent slots; disabled slots are desaturated/dim.
+        float hue = 0.08f + 0.618f * static_cast<float>(i);
+        hue -= static_cast<float>(static_cast<int>(hue));           // fractional part → [0,1)
+        const float sat = si.enabled ? 0.50f : 0.12f;
+        const float val = si.enabled ? 0.42f : 0.26f;
+        ImVec4 cBase, cHover, cActive;
+        ImGui::ColorConvertHSVtoRGB(hue, sat,         val,         cBase.x,   cBase.y,   cBase.z);   cBase.w   = 1.0f;
+        ImGui::ColorConvertHSVtoRGB(hue, sat,         val + 0.13f, cHover.x,  cHover.y,  cHover.z);  cHover.w  = 1.0f;
+        ImGui::ColorConvertHSVtoRGB(hue, sat + 0.10f, val + 0.22f, cActive.x, cActive.y, cActive.z); cActive.w = 1.0f;
+        ImGui::PushStyleColor(ImGuiCol_Header,        cBase);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, cHover);
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive,  cActive);
+        const bool open = ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor(3);   // tint only the header bar, not the body
+
+        if (open)
+        {
+            ImGui::Checkbox("Enabled", &si.enabled);
+
+            // .lua path: free text + ILUA_PATH drag-drop from the Resource panel.
+            char buf[512];
+            strncpy_s(buf, si.scriptPath.c_str(), _TRUNCATE);
+            if (ImGui::InputText("Script Path", buf, sizeof(buf)))
+                si.scriptPath = buf;
+            if (ImGui::BeginDragDropTarget())
+            {
+                if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ILUA_PATH"))
+                {
+                    const char* dropped = static_cast<const char*>(p->Data);
+                    if (dropped && *dropped) si.scriptPath = dropped;
+                }
+                ImGui::EndDragDropTarget();
+            }
+            ImGui::TextDisabled("Drop a .lua file from the Resource Panel");
+
+            // This slot's editor-exposed variables.
+            DrawScriptVarWidgets(sc, i, world, e);
+
+            if (ImGui::Button("Remove Script"))
+                removeIdx = static_cast<int>(i);
+        }
+        ImGui::PopID();
+    }
+
+    if (removeIdx >= 0)
+        sc.scripts.erase(sc.scripts.begin() + removeIdx);
+
+    ImGui::Separator();
+    if (ImGui::Button("+ Add Script"))
+        sc.scripts.emplace_back();
 }
 
 // ---- RegisterDefaultEditors — all built-in component editor + tag registrations. Call once after SetRenderer(). ----
@@ -7275,11 +7376,13 @@ void EditorLayer::RegisterDefaultEditors()
             return w.HasComponent<ChainPhysicsComponent>(e);
         });
 
-    // ScriptComponent — enabled + scriptPath (ILUA_PATH drag-drop) plus a
-    // runtime-generated UI for the Logic script's editor-exposed variables.
+    // ScriptComponent — a dynamic list of attached Lua scripts. The reflected
+    // descriptor is empty (a static field list can't express a vector); the
+    // whole inspector is hand-drawn here: per-slot enabled + path (ILUA_PATH
+    // drag-drop) + exposed-variable UI, with add/remove controls.
     RegisterReflectedComponent<ScriptComponent>("Script", /*priority*/ 50,
         [this](ScriptComponent& sc, World* w, Entity e) {
-            DrawScriptExposedVars(sc, w, e);
+            DrawScriptComponentSlots(sc, w, e);
         });
 
     // SocketComponent — bone combos need live skeleton lookup; full custom postDraw.

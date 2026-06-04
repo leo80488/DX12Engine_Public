@@ -1389,21 +1389,11 @@ void Renderer::BuildScene_GatherBillboards(World& world,
     auto* pLightData = world.GetPool<LightData>();
     auto* pMaterial  = world.GetPool<MaterialComponent>();
     auto pGet = [](auto* p, Entity e) { return p ? p->Get(e) : nullptr; };
-    // Lazy-load light icon texture (m_texSys not available during Compile/Init)
-    if (m_lightIconHandle == Resource::kInvalidTextureHandle && m_texSys && m_resMgr)
-    {
-        m_lightIconHandle = m_texSys->Acquire(
-            "asset/Default_Texture/lightsymbol.itex", *m_resMgr, m_gfx);
-    }
-    if (m_lightIconSRV == 0 && m_texSys && m_lightIconHandle != Resource::kInvalidTextureHandle)
-    {
-        if (m_texSys->IsReady(m_lightIconHandle))
-        {
-            const RHI::Texture* tex = m_texSys->GetTexture(m_lightIconHandle);
-            if (tex) m_lightIconSRV = m_gfx.GetTextureSRVGpuHandle(*tex);
-        }
-    }
 
+    // NOTE: light-icon billboards are no longer emitted here. They moved to the
+    // dedicated editor-only DebugIconPass (driven by DebugDrawSystem), fully off
+    // the gameplay draw path — see editor_debug_draw_system.md / EnsureLightIconBindless.
+    // This loop now handles only genuine gameplay billboards (lights are skipped).
     if (m_meshMgr.GetBillboardMeshDescSlot() != RHI::kInvalidBufferIndex && pBillboard)
     {
         XMVECTOR camPos = XMLoadFloat3(&m_view.cameraPosition);
@@ -1419,9 +1409,11 @@ void Renderer::BuildScene_GatherBillboards(World& world,
             const GlobalTransform* gt = pGet(pGlobalXf, e);
             if (!gt) continue;
 
-            // Editor toggle: hide all light-icon billboards globally. Skips at
-            // DrawCandidate construction so the quads never reach any pass.
-            if (!m_lightBillboardsVisible && pGet(pLightData, e)) continue;
+            // Light entities get their icon from the dedicated debug light-icon
+            // loop below (decoupled from BillboardComponent — see
+            // editor_debug_draw_system.md). A BillboardComponent on a light is
+            // ignored for rendering so we never double-draw.
+            if (pGet(pLightData, e)) continue;
 
             XMFLOAT3 pos = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
             float size = bb->worldSize;
@@ -1469,14 +1461,6 @@ void Renderer::BuildScene_GatherBillboards(World& world,
             PermutationKey perm{};
             perm.Set(PermutationKey::BILLBOARD, true);
 
-            // Auto-assign light icon if LightData and no explicit texture; UNLIT branch.
-            if (pGet(pLightData, e))
-            {
-                if (c.texBaseColor == 0 && m_lightIconSRV)
-                    c.texBaseColor = m_lightIconSRV;
-                perm.Set(PermutationKey::UNLIT, true);
-            }
-
             switch (bb->mode)
             {
             case BillboardMode::Opaque:
@@ -1505,6 +1489,36 @@ void Renderer::BuildScene_GatherBillboards(World& world,
             candidates.push_back(c);
         }
     }
+
+}
+
+// ---------------------------------------------------------------------------
+// GetDebugIconBindless — lazy-load (once) and cache a debug-icon texture by
+// asset path, returning its bindless table index (== handle_id; the SRV is
+// published into the engine's t0 space2 table at slot [handle_id]). Returns
+// 0xFFFFFFFF while the texture is missing / still loading. Generic: any debug
+// icon kind works by passing its texture path — no per-icon plumbing here.
+// ---------------------------------------------------------------------------
+uint32_t Renderer::GetDebugIconBindless(const char* path)
+{
+    if (!path || !*path || !m_texSys || !m_resMgr) return 0xFFFFFFFFu;
+
+    auto it = m_debugIconTex.find(path);
+    if (it == m_debugIconTex.end())
+    {
+        // One Acquire per unique path (cached even on failure → no per-frame
+        // reload spam if the file is missing; restart picks up a new texture).
+        const Resource::TextureHandle h = m_texSys->Acquire(path, *m_resMgr, m_gfx);
+        it = m_debugIconTex.emplace(std::string(path), h).first;
+    }
+
+    const Resource::TextureHandle h = it->second;
+    if (h != Resource::kInvalidTextureHandle && m_texSys->IsReady(h))
+    {
+        if (const RHI::Texture* tex = m_texSys->GetTexture(h))
+            return static_cast<uint32_t>(tex->handle_id);
+    }
+    return 0xFFFFFFFFu;
 }
 
 // ---------------------------------------------------------------------------

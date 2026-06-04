@@ -194,6 +194,8 @@ REFLECT_BEGIN(CameraControllerComponent)
         REFLECT_FLOAT3(shoulderOffset,    "TP Shoulder Offset",      -10.f, 10.f)
         REFLECT_BOOL  (cameraCollisionEnabled, "TP Wall-Collision Probe")
         REFLECT_FLOAT (cameraProbeRadius, "TP Probe Radius",          0.01f, 1.0f)
+        REFLECT_FLOAT_FMT(followLag,      "TP Follow Lag (s, 0=off)", 0.0f, 1.0f, "%.3f", 0.005f)
+        REFLECT_FLOAT_FMT(distanceLag,    "TP Distance Lag (s)",      0.0f, 1.0f, "%.3f", 0.005f)
     REFLECT_ENDIF()
 REFLECT_END()
 
@@ -1006,10 +1008,12 @@ REFLECT_END()
 // ScriptComponent — Lua path with .lua drag-drop.
 // ===========================================================================
 
+// ScriptComponent now holds a std::vector<ScriptInstance> (multiple scripts per
+// entity). A static field descriptor can't express a dynamic list, so the auto
+// UI is empty — the entire inspector (per-slot path / enabled / exposed vars /
+// add / remove) is hand-drawn in EditorLayer's custom postDraw, mirroring how
+// SocketComponent's dynamic list is handled.
 REFLECT_BEGIN(ScriptComponent)
-    REFLECT_BOOL       (enabled,    "Enabled")
-    REFLECT_STRING_DROP(scriptPath, "Script Path", "ILUA_PATH")
-    REFLECT_INFO       ("Drop a .lua file from the Resource Panel")
 REFLECT_END()
 
 // ===========================================================================
