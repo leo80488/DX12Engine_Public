@@ -290,6 +290,17 @@ namespace
 
     Entity LogicalParentOf(World* world, Entity e)
     {
+        // Entity-as-widget Canvas UI: show UI nodes under their UIParent (the
+        // canvas or a parent node), so the canvas subtree appears as real
+        // child entities in the Hierarchy panel.
+        if (auto* up = world->GetComponent<UI::UIParent>(e))
+        {
+            Entity p = up->parent;
+            if ((p == NullEntity || !world->IsAlive(p)) && up->parentGuid.IsValid())
+                p = ECS::GuidRegistry::Get().Find(up->parentGuid);
+            if (p != NullEntity && p != e && world->IsAlive(p)) return p;
+        }
+
         if (auto* pc = world->GetComponent<Parent>(e); pc && pc->entity != NullEntity)
             if (world->IsAlive(pc->entity)) return pc->entity;
 
@@ -353,8 +364,21 @@ namespace
         if (const Children* ch = world->GetComponent<Children>(e))
             children = ch->entities;
 
+        // Canvas-UI children are linked via UIParent (not the scene-graph
+        // Children list) — collect them too so deleting a Canvas/UI node also
+        // removes its whole UI subtree instead of orphaning the child widgets.
+        if (auto* pp = world->GetPool<UI::UIParent>())
+        {
+            const auto& ents = pp->Entities();
+            const auto& data = pp->Data();
+            for (size_t i = 0; i < data.size(); ++i)
+                if (data[i].parent == e && ents[i] != e)
+                    children.push_back(ents[i]);
+        }
+
         for (Entity child : children)
-            DestroyEntityRecursive(world, child);
+            if (world->IsAlive(child))
+                DestroyEntityRecursive(world, child);
 
         if (const Parent* p = world->GetComponent<Parent>(e); p && p->entity != NullEntity)
         {
@@ -478,6 +502,17 @@ namespace
     void ReparentEntity(World* world, Entity child, Entity newParent)
     {
         using namespace DirectX;
+
+        // Entity-as-widget Canvas UI nodes are parented via UIParent (not the
+        // transform Parent) — reparent there and skip the transform path.
+        if (auto* up = world->GetComponent<UI::UIParent>(child))
+        {
+            up->parent     = newParent;
+            up->parentGuid = (newParent != NullEntity && world->IsAlive(newParent))
+                           ? ECS::EnsureGuidOn(*world, newParent)
+                           : ECS::Guid{};
+            return;
+        }
 
         // 1. Recompute LocalTransform to preserve world pose.
         const GlobalTransform* childGT = world->GetComponent<GlobalTransform>(child);
@@ -1295,6 +1330,115 @@ void EditorLayer::RenderMenuBar()
 
         ImGui::Separator();
 
+        // ---- Canvas UI (entity-as-widget) — create entities + components ----
+        if (ImGui::BeginMenu("UI (Canvas)"))
+        {
+            // Parent new elements to the CANVAS (walk up from the selection),
+            // NOT the last-created node — so successive Create calls make
+            // SIBLINGS under the canvas instead of nesting inside each other.
+            auto findUIParent = [&]() -> Entity
+            {
+                Entity sel = m_selectedEntity;
+                int guard = 0;
+                while (sel != NullEntity && m_world && m_world->IsAlive(sel) && guard++ < 256)
+                {
+                    if (m_world->HasComponent<UI::UICanvas>(sel)) return sel;
+                    const auto* up = m_world->GetComponent<UI::UIParent>(sel);
+                    sel = up ? up->parent : NullEntity;
+                }
+                if (m_world)
+                    if (auto* cp = m_world->GetPool<UI::UICanvas>())
+                        if (cp->Size() > 0) return cp->Entities()[0];
+                return NullEntity;
+            };
+            auto childIndex = [&](Entity parent) -> int
+            {
+                int n = 0;
+                if (m_world)
+                    if (auto* pp = m_world->GetPool<UI::UIParent>())
+                        for (auto& up : pp->Data())
+                            if (up.parent == parent) ++n;
+                return n;
+            };
+            auto newUINode = [&](const char* name, Entity parent, float w, float h) -> Entity
+            {
+                Entity e = m_world->CreateEntity();
+                m_world->SetName(e, name);
+                UI::UIRect r;
+                r.size   = { w, h };
+                r.offset = { 0.f, static_cast<float>(childIndex(parent)) * (h + 10.f) };
+                m_world->AddComponent<UI::UIRect>(e, r);
+                UI::AttachUIParent(*m_world, e, parent);
+                return e;
+            };
+
+            if (m_world && ImGui::MenuItem("Canvas (root)"))
+            {
+                Entity c = m_world->CreateEntity();
+                m_world->SetName(c, "Canvas");
+                m_world->AddComponent<UI::UICanvas>(c, UI::UICanvas{});
+                m_selectedEntity = c;
+            }
+            ImGui::Separator();
+
+            const Entity parent = m_world ? findUIParent() : NullEntity;
+            const bool   canAdd = (parent != NullEntity);
+            if (!canAdd)
+                ImGui::TextDisabled("(create a Canvas first, or select one)");
+
+            if (ImGui::MenuItem("Panel (Image)", nullptr, false, canAdd))
+            {
+                Entity e = newUINode("Panel", parent, 300.f, 200.f);
+                UI::UIImage img; img.color = { 0.10f, 0.11f, 0.15f, 0.94f };
+                m_world->AddComponent<UI::UIImage>(e, img);
+                m_selectedEntity = e;
+            }
+            if (ImGui::MenuItem("Button (Image + Interactable + Label)", nullptr, false, canAdd))
+            {
+                Entity e = newUINode("Button", parent, 200.f, 56.f);
+                UI::UIImage img; img.color = { 0.22f, 0.46f, 0.86f, 1.f };
+                m_world->AddComponent<UI::UIImage>(e, img);
+                UI::UIInteractable it; it.tintTransition = true;
+                m_world->AddComponent<UI::UIInteractable>(e, it);
+                Entity lbl = m_world->CreateEntity();
+                m_world->SetName(lbl, "Label");
+                UI::UIRect lr; lr.anchorMin = { 0.f, 0.f }; lr.anchorMax = { 1.f, 1.f };
+                lr.pivot = { 0.5f, 0.5f }; lr.size = { 0.f, 0.f }; lr.offset = { 0.f, 0.f };
+                m_world->AddComponent<UI::UIRect>(lbl, lr);
+                UI::UIText lt; lt.text = "Button"; lt.alignH = 1; lt.alignV = 1;
+                m_world->AddComponent<UI::UIText>(lbl, lt);
+                UI::AttachUIParent(*m_world, lbl, e);
+                m_selectedEntity = e;
+            }
+            if (ImGui::MenuItem("Text", nullptr, false, canAdd))
+            {
+                Entity e = newUINode("Text", parent, 220.f, 40.f);
+                UI::UIText t; t.text = "New Text"; t.alignH = 1; t.alignV = 1;
+                m_world->AddComponent<UI::UIText>(e, t);
+                m_selectedEntity = e;
+            }
+            if (ImGui::MenuItem("Image", nullptr, false, canAdd))
+            {
+                Entity e = newUINode("Image", parent, 120.f, 120.f);
+                UI::UIImage img;
+                m_world->AddComponent<UI::UIImage>(e, img);
+                m_selectedEntity = e;
+            }
+            if (ImGui::MenuItem("Animated Sprite (Image + SpriteAnim)", nullptr, false, canAdd))
+            {
+                Entity e = newUINode("Sprite", parent, 128.f, 128.f);
+                UI::UIImage img;            // drop a sprite-sheet .itex on its Texture field
+                img.pointFilter = true;     // crisp pixel-art frames by default
+                m_world->AddComponent<UI::UIImage>(e, img);
+                UI::UISpriteAnimComponent anim; // 4x4 @ 12fps default — tune in Inspector
+                m_world->AddComponent<UI::UISpriteAnimComponent>(e, anim);
+                m_selectedEntity = e;
+            }
+            ImGui::EndMenu();
+        }
+
+        ImGui::Separator();
+
         auto createLight = [this](LightType type, const char* name, float y = 5.f) {
             if (!m_world) return;
             Entity e = m_world->CreateEntity();
@@ -1577,6 +1721,10 @@ void EditorLayer::RenderMenuBar()
                     m_selectedEntity = e;
                 }
             }
+
+            // Entity-as-widget Canvas UI creation lives in the menu-bar
+            // "Create -> UI (Canvas)" submenu (Canvas / Panel / Button / Text /
+            // Image). Removed the duplicate sample spawner that used to sit here.
 
             // ---- Helper: spawn world-space UI entity (LocalTransform + Global + FollowEntity + WorldSpaceUI). ----
             auto spawnWorldUIChild = [&](const char* dbgName, float yOffset,
@@ -2590,6 +2738,7 @@ void EditorLayer::RenderHierarchyPanel()
         m_world->AddComponent<GlobalTransform>(ne, GlobalTransform{});
         m_selectedEntity = ne;
     }
+
     ImGui::SameLine();
     ImGui::TextDisabled("|");
     ImGui::SameLine();
@@ -6753,9 +6902,66 @@ void EditorLayer::RegisterDefaultEditors()
     // UIRootComponent — one entity per HUD/menu; widget tree built in C++/Lua, not ECS-editable.
     RegisterReflectedComponent<UI::UIRootComponent>("UI Root", /*priority*/ 95);
     RegisterReflectedComponent<UI::UIScreenSpaceComponent>("UI Screen-Space", /*priority*/ 96);
-    RegisterReflectedComponent<UI::UIImageComponent>("UI Image", /*priority*/ 98);
+    // UI Image — texturePath is the stable identity; App re-resolves the SRV
+    // handle each frame. When the path field changes here, drop the cached
+    // handle so the next frame re-acquires the new texture.
+    RegisterReflectedComponent<UI::UIImageComponent>("UI Image", /*priority*/ 98,
+        [](UI::UIImageComponent& img, World*, Entity e)
+        {
+            static std::unordered_map<Entity, std::string> s_lastPath;
+            std::string& last = s_lastPath[e];
+            if (last != img.texturePath)
+            {
+                last = img.texturePath;
+                img.texture = Resource::TextureHandle{}; // force App re-acquire
+                img.srvGpuHandle = 0;
+            }
+            if (img.srvGpuHandle != 0)
+                ImGui::Image(ImTextureRef(static_cast<ImTextureID>(img.srvGpuHandle)),
+                             ImVec2(64.f, 64.f));
+            else if (!img.texturePath.empty())
+                ImGui::TextDisabled("(loading \"%s\" ...)", img.texturePath.c_str());
+            else
+                ImGui::TextDisabled("(no texture — drop an .itex onto the Texture field)");
+        });
     RegisterReflectedComponent<UI::UITextComponent>("UI Text",   /*priority*/ 99);
     RegisterReflectedComponent<UI::UIBarComponent>("UI Bar",     /*priority*/ 100);
+
+    // Entity-as-widget Canvas UI (UI/UICanvas.h) — UIRect layout + hierarchy.
+    RegisterReflectedComponent<UI::UICanvas>("Canvas (Root)", /*priority*/ 90);
+    RegisterReflectedComponent<UI::UIRect>  ("UI Rect",       /*priority*/ 91);
+    RegisterReflectedComponent<UI::UIInteractable>("UI Interactable", /*priority*/ 92);
+    RegisterReflectedComponent<UI::UIText>  ("Canvas Text",   /*priority*/ 93);
+    RegisterReflectedComponent<UI::UIImage>("Canvas Image", /*priority*/ 94,
+        [](UI::UIImage& img, World*, Entity e)
+        {
+            static std::unordered_map<Entity, std::string> s_lastPath;
+            std::string& last = s_lastPath[e];
+            if (last != img.texturePath)
+            {
+                last = img.texturePath;
+                img.texture = Resource::TextureHandle{};
+                img.srvGpuHandle = 0;
+            }
+            if (img.srvGpuHandle != 0)
+                ImGui::Image(ImTextureRef(static_cast<ImTextureID>(img.srvGpuHandle)),
+                             ImVec2(64.f, 64.f));
+            else if (!img.texturePath.empty())
+                ImGui::TextDisabled("(loading \"%s\" ...)", img.texturePath.c_str());
+            else
+                ImGui::TextDisabled("(no texture — solid colour fill)");
+        });
+    // Sprite-sheet animation — drives the sibling Canvas Image's uv each frame.
+    RegisterReflectedComponent<UI::UISpriteAnimComponent>("Sprite Animation", /*priority*/ 95,
+        [](UI::UISpriteAnimComponent& a, World*, Entity)
+        {
+            const int total = a.frameCount > 0 ? a.frameCount
+                                               : std::max(1, a.columns) * std::max(1, a.rows);
+            ImGui::TextDisabled("Frame %d / %d", a.frame + 1, total);
+            if (ImGui::SmallButton("Restart")) { a.elapsed = 0.f; a.frame = 0; }
+            ImGui::SameLine();
+            if (ImGui::SmallButton(a.playing ? "Pause" : "Play")) a.playing = !a.playing;
+        });
 
     // World-space UI — billboarded 3D quads via WorldSpaceUISystem + WorldUIBillboardPass; pair marker + content component.
     RegisterReflectedComponent<UI::WorldSpaceUIComponent>("World-Space UI",     /*priority*/ 101);
@@ -8263,6 +8469,12 @@ void EditorLayer::RegisterDefaultEditors()
     SetComponentCategory<UI::UIImageComponent>            ("UI");
     SetComponentCategory<UI::UITextComponent>             ("UI");
     SetComponentCategory<UI::UIBarComponent>              ("UI");
+    SetComponentCategory<UI::UICanvas>                    ("UI");
+    SetComponentCategory<UI::UIRect>                      ("UI");
+    SetComponentCategory<UI::UIInteractable>              ("UI");
+    SetComponentCategory<UI::UIText>                      ("UI");
+    SetComponentCategory<UI::UIImage>                     ("UI");
+    SetComponentCategory<UI::UISpriteAnimComponent>       ("UI");
     SetComponentCategory<UI::WorldSpaceUIComponent>       ("UI");
     SetComponentCategory<UI::WorldUIBarComponent>         ("UI");
     SetComponentCategory<UI::WorldUITextComponent>        ("UI");

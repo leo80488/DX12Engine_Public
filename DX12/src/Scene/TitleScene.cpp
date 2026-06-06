@@ -97,10 +97,13 @@ void TitleScene::Update(float /*dt*/)
 {
     if (!m_ctx) return;
 
-    if (Input::Get().WasKeyPressed(VK_SPACE) && m_ctx->requestReplaceMode)
+    if (Input::Get().WasKeyPressed(VK_SPACE))
     {
         LOG_INFO("TitleScene: -> GameScene");
-        m_ctx->requestReplaceMode(std::make_unique<GameScene>());
+        if (m_ctx->beginTransition)
+            m_ctx->beginTransition(std::make_unique<GameScene>());
+        else if (m_ctx->requestReplaceMode)
+            m_ctx->requestReplaceMode(std::make_unique<GameScene>());
     }
 }
 

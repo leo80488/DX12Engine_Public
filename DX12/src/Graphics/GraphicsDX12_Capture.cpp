@@ -17,6 +17,7 @@ using Microsoft::WRL::ComPtr;
 
 #include "DirectXTex.h"
 #include "Resource/AssetHeader.h"   // .itex container — AssetHeader + TextureMetadata
+#include "Resource/AssetFS.h"       // pak-first read for baked probe cubemaps
 #include <fstream>
 
 bool GraphicsDX12::CaptureTextureToPNG(const RHI::Texture& tex,
@@ -461,24 +462,16 @@ bool GraphicsDX12::LoadITEXIntoTextureCube(RHI::Texture&      cubeArrayTex,
     if (firstFace + 6 > desc.DepthOrArraySize)
     { LOG_ERROR("LoadITEXIntoTextureCube: cubeIndex %u out of range", cubeIndex); return false; }
 
-    // Read the whole .itex blob, then parse it exactly like TextureLoader:
-    // ValidateHeader → GetPayload → LoadFromDDSMemory.
+    // Read the whole .itex blob via AssetFS (game.ipak first, then loose disk),
+    // then parse it exactly like TextureLoader: ValidateHeader → GetPayload →
+    // LoadFromDDSMemory. A raw std::ifstream here used to fail in PACKED builds
+    // (the baked probe .itex lives only inside game.ipak), forcing a needless
+    // re-bake every launch.
     std::vector<uint8_t> blob;
+    if (!Resource::AssetFS::Get().ReadFile(path, blob) || blob.empty())
     {
-        std::wstring wpath;
-        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path, -1, nullptr, 0);
-        if (wlen > 0) { wpath.resize(wlen - 1); MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath.data(), wlen); }
-        std::ifstream in(wpath, std::ios::binary | std::ios::ate);
-        if (!in)
-        {
-            LOG_WARNING("LoadITEXIntoTextureCube: cannot open '%s'", path);
-            return false;
-        }
-        const std::streamsize sz = in.tellg();
-        if (sz <= 0) { LOG_WARNING("LoadITEXIntoTextureCube: '%s' is empty", path); return false; }
-        blob.resize(static_cast<size_t>(sz));
-        in.seekg(0);
-        in.read(reinterpret_cast<char*>(blob.data()), sz);
+        LOG_WARNING("LoadITEXIntoTextureCube: cannot read '%s'", path);
+        return false;
     }
 
     if (!Resource::ValidateHeader(blob.data(), blob.size(), Resource::MAGIC_TEXTURE))

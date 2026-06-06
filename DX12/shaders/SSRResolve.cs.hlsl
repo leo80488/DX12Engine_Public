@@ -83,18 +83,36 @@ float V_SmithGGXCorrelated(float NdotV, float NdotL, float a2)
 
 float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
-// Current-pixel BRDF weight using the neighbour's sampled (L, PDF).
-float GetWeight(int2 np, float3 V, float3 N, float roughness, float NdotV)
+// Parallax-corrected, lobe-aligned BRDF resolve weight (Stachowiak, SIGGRAPH
+// 2015 "Stochastic Screen-Space Reflections"). Rather than reusing the
+// neighbour's traced direction verbatim, reconstruct the neighbour's HIT point
+// in world space and ask what direction THIS pixel would have to reflect along
+// to see that same point. Evaluating the current pixel's GGX BRDF along that
+// parallax-corrected L is what makes glossy reflections on CURVED / OBLIQUE
+// surfaces resolve sharply instead of smearing the neighbour's mismatched
+// reflection into the spatial mean.
+float GetWeight(int2 np, float npDepth, float3 P, float3 V, float3 N,
+                float roughness, float NdotV, float3 Rmirror, float selfRayLen)
 {
     float4 lpdf = gRayDirPDF.Load(int3(np, 0));
     if (lpdf.w <= 0.0 || dot(lpdf.xyz, lpdf.xyz) < 1e-6) return 0.0;
 
-    float3 L = normalize(lpdf.xyz);
-    float  PDF = lpdf.w;
+    float3 npL  = normalize(lpdf.xyz);
+    float  PDF  = lpdf.w;
+    float  npRL = gRayLength.Load(int3(np, 0));
 
-    float3 H = normalize(L + V);
-    float  NdotH = saturate(dot(N, H));
+    // Neighbour surface pos → its reflected hit point in world space.
+    float2 npUV   = (float2(np) + 0.5) / float2(renderW, renderH);
+    float3 npPos  = ReconstructWorldPos(npUV, npDepth);
+    float3 hitPos = npPos + npL * npRL;
+
+    // Parallax-corrected L: from THIS pixel toward the shared hit point.
+    float3 L     = normalize(hitPos - P);
     float  NdotL = saturate(dot(N, L));
+    if (NdotL <= 0.0) return 0.0;
+
+    float3 H     = normalize(L + V);
+    float  NdotH = saturate(dot(N, H));
 
     float a  = max(roughness, 0.045);
     float a2 = a * a; a2 *= a2;
@@ -102,7 +120,41 @@ float GetWeight(int2 np, float3 V, float3 N, float roughness, float NdotV)
     float Vis  = V_SmithGGXCorrelated(NdotV, NdotL, a2);
     float D    = D_GGX(NdotH, a2);
     float brdf = Vis * D * NdotL;
-    return brdf / max(PDF, 1e-5);
+    float w    = brdf / max(PDF, 1e-5);
+
+    // Lobe alignment — a GENTLE linear bias toward this pixel's mirror
+    // reflection. The GGX D term above ALREADY provides sharp lobe weighting
+    // (it also peaks at L≈Rmirror), so the original pow(.,2/a) — exponent 20 at
+    // roughness 0.1 — double-suppressed off-lobe neighbours and collapsed
+    // weightSum on small/curved glossy surfaces straight into the noisy 1-spp
+    // self fallback (exactly the noise this pass is meant to remove). Linear
+    // keeps a mild directional preference without that collapse.
+    w *= saturate(dot(L, Rmirror));
+
+    // Ray-length similarity — a neighbour whose hit sits at a very different
+    // distance saw DIFFERENT content; soft-reject via a relative Gaussian.
+    // Skipped when this pixel has no valid self hit (selfRayLen ~ 0), so a
+    // missed-self pixel can still pull a resolve from its neighbourhood.
+    if (selfRayLen > 0.1)
+    {
+        float rlRel = (npRL - selfRayLen) / max(selfRayLen, 0.1);
+        w *= exp(-rlRel * rlRel * 2.0);
+    }
+    return w;
+}
+
+// Vogel golden-angle disk — near-blue-noise sample distribution at zero
+// precompute cost. Returns a point in the unit disk; caller scales by radius.
+// r uses i/count (not (i+0.5)/count) so sample 0 lands EXACTLY on the center
+// pixel — a guaranteed self tap whose importance-sampled hit keeps weightSum
+// non-zero even if every off-center neighbour is BRDF-rejected. Without it,
+// small/curved glossy surfaces could collapse into the noisy raw-self fallback.
+float2 VogelDisk(uint i, uint count, float phi)
+{
+    const float goldenAngle = 2.39996322973;   // radians, π(3−√5)
+    float r     = sqrt(float(i) / float(count));
+    float theta = float(i) * goldenAngle + phi;
+    return float2(r * cos(theta), r * sin(theta));
 }
 
 uint WangHash(uint s)
@@ -216,10 +268,21 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
 
     // Sample radius: glossy [2..8 px] scaled by roughness.
     const float  spatialSize = lerp(2.0, 8.0, saturate(roughness * 5.0));
-    const uint   kSamples    = 4u;
+    // 4 -> 8 taps. 4 single-frame BRDF samples is far too few once temporal
+    // accumulation is unavailable (small surfaces whose reprojected history is
+    // rejected every frame), so their 1-spp trace noise survives to the output.
+    // Denser per-frame sampling cuts that noise ~sqrt(2)x regardless of history
+    // or neighbour availability. (The 2026-05-18 tuning ran this at 16; 8 is the
+    // conservative restore — bump toward 16 if small-surface noise persists.)
+    const uint   kSamples    = 8u;
 
-    uint h = WangHash(pixel.x + pixel.y * renderW + frameIndex * 0x9E3779B9u);
-    uint2 random = uint2(h & 0xFFFFu, (h >> 16) & 0xFFFFu);
+    // Per-pixel Vogel rotation phase, varied per frame for temporal decorrelation.
+    uint  hseed = WangHash(pixel.x + pixel.y * renderW + frameIndex * 0x9E3779B9u);
+    float phi   = float(hseed & 0xFFFFu) * (6.28318530718 / 65536.0);
+
+    // References for the parallax-corrected, lobe-aligned neighbour weighting.
+    float3 Rmirror    = reflect(-V, N);
+    float  selfRayLen = gRayLength.Load(int3(pixel, 0));
 
     float4 accumColor = 0;
     float  weightSum  = 0;
@@ -229,14 +292,19 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
     [unroll]
     for (uint i = 0; i < kSamples; ++i)
     {
-        float2 offset = (Hammersley2DRandom(i, kSamples, random) - 0.5) * spatialSize;
+        // Vogel golden-angle disk: covers the radius more evenly than the old
+        // Hammersley-in-square for the same budget, and its residual is
+        // higher-frequency (easier for temporal + upsample to mop up).
+        float2 offset = VogelDisk(i, kSamples, phi) * spatialSize;
         int2 np = clamp(pixel + int2(offset),
                         int2(0, 0),
                         int2(int(renderW) - 1, int(renderH) - 1));
 
-        if (gDepth.Load(int3(np, 0)) <= 0.0) continue;
+        float npDepth = gDepth.Load(int3(np, 0));
+        if (npDepth <= 0.0) continue;
 
-        float w = GetWeight(np, V, N, roughness, NdotV);
+        float w = GetWeight(np, npDepth, worldPos, V, N, roughness, NdotV,
+                            Rmirror, selfRayLen);
         if (w <= 0.0) continue;
 
         float4 sampleColor = gHitBuffer.Load(int3(np, 0));

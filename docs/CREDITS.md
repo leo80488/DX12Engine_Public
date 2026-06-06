@@ -10,6 +10,7 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 
 | Library                            | Use                                                       | License (upstream) |
 | ---------------------------------- | --------------------------------------------------------- | ------------------ |
+| **Assimp**                         | Mesh / scene / skeleton / animation import (offline cook)  | BSD-3-Clause       |
 | **DirectX-Headers**                | Up-to-date `d3d12.h` + Agility SDK headers                | MIT                |
 | **DirectXTex**                     | Texture loading, BC compression, WIC save (PNG capture)   | MIT                |
 | **DXC (dxcompiler.dll, dxil.dll)** | HLSL → DXIL compilation, reflection                       | LLVM (Apache 2.0)  |
@@ -23,12 +24,6 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 | **Recast & Detour**                | Navmesh generation (Recast) + pathfinding (Detour)        | zlib               |
 | **FFmpeg** (avcodec/format/util/swscale) | Video demux + hardware (D3D12VA) decode + scaling   | LGPL-2.1+          |
 | **XAudio2 / X3DAudio**             | Audio mixer + 3D spatialisation                           | Windows SDK        |
-
-## Libraries via vcpkg
-
-| Library    | Use                                                     | License      |
-| ---------- | ------------------------------------------------------- | ------------ |
-| **Assimp** | Mesh / scene / skeleton / animation import (offline cook) | BSD-3-Clause |
 
 > DXC binaries are copied from Windows SDK 10.0.26100.0.
 
@@ -49,8 +44,7 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 | **Clustered Shading**      | Olsson / Billeter / Assarsson 2012, Doom 2016 implementation                                                                                 |
 | **Outline**                | Inverted-hull (Genshin / NPR style) + screen-space Roberts edge on object-ID/normal/depth                                                    |
 | **Glass Shatter**          | Voronoi shard pre-cut + per-shard 2D rigid-body sim                                                                                          |
-| **Decals**                 | Volume-projected (cube) clustered decals, similar to Doom 2016 / Wicked Engine decal cluster path                                            |
-| **Beam (procedural tube)** | Parallel-transport frame, Rodrigues' rotation, per-segment hash noise wobble                                                                 |
+| **Decals**                 | Volume-projected (cube) clustered decals, similar to Doom 2016 / Wicked Engine decal cluster path
 | **Tracer (cyl. billboard)** | `cross(beamAxis, toCamera)` cylindrical billboard with parallel-degenerate fallback                                                         |
 | **TAA Velocity Dilation**  | Drobot / Lottes nearest-depth dilation                                                                                                       |
 | **Reverse-Z Depth**        | Reed/Persson — recommended for D32_FLOAT depth precision                                                                                     |
@@ -71,6 +65,5 @@ Bundled under `DX12/asset/`:
 
 - **Sponza** (Crytek / Frank Meinl / Intel) — classic GI / lighting reference scene.
 - **Bistro** (Amazon Lumberyard) — DDGI verification scene.
-- **soldier2** — skinned animation sample.
 - **PMX/VMD test rig** — MMD pipeline verification.
 - **IBL** — multiple HDRI cubemaps with pre-baked irradiance + radiance.

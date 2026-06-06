@@ -351,10 +351,28 @@ void Renderer::BuildScene_UpdateDDGI(World& world)
             activeCount++;
         }
 
-        // Trace CS picks random light per ray from cluster buffer; 0 → sky-miss + multi-bounce only.
+        // Trace CS picks random point/spot light per ray from cluster buffer;
+        // 0 → sky-miss + multi-bounce only.
         const uint32_t ddgiLightCount =
             m_clusterPass ? m_clusterPass->GetLightCount() : 0u;
-        m_ddgiMgr.Tick(m_gfx, vols, runs, activeCount, ddgiLightCount);
+
+        // Directional sun — read back the FINAL LightCB sun. The light gather
+        // wrote the authored directional into LightCB.lightDir/lightColor; then
+        // SyncSkyboxIBL's TOD override (run earlier this frame, inside
+        // BuildScene_UploadLights) replaced it with the active day/night body
+        // when Time-of-Day is enabled. This is the SAME single sun the deferred
+        // Lighting.ps applies, so feeding it to the trace CS makes DDGI's
+        // directional GI track both the authored light AND the TOD cycle — even
+        // when the sun is not a tagged SunLightTag entity (the cluster buffer
+        // alone never sees that override).
+        XMFLOAT3 sunDir{ 0.0f, -1.0f, 0.0f };
+        XMFLOAT3 sunCol{ 0.0f,  0.0f, 0.0f };
+        if (const auto* lb = m_lightCB.Current(m_gfx))
+        {
+            sunDir = { lb->lightDir[0],   lb->lightDir[1],   lb->lightDir[2]   };
+            sunCol = { lb->lightColor[0], lb->lightColor[1], lb->lightColor[2] };
+        }
+        m_ddgiMgr.Tick(m_gfx, vols, runs, activeCount, ddgiLightCount, sunDir, sunCol);
     }
 
     // GC orphaned slots — ALWAYS, even when volPool==null (the new world has no

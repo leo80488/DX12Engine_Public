@@ -230,6 +230,10 @@ void EditorLayer::RenderFontEditorWindow()
     // ---- Test text preview ---------------------------------------------------
     if (font.IsReady() && ImGui::CollapsingHeader("Test Preview", ImGuiTreeNodeFlags_DefaultOpen))
     {
+        ImGui::TextDisabled("Note: this preview looks soft on purpose — the atlas now stores a");
+        ImGui::TextDisabled("signed distance field, and ImGui's plain shader can't run the SDF");
+        ImGui::TextDisabled("smoothstep. In-game UI text (UI.ps.hlsl) is crisp at any scale.");
+        ImGui::Spacing();
         ImGui::InputTextMultiline("##testtext", st.testText, sizeof(st.testText),
                                    ImVec2(-FLT_MIN, 60.f));
         ImGui::ColorEdit4("Color##test", st.testColor);

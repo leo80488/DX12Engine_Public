@@ -60,6 +60,16 @@ struct DDGIVolumeGPU
     uint   frameIndex;
     uint   _padFI0;
     uint   _padFI1;
+
+    // Directional sun — SINGLE source of truth, mirrored from LightCB.lightDir /
+    // lightColor (which the light gather AND the TOD day/night override both
+    // write). The trace CS evaluates this deterministically per ray and SKIPS
+    // directional entries in the cluster g_Lights Monte-Carlo, exactly like the
+    // deferred Lighting.ps. This keeps DDGI's directional GI in lockstep with
+    // direct lighting — including the Time-of-Day cycle — whether or not the sun
+    // is authored as a tagged SunLightTag entity.
+    float3 sunDirection; float _padSun0;   // from-light convention (== LightCB.lightDir)
+    float3 sunColor;     float _padSun1;   // rgb radiance, already × intensity
 };
 
 struct DDGIProbeData

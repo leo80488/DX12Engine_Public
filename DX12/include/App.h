@@ -3,13 +3,10 @@
 #include "System/Window.h"
 #ifdef WITH_EDITOR
 #include "Editor/EditorLayer.h"
-#endif
-// DebugDrawSystem is plain engine driver code (compiled into EngineCore — see
-// DX12/CMakeLists.txt). The App::m_debugDraw member is always present so Game
-// builds compile too; only the call sites are WITH_EDITOR-gated. Hence this
-// include must stay OUTSIDE the WITH_EDITOR block.
 #include "Editor/DebugDrawSystem.h"
+#endif
 #include "Scene/GameModeStack.h"
+#include "Scene/SceneTransitionManager.h"
 
 // ---- Resource systems --------------------------------------------------
 #include "Resource/ResourceManager.h"
@@ -43,6 +40,7 @@
 
 // ---- UI ----------------------------------------------------------------
 #include "UI/UISystem.h"
+#include "UI/UICanvasSystem.h"
 #include "UI/WorldSpaceUISystem.h"
 
 class Renderer;
@@ -88,6 +86,8 @@ private:
     EditorLayer  m_editorLayer;
 #endif
     GameModeStack m_gameModeStack;
+    // Drives the fade-out -> loading screen -> fade-in around scene switches.
+    SceneTransitionManager m_transition;
 
     // ---- Engine state (shared across game modes; survives level switches) ----
     // IGameModes operate on this World rather than owning their own; systems
@@ -101,9 +101,12 @@ private:
     DX12Physics::PhysicsSystem  m_physicsSystem;
     Nav::NavMeshSystem          m_navSystem;
     // Editor-only single submission point for debug visuals (wireframes +
-    // light icons). Driven from the render lambda under WITH_EDITOR; harmless
-    // and untouched in Game builds.
+    // light icons). Driven from the render lambda under WITH_EDITOR. Guarded
+    // because DebugDrawSystem.h is only included in editor builds (its only
+    // uses in App.cpp are already WITH_EDITOR-gated).
+#ifdef WITH_EDITOR
     DebugDrawSystem             m_debugDraw;
+#endif
     Audio::AudioEngine          m_audioEngine;
     Audio::AudioSystem          m_audioSystem;
     Audio::Audio3DSystem        m_audio3DSystem;
@@ -113,6 +116,9 @@ private:
     // Screen-space UISystem drives UIRoot widgets/hit-test/DrawList submit.
     // WorldSpaceUISystem feeds WorldUIBillboardPass (separate from UIPass).
     UI::UISystem                m_uiSystem;
+    // Entity-as-widget Canvas UI (Bevy/Unity-style) — coexists with m_uiSystem,
+    // feeds the same UIDrawList. See UI/UICanvas.h + UICanvasSystem.
+    UI::UICanvasSystem          m_uiCanvasSystem;
     UI::UIInputState            m_uiInput;
     UI::WorldSpaceUISystem      m_worldSpaceUISystem;
 
@@ -127,4 +133,12 @@ private:
     // long load doesn't burn 5 catch-up steps the first tick.
     float        m_physicsAccumulator{ 0.0f };
     bool         m_viewportFullscreen{ false };
+
+    // Game build only: previous-frame OS mouse position, used to synthesise the
+    // per-frame look delta the editor would otherwise supply from its viewport
+    // panel (ctx.mouseViewportDX/DY). m_prevMouseValid guards the first frame so
+    // a cold start doesn't produce a huge jump.
+    int          m_prevMouseX{ 0 };
+    int          m_prevMouseY{ 0 };
+    bool         m_prevMouseValid{ false };
 };

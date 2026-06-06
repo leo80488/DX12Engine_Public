@@ -143,4 +143,23 @@ namespace Resource
         out.resize(static_cast<std::size_t>(sz));
         return static_cast<bool>(f.read(reinterpret_cast<char*>(out.data()), sz));
     }
+
+    bool AssetFS::ReadFileText(const std::string& path, std::string& out) const
+    {
+        std::vector<std::uint8_t> bytes;
+        if (!ReadFile(path, bytes)) return false;
+        out.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        return true;
+    }
+
+    void AssetFS::EnumerateUnder(const std::string& prefix,
+                                 std::vector<std::string>& out) const
+    {
+        // No-op when no pak is mounted — callers fall back to a loose-disk scan.
+        const std::string pfx = Normalize(prefix);
+        for (const auto& kv : m_index)
+            if (kv.first.size() >= pfx.size() &&
+                kv.first.compare(0, pfx.size(), pfx) == 0)
+                out.push_back(kv.first);
+    }
 }

@@ -12,6 +12,7 @@
 #include "Input/InputSystem.h"
 #include "System/EventBus.h"
 #include "System/Log.h"
+#include "Resource/AssetFS.h"
 
 #define SOL_ALL_SAFETIES_ON 1
 #include <sol/sol.hpp>
@@ -34,6 +35,21 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------------------
 namespace
 {
+    // Load a Lua asset through AssetFS (pak first, disk fallback) and execute
+    // it, returning the script result. Replaces sol::state::safe_script_file,
+    // which reads straight off disk and so can't find scripts bundled inside
+    // game.ipak in a packed Game build. On a missing file the returned result
+    // is invalid (just like safe_script_file), so callers' existing
+    // `!result.valid()` checks still fire — they log their own [path] context.
+    sol::protected_function_result RunScriptAsset(sol::state& lua, const std::string& path)
+    {
+        std::string src;
+        if (Resource::AssetFS::Get().ReadFileText(path, src))
+            return lua.safe_script(src, sol::script_pass_on_error, "@" + path);
+        // Not in pak or on disk — surface as an invalid result.
+        return lua.safe_script("error('asset not found')", sol::script_pass_on_error);
+    }
+
     // Returns the per-entity instance array, creating it on demand when
     // `create` is set. When `create` is false and none exists, returns an
     // invalid (nil) table.
@@ -764,7 +780,7 @@ void ScriptSystem::RegisterBindings()
     engine.set_function("LoadConfig",
         [this](const std::string& path) -> sol::object
         {
-            auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+            auto result = RunScriptAsset(*m_lua, path);
             if (!result.valid()) {
                 sol::error err = result;
                 LOG_ERROR("Engine.LoadConfig [%s]: %s", path.c_str(), err.what());
@@ -906,7 +922,7 @@ bool ScriptSystem::LoadLogicTemplate(const std::string& path)
     tmpl.lastError.clear();
     tmpl.hasSpawn = tmpl.hasUpdate = tmpl.hasDestroy = false;
 
-    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    auto result = RunScriptAsset(*m_lua, path);
     if (!result.valid())
     {
         sol::error err = result;
@@ -1220,7 +1236,7 @@ bool ScriptSystem::LoadSystem(const std::string& path)
         if (sys.name == name) { TeardownSystem(sys); }
     }
 
-    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    auto result = RunScriptAsset(*m_lua, path);
     if (!result.valid())
     {
         sol::error err = result;
@@ -1308,7 +1324,7 @@ bool ScriptSystem::LoadService(const std::string& path)
 {
     const std::string name = fs::path(path).stem().string();
 
-    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    auto result = RunScriptAsset(*m_lua, path);
     if (!result.valid())
     {
         sol::error err = result;
@@ -1347,7 +1363,7 @@ bool ScriptSystem::LoadUIScript(const std::string& path)
 {
     const std::string name = fs::path(path).stem().string();
 
-    auto result = m_lua->safe_script_file(path, sol::script_pass_on_error);
+    auto result = RunScriptAsset(*m_lua, path);
     if (!result.valid())
     {
         sol::error err = result;
@@ -1412,25 +1428,49 @@ void ScriptSystem::ScanScriptDirectory(const std::string& root)
     enum class Kind { Service, System, UI };
     auto scan = [this](const fs::path& dir, Kind kind)
     {
-        std::error_code ec;
-        if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+        // Collect the .lua files directly under `dir`. In a PACKED build there are
+        // NO loose files on disk, so a fs::directory_iterator would find nothing
+        // and every auto-scanned Service/System/UI script would silently never
+        // register — even though they ARE bundled in game.ipak. Discover them from
+        // the pak index when one is mounted; fall back to a loose-disk scan in the
+        // editor / unpacked dev workflow. (Content is read pak-first either way via
+        // RunScriptAsset -> AssetFS::ReadFileText.)
+        std::vector<std::string> files;
+
+        auto& afs = ::Resource::AssetFS::Get();
+        if (afs.IsMounted())
+        {
+            std::string prefix = dir.generic_string();          // forward slashes
+            if (!prefix.empty() && prefix.back() != '/') prefix += '/';
+            std::vector<std::string> keys;
+            afs.EnumerateUnder(prefix, keys);
+            for (const std::string& k : keys)
+            {
+                const std::string rest = k.substr(prefix.size());
+                if (rest.find('/') != std::string::npos) continue;   // direct children only
+                if (rest.size() > 4 && rest.compare(rest.size() - 4, 4, ".lua") == 0)
+                    files.push_back(k);
+            }
+        }
+        else
+        {
+            std::error_code ec;
+            if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return;
+            for (auto& entry : fs::directory_iterator(dir, ec))
+                if (entry.path().extension() == ".lua")
+                    files.push_back(entry.path().string());
+        }
 
         // Sort alphabetically so load order is deterministic across runs.
-        std::vector<fs::path> files;
-        for (auto& entry : fs::directory_iterator(dir, ec))
-        {
-            if (entry.path().extension() == ".lua")
-                files.push_back(entry.path());
-        }
         std::sort(files.begin(), files.end());
 
-        for (const auto& f : files)
+        for (const std::string& f : files)
         {
             switch (kind)
             {
-                case Kind::Service: LoadService (f.string()); break;
-                case Kind::System:  LoadSystem  (f.string()); break;
-                case Kind::UI:      LoadUIScript(f.string()); break;
+                case Kind::Service: LoadService (f); break;
+                case Kind::System:  LoadSystem  (f); break;
+                case Kind::UI:      LoadUIScript(f); break;
             }
         }
     };

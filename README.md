@@ -8,6 +8,21 @@
 
 A real-time rendering engine and editor written in C++20 / Direct3D 12 (Shader Model 6.6, DXIL via DXC).
 
+## Demo
+
+> Click a thumbnail to watch on YouTube.
+
+<table>
+  <tr>
+    <td><a href="https://youtu.be/6CPXLe-J1sw"><img width="400" src="https://img.youtube.com/vi/6CPXLe-J1sw/hqdefault.jpg" alt="DX12Engine demo 1"></a></td>
+    <td><a href="https://youtu.be/mi7Asi6O87Y"><img width="400" src="https://img.youtube.com/vi/mi7Asi6O87Y/hqdefault.jpg" alt="DX12Engine demo 2"></a></td>
+  </tr>
+  <tr>
+    <td><a href="https://youtu.be/0zyT00WBlOE"><img width="400" src="https://img.youtube.com/vi/0zyT00WBlOE/hqdefault.jpg" alt="DX12Engine demo 3"></a></td>
+    <td><a href="https://youtu.be/juu7YkzafQs"><img width="400" src="https://img.youtube.com/vi/juu7YkzafQs/hqdefault.jpg" alt="DX12Engine demo 4"></a></td>
+  </tr>
+</table>
+
 ## Features
 
 **Rendering**
@@ -38,7 +53,6 @@ A real-time rendering engine and editor written in C++20 / Direct3D 12 (Shader M
 ## Build
 
 ```bat
-set VCPKG_ROOT=C:\path\to\vcpkg
 cmake --preset vs-x64
 cmake --build --preset vs-x64-release
 ```

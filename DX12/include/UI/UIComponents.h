@@ -8,6 +8,7 @@
 // or copying is forbidden (matches the "ownership in C++" rule of §6.3).
 
 #include "UI/Widget.h"
+#include "Resource/SystemHandles.h"   // Resource::TextureHandle (stable image identity)
 #include <memory>
 #include <string>
 #include <DirectXMath.h>
@@ -83,8 +84,18 @@ namespace UI
 
     struct UIImageComponent
     {
+        // Stable texture identity. `texturePath` is the serialized source of
+        // truth; `texture` is the runtime TextureSystem handle. The renderer
+        // RE-RESOLVES srvGpuHandle from this every frame so a recycled
+        // descriptor slot (e.g. after a font re-bake) can never alias another
+        // texture (notably the font atlas). Leave empty + set srvGpuHandle
+        // directly for code-driven (handle-only) images.
+        std::string           texturePath;
+        Resource::TextureHandle texture{};   // runtime cache; not serialized
+
         // GPU SRV handle of the texture (use TextureSystem::GetTexture and
         // GraphicsDX12::GetTextureSRVGpuHandle to obtain). 0 = invisible.
+        // Per-frame cache when texturePath is set; never trust across frames.
         uint64_t srvGpuHandle = 0;
 
         float    sizeX = 64.f;
@@ -95,6 +106,9 @@ namespace UI
         // RGBA in 0..1 — multiplied with the sampled texel.
         // (XMFLOAT4 so the inspector picks a colour swatch + picker.)
         DirectX::XMFLOAT4 tint = { 1.f, 1.f, 1.f, 1.f };
+        // UV addressing + filtering (see UIWrapMode). Clamp+linear by default.
+        UIWrapMode wrapMode    = UIWrapMode::Clamp;
+        bool       pointFilter = false;
         bool     visible = true;
     };
 
@@ -105,6 +119,21 @@ namespace UI
         DirectX::XMFLOAT4 color = { 1.f, 1.f, 1.f, 1.f };
         float             scale = 1.f;
         bool              visible = true;
+
+        // ---- SDF text effects (toggleable preset + per-effect overrides) ----
+        // The preset chooses which sub-effects are active; the fields below
+        // tune them. SDF makes outline/glow/shadow nearly free; jitter is an
+        // animated per-glyph wobble.
+        TextEffectPreset  effectPreset = TextEffectPreset::None;
+        DirectX::XMFLOAT4 outlineColor = { 0.f, 0.f, 0.f, 1.f };
+        float             outlineWidth = 2.f;   // px
+        DirectX::XMFLOAT4 glowColor    = { 1.f, 0.85f, 0.4f, 1.f };
+        float             glowWidth    = 4.f;   // px
+        DirectX::XMFLOAT4 shadowColor  = { 0.f, 0.f, 0.f, 0.6f };
+        float             shadowOffsetX = 2.f;  // px
+        float             shadowOffsetY = 2.f;  // px
+        float             jitterAmplitude = 2.f; // px
+        float             jitterFrequency = 12.f; // Hz
     };
 
     // Flat-ECS progress / HP bar — bg rect + filled portion + optional border.

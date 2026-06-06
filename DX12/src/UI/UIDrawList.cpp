@@ -30,6 +30,21 @@ namespace UI
         m_clipStack.clear();
         m_texStack.clear();
         m_xformStack.clear();
+        // Element 0 is the reserved no-op effect (zeroed widths → plain SDF).
+        m_effects.clear();
+        m_effects.push_back(GpuTextEffect{});
+    }
+
+    uint32_t UIDrawList::AddTextEffect(const GpuTextEffect& fx)
+    {
+        if (m_effects.empty()) m_effects.push_back(GpuTextEffect{}); // keep [0] reserved
+        // Dedup identical configs so N labels sharing a style use ONE slot —
+        // keeps the per-frame table well under the shader's 64-entry cap.
+        for (size_t i = 1; i < m_effects.size(); ++i)
+            if (std::memcmp(&m_effects[i], &fx, sizeof(GpuTextEffect)) == 0)
+                return static_cast<uint32_t>(i);
+        m_effects.push_back(fx);
+        return static_cast<uint32_t>(m_effects.size() - 1);
     }
 
     void UIDrawList::PushClipRect(const Rect& r)
@@ -75,7 +90,8 @@ namespace UI
         return q;
     }
 
-    void UIDrawList::EnsureCmd(const UITextureRef& tex, uint32_t materialID)
+    void UIDrawList::EnsureCmd(const UITextureRef& tex, uint32_t materialID,
+                               uint32_t effectIndex, uint32_t samplerId)
     {
         const Rect clip = CurrentClipRect();
         // Merge into the previous cmd ONLY when the active transform stack
@@ -90,7 +106,9 @@ namespace UI
         {
             UIDrawCmd& last = m_cmds.back();
             if (last.texture.srvGpuHandle == tex.srvGpuHandle
-                && last.materialID == materialID
+                && last.materialID  == materialID
+                && last.effectIndex == effectIndex
+                && last.samplerId   == samplerId
                 && std::memcmp(&last.clipRect, &clip, sizeof(Rect)) == 0)
             {
                 return; // mergeable
@@ -102,6 +120,8 @@ namespace UI
         cmd.clipRect    = clip;
         cmd.texture     = tex;
         cmd.materialID  = materialID;
+        cmd.effectIndex = effectIndex;
+        cmd.samplerId   = samplerId;
         m_cmds.push_back(cmd);
     }
 
@@ -132,7 +152,7 @@ namespace UI
     void UIDrawList::AddRectFilled(const Vec2& min, const Vec2& max, Color32 col)
     {
         if (min.x >= max.x || min.y >= max.y) return;
-        EnsureCmd(CurrentTex(m_texStack), 0);
+        EnsureCmd(CurrentTex(m_texStack), 0, 0, 0);
         const uint32_t b = ReserveQuad();
         const Vec2 p0 = TransformPoint({ min.x, min.y });
         const Vec2 p1 = TransformPoint({ max.x, min.y });
@@ -147,7 +167,7 @@ namespace UI
 
     void UIDrawList::AddTriangleFilled(const Vec2& a, const Vec2& b, const Vec2& c, Color32 col)
     {
-        EnsureCmd(CurrentTex(m_texStack), 0);
+        EnsureCmd(CurrentTex(m_texStack), 0, 0, 0);
         const uint32_t base = static_cast<uint32_t>(m_verts.size());
         const Vec2 ta = TransformPoint(a);
         const Vec2 tb = TransformPoint(b);
@@ -166,7 +186,7 @@ namespace UI
                                      Color32 col, int segments)
     {
         if (radius <= 0.f || segments < 3) return;
-        EnsureCmd(CurrentTex(m_texStack), 0);
+        EnsureCmd(CurrentTex(m_texStack), 0, 0, 0);
         const uint32_t base = static_cast<uint32_t>(m_verts.size());
         const Vec2 tc = TransformPoint(center);
         m_verts.push_back({ { tc.x, tc.y }, { 0, 0 }, col.rgba });
@@ -200,7 +220,7 @@ namespace UI
         const float r = std::min(radius, maxR);
         if (segmentsPerCorner < 1) segmentsPerCorner = 1;
 
-        EnsureCmd(CurrentTex(m_texStack), 0);
+        EnsureCmd(CurrentTex(m_texStack), 0, 0, 0);
         const uint32_t base = static_cast<uint32_t>(m_verts.size());
 
         // Centre + rim (4 corners × N segments). Corner order: TL, TR, BR, BL.
@@ -253,7 +273,7 @@ namespace UI
         const float nx = -dy / len * (thickness * 0.5f);
         const float ny =  dx / len * (thickness * 0.5f);
 
-        EnsureCmd(CurrentTex(m_texStack), 0);
+        EnsureCmd(CurrentTex(m_texStack), 0, 0, 0);
         const uint32_t base = ReserveQuad();
         const Vec2 p0 = TransformPoint({ a.x + nx, a.y + ny });
         const Vec2 p1 = TransformPoint({ b.x + nx, b.y + ny });
@@ -278,10 +298,31 @@ namespace UI
 
     void UIDrawList::AddImage(const UITextureRef& tex,
                               const Vec2& min, const Vec2& max,
-                              const Vec2& uv0, const Vec2& uv1, Color32 tint)
+                              const Vec2& uv0, const Vec2& uv1, Color32 tint,
+                              uint32_t samplerId)
     {
         if (min.x >= max.x || min.y >= max.y) return;
-        EnsureCmd(tex, 0);
+        EnsureCmd(tex, 0, 0, samplerId);
+        const uint32_t b = ReserveQuad();
+        const Vec2 p0 = TransformPoint({ min.x, min.y });
+        const Vec2 p1 = TransformPoint({ max.x, min.y });
+        const Vec2 p2 = TransformPoint({ max.x, max.y });
+        const Vec2 p3 = TransformPoint({ min.x, max.y });
+        UIVertex* v = m_verts.data() + b;
+        v[0] = { { p0.x, p0.y }, { uv0.x, uv0.y }, tint.rgba };
+        v[1] = { { p1.x, p1.y }, { uv1.x, uv0.y }, tint.rgba };
+        v[2] = { { p2.x, p2.y }, { uv1.x, uv1.y }, tint.rgba };
+        v[3] = { { p3.x, p3.y }, { uv0.x, uv1.y }, tint.rgba };
+    }
+
+    void UIDrawList::AddImageMat(const UITextureRef& tex,
+                                 const Vec2& min, const Vec2& max,
+                                 const Vec2& uv0, const Vec2& uv1, Color32 tint,
+                                 uint32_t materialID, uint32_t effectIndex,
+                                 uint32_t samplerId)
+    {
+        if (min.x >= max.x || min.y >= max.y) return;
+        EnsureCmd(tex, materialID, effectIndex, samplerId);
         const uint32_t b = ReserveQuad();
         const Vec2 p0 = TransformPoint({ min.x, min.y });
         const Vec2 p1 = TransformPoint({ max.x, min.y });

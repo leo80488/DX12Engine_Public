@@ -943,6 +943,17 @@ void Renderer::BuildScene_GatherPrimitivesAndLights(World& world,
     auto* pMaterial   = world.GetPool<MaterialComponent>();
     auto pGet = [](auto* p, Entity e) { return p ? p->Get(e) : nullptr; };
     auto* lb = m_lightCB.Current(m_gfx);
+    // Clear the directional-sun COLOUR each frame before the gather. The CB is
+    // triple-buffered and never wholesale-cleared, so without this a scene that
+    // loses its last directional light (deletion, or a scene with none + TOD
+    // off) would ghost the previous frame's sun in BOTH the deferred Lighting.ps
+    // AND DDGI (which now reads the same LightCB sun). The gather loop below
+    // re-fills it for any directional, and the TOD override re-fills it when
+    // active, so this only takes effect in the genuinely-sunless case — matching
+    // the engine's "no directional → no sun" convention. lightDir is left as-is
+    // (a stale direction is harmless once the colour is zero, and zeroing it
+    // would feed normalize(0)=NaN into Lighting.ps).
+    if (lb) { lb->lightColor[0] = lb->lightColor[1] = lb->lightColor[2] = 0.0f; }
     for (Entity e : world.GetEntities())
     {
         if (!world.IsAlive(e)) continue;

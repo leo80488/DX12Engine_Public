@@ -210,6 +210,24 @@ float3 EvalLight(GPULight light, float3 P, float3 N)
     return lightCol * NdotL * vis;
 }
 
+// Deterministic directional-sun evaluator. `dirFromLight` uses the same
+// from-light convention as LightCB.lightDir / GPULight.direction; `radiance`
+// is the sun colour already premultiplied by intensity (== LightCB.lightColor).
+// Returns the irradiance arriving at P (the caller folds in the 1/PI Lambert
+// term, exactly as for EvalLight). Mirrors the directional branch of EvalLight,
+// including its 100-unit shadow-ray range (see the rationale there). A zero
+// radiance — no sun, or an intensity-0 directional in the Unreal-style "no sun
+// → no light" convention — yields zero contribution and skips the shadow ray.
+float3 EvalDirectionalSun(float3 dirFromLight, float3 radiance, float3 P, float3 N)
+{
+    if (dot(radiance, radiance) <= 0.0) return float3(0, 0, 0);
+    float3 L = -normalize(dirFromLight);
+    float  NdotL = saturate(dot(N, L));
+    if (NdotL <= 0.0) return float3(0, 0, 0);
+    float vis = ShadowVisibility(P, L, 100.0);
+    return radiance * NdotL * vis;
+}
+
 // ---- Entry ----------------------------------------------------------------
 [numthreads(32, 1, 1)]
 void main(uint3 DTid : SV_DispatchThreadID)
@@ -371,11 +389,26 @@ void main(uint3 DTid : SV_DispatchThreadID)
             emissive *= emTex;
         }
 
-        // Direct lighting — pick one random light from the cluster GPULight
-        // buffer and importance-sample by lightCount. Matches WickedEngine's
-        // ddgi_raytraceCS approach: per-ray Monte-Carlo over the light list,
-        // shadow-rayed, multiplied by N to undo the 1/N pick prob.
-        float3 directLit = float3(0, 0, 0);
+        // Direct lighting — directional sun + cluster point/spot lights.
+        //
+        // The directional sun is a SINGLE source of truth (g_Vol.sunDirection/
+        // sunColor, mirrored from LightCB by the CPU). Evaluate it
+        // deterministically every ray, exactly like the deferred Lighting.ps —
+        // which also reads the sun from LightCB and skips type==0 entries in its
+        // cluster loop. This keeps DDGI's sun byte-identical to direct lighting
+        // and makes it follow the Time-of-Day cycle whether or not the sun is a
+        // tagged SunLightTag entity (the cluster buffer alone never sees the TOD
+        // override, which is why DDGI previously ignored it).
+        float3 directLit = EvalDirectionalSun(g_Vol.sunDirection, g_Vol.sunColor,
+                                              hitPos, worldN);
+
+        // Point / spot lights — single-sample Monte-Carlo over the cluster
+        // GPULight buffer, importance-weighted by lightCount (WickedEngine
+        // ddgi_raytraceCS style). Directional entries are SKIPPED here (handled
+        // above): a uniform pick over all lightCount entries that scores 0 on
+        // directionals and ×lightCount on the rest is still an UNBIASED estimator
+        // of the point/spot sum — E[score] = Σ_{non-dir} EvalLight — so there's
+        // no double-counting of the sun and no weight correction needed.
         if (g_Vol.lightCount > 0u)
         {
             uint seed = HashPCG((probeIdx * 0x9E3779B9u) ^
@@ -383,7 +416,8 @@ void main(uint3 DTid : SV_DispatchThreadID)
                                 (g_Vol.frameIndex * 0xC2B2AE3Du));
             uint pick = seed % g_Vol.lightCount;
             GPULight L  = g_Lights[pick];
-            directLit   = EvalLight(L, hitPos, worldN) * float(g_Vol.lightCount);
+            if (L.type != 0u)
+                directLit += EvalLight(L, hitPos, worldN) * float(g_Vol.lightCount);
         }
         // `directLit` and `prev.rgb` are both irradiance terms (energy/area
         // arriving at the surface). For a Lambertian surface the outgoing

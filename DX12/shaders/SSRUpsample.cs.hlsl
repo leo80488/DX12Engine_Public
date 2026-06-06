@@ -30,10 +30,25 @@ SamplerState gLinClamp : register(s0, space2);
 
 static const float kDepthThreshold    = 10000.0;
 static const float kNormalThreshold   = 1.0;
-static const float kVarianceEstimate  = 0.015;   // high-variance gate
+static const float kVarianceEstimate  = 0.008;   // high-variance gate — lowered
+                                                 // 0.015->0.008 so the strong
+                                                 // blur engages on glossy 1-spp
+                                                 // noise (incl. disoccluded small
+                                                 // surfaces), not just extreme
+                                                 // outliers. Matches the proven
+                                                 // 2026-05-18 SSR tuning.
 static const float kVarianceExit      = 0.005;   // min variance to blur at all
 static const int   kMinRadius         = 0;
-static const int   kMaxRadius         = 2;
+// Widened 2 -> 5. This bilateral is the ONLY denoiser for pixels the temporal
+// pass disoccluded (variance forced to 1.0) — overwhelmingly SMALL reflective
+// surfaces, whose reprojected history keeps landing off-surface so 0.85 EMA
+// accumulation never kicks in. At ±2 it could not clean the raw 1-spp stochastic
+// trace noise, so small surfaces stayed grainy while large planes (history
+// retained -> converged) looked fine. The blur stays variance-GATED (converged
+// large surfaces have low variance and skip it entirely) and bilateral
+// depth/normal-weighted (off-surface taps get ~0 weight), so widening it does
+// not bleed across silhouettes or over-blur clean reflections.
+static const int   kMaxRadius         = 5;
 static const float kBilateralSigma    = 0.9;
 
 // ---------------------------------------------------------------------------

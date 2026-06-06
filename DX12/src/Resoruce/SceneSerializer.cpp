@@ -10,6 +10,7 @@
 #include "Resource/MaterialSerializer.h"
 #include "Resource/PostProcessConfig.h"
 #include "ECS/GuidRegistry.h"
+#include "UI/UICanvas.h"           // UI::UIParent — stamp parent GUIDs before save
 #include "System/TaskSystem.h"
 #include "ECS/Components.h"
 #include "ECS/HierarchyComponents.h"
@@ -445,6 +446,24 @@ bool Resource::SaveScene(World& world, const std::string& path,
             const SceneSourcePath* ssp = world.GetComponent<SceneSourcePath>(ni.entity);
             if (ssp && !ssp->path.empty())
                 markChildren(ni.entity);
+        }
+    }
+
+    // Stamp a GuidComponent on every UIParent target UP FRONT, before any
+    // entity row is written. The per-entity loop runs in entity-creation order
+    // (not hierarchy order) and CvParent only stamps the parent's GUID lazily
+    // while serializing the CHILD — so a parent already flushed earlier (or one
+    // whose UIParent was set without AttachUIParent) would never emit its
+    // `Guid:` line, and the child could not re-resolve its parent on load.
+    // Doing it here makes the UIParent GUID round-trip order-independent.
+    if (auto* uiParentPool = world.GetPool<UI::UIParent>())
+    {
+        auto& upData = uiParentPool->Data();
+        for (size_t i = 0; i < upData.size(); ++i)
+        {
+            const Entity par = upData[i].parent;
+            if (par != NullEntity && world.IsAlive(par))
+                ECS::EnsureGuidOn(world, par);
         }
     }
 

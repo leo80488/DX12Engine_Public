@@ -59,6 +59,19 @@ namespace Resource
         // false only if neither source has the file.
         bool ReadFile(const std::string& path, std::vector<uint8_t>& out) const;
 
+        // Convenience wrapper around ReadFile that returns the bytes as a
+        // std::string — used by the Lua loaders (run via sol::state::safe_script
+        // on the source string) so scripts resolve from the pak in a packed
+        // build instead of being read straight off disk.
+        bool ReadFileText(const std::string& path, std::string& out) const;
+
+        // Append every mounted-pak entry whose normalised (forward-slash) path
+        // begins with `prefix` to `out`. No-op when no pak is mounted. Used to
+        // DISCOVER directory-scanned assets (e.g. asset/scripts/systems/*.lua) in
+        // packed builds, where there are no loose files for a directory_iterator
+        // to enumerate. Content is still read via ReadFile/ReadFileText.
+        void EnumerateUnder(const std::string& prefix, std::vector<std::string>& out) const;
+
     private:
         struct Entry { std::uint64_t offset; std::uint64_t size; };
 

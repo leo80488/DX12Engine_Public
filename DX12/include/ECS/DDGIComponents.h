@@ -54,6 +54,19 @@ struct DDGIVolumeComponent
     //   0.965 → 3.5 %/frame → ~1.1 s to 90 % at 60 fps  (smooth, slow)
     //   0.85 → 15 %/frame → noisier but tracks fast motion
     float             hysteresis   = 0.92f;
+
+    // Per-frame ray-set rotation jitter, as a fraction of the auto-computed
+    // amplitude (≈ the Halton gap radius, sqrt(pi / raysPerProbe)). 1.0 = full
+    // jitter (best gap-filling / least bias); lower = steadier ray set frame to
+    // frame. The jitter is the ONLY per-frame variable in the probe trace, so it
+    // is the dominant source of temporal flicker on HARD directional shadows
+    // (each frame sweeps sampled points across lit/shadow edges). At high ray
+    // counts the base Halton set already covers well, so dropping this to
+    // ~0.3-0.5 markedly steadies sun lighting at the cost of a little extra bias.
+    // 0 disables jitter entirely (fully static ray set — may show structured
+    // banding on low ray counts).
+    float             rotationJitterScale = 1.0f;
+
     // Sampling biases (world units). Plan §5.3.
     float             normalBias   = 0.25f;
     float             viewBias     = 0.10f;

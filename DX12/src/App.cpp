@@ -61,6 +61,7 @@
 #include "Audio/AudioEvents.h"
 #include "UI/UISystem.h"
 #include "UI/UIComponents.h"
+#include "UI/UICanvas.h"
 #include "UI/Font.h"
 #include "UI/LuaUIBindings.h"
 #include "AI/LuaBTBindings.h"
@@ -163,10 +164,17 @@ int App::Run()
     ctx.matSys      = &m_matSys;
     ctx.assetMgr    = &m_assetMgr;
     ctx.world       = &m_world;
+    ctx.navSys      = &m_navSystem;
 
     std::unique_ptr<IGameMode> pendingMode;
     ctx.requestReplaceMode = [&pendingMode](std::unique_ptr<IGameMode> next) {
         pendingMode = std::move(next);
+    };
+    // Faded variant: scenes call this for player-facing switches; the manager
+    // drives fade-out/loading/fade-in and triggers the raw swap above when the
+    // screen is fully black (see SceneTransitionManager::Tick).
+    ctx.beginTransition = [this](std::unique_ptr<IGameMode> next) {
+        m_transition.Begin(std::move(next));
     };
 
     // Initial mode varies by build: ShaderLab tool / Editor target / Game flow.
@@ -177,6 +185,16 @@ int App::Run()
 #else
     m_gameModeStack.PushMode(std::make_unique<TitleScene>(), ctx);
 #endif
+
+    // Renderer-side system wiring needed by BOTH Game and Editor builds. These
+    // used to live in WireEditor (editor-only), which left them null in a Game
+    // build: CharacterStateSystem then had no AnimationClipSystem, so Lua
+    // state-machine clips (Character.AddState/SetState) never loaded → skinned
+    // characters stayed in bind pose ("no animation"); foot-IK also lost its
+    // physics ground-raycast source. Must run after the renderer's skin
+    // subsystem exists (it is, by construction) and after m_animClipSys.Init().
+    renderer.SetPhysicsSystem(&m_physicsSystem);
+    renderer.SetAnimationClipSystem(&m_animClipSys);
 
 #ifdef WITH_EDITOR
     WireEditor(backend, renderer, ctx);
@@ -233,9 +251,31 @@ int App::Run()
         ctx.viewportRightMouseHeld = m_editorLayer.IsViewportRightDragging();
         m_editorLayer.GetViewportMouseDelta(ctx.mouseViewportDX, ctx.mouseViewportDY);
 #else
-        ctx.viewportRightMouseHeld = false;
-        ctx.mouseViewportDX = 0.f;
-        ctx.mouseViewportDY = 0.f;
+        // Game build (no editor viewport): drive the free-look camera straight
+        // from the OS mouse. Right button held = look; the delta is this frame's
+        // mouse movement in pixels, matching the editor's ImGui MouseDelta
+        // convention so CameraSystem sensitivity feels identical. Without this
+        // the camera never sees mouse input (the editor used to be the only
+        // source of mouseViewportDX/DY), so mouse-look appeared dead in Game.
+        {
+            Mouse&     ms  = Mouse::GetInstance();
+            const bool rmb = ms.RightIsPressed();
+            const auto mp  = ms.GetPos();
+            if (rmb && m_prevMouseValid)
+            {
+                ctx.mouseViewportDX = static_cast<float>(mp.first  - m_prevMouseX);
+                ctx.mouseViewportDY = static_cast<float>(mp.second - m_prevMouseY);
+            }
+            else
+            {
+                ctx.mouseViewportDX = 0.f;
+                ctx.mouseViewportDY = 0.f;
+            }
+            ctx.viewportRightMouseHeld = rmb;
+            m_prevMouseX     = mp.first;
+            m_prevMouseY     = mp.second;
+            m_prevMouseValid = true;
+        }
 #endif
 
         // Promote async-loaded resources to GPU (2 ms budget) + flush dirty mats.
@@ -291,6 +331,12 @@ int App::Run()
         m_scheduler.RunPhase(TickPhase::AI,                m_world, frameCtx);
 
         RunFixedPhysicsLoop(scaledDt, frameCtx);
+
+        // Advance any in-flight scene transition (fade/loading). When fade-out
+        // completes it calls ctx.requestReplaceMode, which the drain below picks
+        // up the SAME frame, so the blocking scene load runs behind full black.
+        if (runUpdate)
+            m_transition.Tick(effectiveDt, ctx.requestReplaceMode);
 
         // Mode transition drain — kept inline (not a System adapter) because
         // IGameMode::Init needs the live GameModeContext built from local refs.
@@ -402,7 +448,7 @@ void App::InitUIFont(IGraphicsDevice& backend)
 {
     // FGMiraiRen ships with the engine. Falls back silently to a no-op text
     // path if the TTF isn't on disk.
-    constexpr const char* kDefaultTTF = "asset/font/FGMiraiRen.ttf";
+    constexpr const char* kDefaultTTF = "asset/font/arial.ttf";
     if (UI::DefaultFont().Init(backend, kDefaultTTF, /*pixelSize*/ 24.f))
         UI::DefaultFont().InstallAsGlobal();
     else
@@ -448,7 +494,16 @@ void App::InitLuaBindings(Renderer& renderer)
     };
     for (const char* path : kBTScripts)
     {
-        auto r = lua->safe_script_file(path, sol::script_pass_on_error);
+        // Read via AssetFS (pak first, disk fallback) so these load from
+        // game.ipak in a packed Game build instead of only off loose disk.
+        std::string src;
+        if (!::Resource::AssetFS::Get().ReadFileText(path, src))
+        {
+            LOG_ERROR("App: failed to read '%s' (not in pak or on disk)", path);
+            continue;
+        }
+        auto r = lua->safe_script(src, sol::script_pass_on_error,
+                                  std::string("@") + path);
         if (!r.valid())
         {
             sol::error err = r;
@@ -485,10 +540,10 @@ void App::WireEditor(IGraphicsDevice& backend, Renderer& renderer, GameModeConte
     m_editorLayer.SetAnimationClipSystem(&m_animClipSys);
     m_editorLayer.SetAnimationSystem(renderer.GetAnimationSystem());
     m_editorLayer.SetPhysicsSystem(&m_physicsSystem);
-    // FootIKTargetSystem raycasts via physics for ground-aware foot IK;
-    // ClipLibrary lazy-acquires state clips through CharacterStateSystem.
-    renderer.SetPhysicsSystem(&m_physicsSystem);
-    renderer.SetAnimationClipSystem(&m_animClipSys);
+    // NOTE: renderer.SetPhysicsSystem / SetAnimationClipSystem moved to App::Run
+    // (before this WireEditor call) so Game builds get them too — they are not
+    // editor-specific. FootIK raycasts via physics; CharacterStateSystem
+    // lazy-acquires state clips through the AnimationClipSystem.
     m_editorLayer.SetNavMeshSystem(&m_navSystem);
     m_editorLayer.SetAISystem(&m_aiSystem);
     m_editorLayer.SetScriptSystem(&m_scriptSystem);   // exposed-var inspector
@@ -691,13 +746,74 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
             m_uiInput.ctrl  = kbIn.IsKeyDown(VK_CONTROL);
             m_uiInput.alt   = kbIn.IsKeyDown(VK_MENU);
 
-            UI::UICanvas canvas;
+            UI::UIScreen canvas;
             canvas.size = { static_cast<float>(ctx.viewportW),
                             static_cast<float>(ctx.viewportH) };
 
+            // Re-resolve flat UI-image SRV handles from their stable texture
+            // path EVERY frame. A raw cached GPU descriptor handle silently
+            // aliases whatever texture now occupies its (recycled) heap slot —
+            // e.g. after a font re-bake the slot is reused by the glyph atlas,
+            // making the image sample the font. Resolving from the live
+            // TextureHandle each frame keeps the bound descriptor in lockstep
+            // with the texture's current slot. Code-driven (path-less) images
+            // are left to manage srvGpuHandle themselves.
+            // Advance sprite-sheet animations BEFORE resolving handles / ticking
+            // UI, so the current frame's uv0/uv1 are already set this frame.
+            UI::AdvanceSpriteAnimations(world, frameCtx.deltaTime);
+
+            auto resolveUiImageHandle = [&](const std::string& path,
+                                            Resource::TextureHandle& handle,
+                                            uint64_t& srv)
+            {
+                if (path.empty()) return;
+                if (!handle.IsValid())
+                    handle = m_textureSys.Acquire(path, m_resourceMgr, backend);
+                if (m_textureSys.IsReady(handle))
+                {
+                    if (const RHI::Texture* tex = m_textureSys.GetTexture(handle))
+                        srv = backend.GetTextureSRVGpuHandle(*tex);
+                }
+                else
+                {
+                    srv = 0; // not resident yet → renderer skips it
+                }
+            };
+
+            if (auto* imgPool = world.GetPool<UI::UIImageComponent>())
+                for (auto& img : imgPool->Data())
+                    resolveUiImageHandle(img.texturePath, img.texture, img.srvGpuHandle);
+
+            // Canvas UI images use the same stable-path → live-SRV re-resolve.
+            // CRUCIAL: a path-less canvas image is a solid-colour panel — force
+            // its handle to 0 every frame so a stale value left over from a
+            // previously-assigned (then cleared) texture can never survive to
+            // alias a recycled font-atlas slot (the "texture polluted by font
+            // atlas" bug). Solid panels then bind UIPass's 1x1 white texture.
+            if (auto* canvasImgPool = world.GetPool<UI::UIImage>())
+                for (auto& img : canvasImgPool->Data())
+                {
+                    if (img.texturePath.empty())
+                    {
+                        img.srvGpuHandle = 0;
+                        img.texture      = Resource::TextureHandle{};
+                    }
+                    else
+                    {
+                        resolveUiImageHandle(img.texturePath, img.texture, img.srvGpuHandle);
+                    }
+                }
+
             if (UIPass* uip = renderer.GetUIPass())
+            {
                 m_uiSystem.Tick(world, m_uiInput, canvas,
                                 uip->GetDrawList(), frameCtx.deltaTime);
+                // Entity-as-widget Canvas UI feeds the same draw list, on top.
+                m_uiCanvasSystem.Tick(world, m_uiInput, canvas,
+                                      uip->GetDrawList(), frameCtx.deltaTime);
+                UI::UISystem::MergeExternalCaptureMouse(
+                    m_uiCanvasSystem.WantsCaptureMouse());
+            }
 
             // World-space UI: per-frame fade/scale/cull + DamageNumber lifetimes.
             // WorldUIBillboardPass reads the same components using its own viewProj.
@@ -735,6 +851,13 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
 #endif
 
         pumpUIInput();
+
+        // Scene-transition fade/loading overlay — appended on top of the UI
+        // draw list (bypasses ECS, so the new scene's world.Clear() can't wipe
+        // it mid-fade). Consumed + cleared by the UIPass inside renderer.Render.
+        if (UIPass* uip = renderer.GetUIPass())
+            m_transition.DrawOverlay(uip->GetDrawList(), ctx.viewportW, ctx.viewportH);
+
         RHI::CommandList lastPassCL = renderer.Render();
         if (lastPassCL.IsValid())
             backend.AddCommandListDependency(primaryCL, lastPassCL);

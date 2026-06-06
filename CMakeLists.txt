@@ -7,14 +7,12 @@
 #   * Game        (Application)    — runtime-only exe
 #   * ShaderLab   (Application)    — shader-authoring sandbox (WITH_SHADERLAB)
 #
-# Quick start (Visual Studio 2022 + vcpkg):
+# Quick start (Visual Studio 2022):
 #   cmake --preset vs-x64
 #   cmake --build --preset vs-x64-release
 #
 # Quick start (manual):
-#   set VCPKG_ROOT=C:\path\to\vcpkg
-#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-#         -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
+#   cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 #   cmake --build build --config Release
 #
 # Packaging:
@@ -24,23 +22,31 @@
 
 cmake_minimum_required(VERSION 3.21)  # for $<TARGET_RUNTIME_DLLS>
 
-# Pick up vcpkg toolchain automatically when VCPKG_ROOT is set, unless the user
-# has already passed -DCMAKE_TOOLCHAIN_FILE.
-if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
-    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-        CACHE STRING "Vcpkg toolchain file")
-endif()
-
 project(DX12Engine
     VERSION     1.1.0
     LANGUAGES   CXX C
     DESCRIPTION "Direct3D 12 deferred renderer + ECS + editor"
 )
 
-# Third-party libraries are vendored prebuilt under DX12/external/ (DirectXTex,
-# Jolt, DXC, FreeType, Dear ImGui, Lua, sol2, nlohmann/json, meshoptimizer,
-# Recast/Detour, FFmpeg, DirectX-Headers). Only Assimp comes from vcpkg — see
-# vcpkg.json and DX12/CMakeLists.txt.
+# Collapse CMake's auto-generated helper targets (ALL_BUILD, ZERO_CHECK, INSTALL,
+# PACKAGE) into a "CMakePredefinedTargets" solution folder so they don't clutter
+# the top level of the generated .sln. (Not on by default here because we declare
+# cmake_minimum_required 3.21, which predates the CMP0143 USE_FOLDERS=ON default.)
+set_property(GLOBAL PROPERTY USE_FOLDERS ON)
+
+# Multi-config (VS) defaults to Debug/Release/MinSizeRel/RelWithDebInfo. The engine
+# only ships Debug + Release prebuilt deps under external/, so restrict the solution
+# to those two (matches the original .sln and drops the two unused configs). Guarded
+# so single-config generators (Ninja, which use CMAKE_BUILD_TYPE) are unaffected.
+if(CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_CONFIGURATION_TYPES "Debug;Release"
+        CACHE STRING "Available build configurations" FORCE)
+endif()
+
+# All third-party libraries are vendored prebuilt under DX12/external/ (Assimp,
+# DirectXTex, Jolt, DXC, FreeType, Dear ImGui, Lua, sol2, nlohmann/json,
+# meshoptimizer, Recast/Detour, FFmpeg, DirectX-Headers). No package manager
+# (vcpkg / Conan) is required.
 
 # -----------------------------------------------------------------------------
 # Platform guard — Windows + MSVC + x64 only.

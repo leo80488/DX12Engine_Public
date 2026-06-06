@@ -3,25 +3,24 @@
 #include "Graphics/GraphicsDX12.h"
 #include "Graphics/MeshDescriptorHeap.h"   // kMaxBuffers — root-sig bindless table size
 #include "Graphics/DxcCompiler.h"
+#include "Resource/AssetFS.h"   // pak-first read so DDGI shaders load in packed builds
 #include "System/Log.h"
 
-#include <fstream>
 #include <vector>
 #include <string>
 
 namespace
 {
-// Read a shader source file from disk. Returns empty vector on failure.
+// Read a shader source file via AssetFS (game.ipak first, then loose disk).
+// Using raw std::ifstream here used to make DDGI silently disabled in PACKED
+// builds — the .hlsl lives only inside game.ipak, so the direct open failed and
+// every DDGI shader compile bailed. Returns empty vector on failure.
 std::vector<uint8_t> ReadFileBytes(const std::string& path)
 {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return {};
-    std::streamsize sz = f.tellg();
-    if (sz <= 0) return {};
-    f.seekg(0);
-    std::vector<uint8_t> buf((size_t)sz);
-    f.read(reinterpret_cast<char*>(buf.data()), sz);
-    return buf;
+    std::vector<std::uint8_t> buf;
+    if (Resource::AssetFS::Get().ReadFile(path, buf))
+        return buf;
+    return {};
 }
 
 // Compile one shader source file via DXC. Returns the DXIL container bytes.

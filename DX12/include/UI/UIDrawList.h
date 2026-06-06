@@ -64,6 +64,67 @@ namespace UI
     };
     static_assert(sizeof(UIVertex) == 20, "UIVertex must be 20 bytes");
 
+    // ---- Text effects (SDF text only) ---------------------------------------
+    // Built-in presets a UITextComponent can switch between; the inspector
+    // exposes per-effect colour/size overrides on top of the chosen preset.
+    enum class TextEffectPreset : uint32_t
+    {
+        None = 0,
+        Shadow,         // soft drop shadow (offset glyph copy)
+        Outline,        // SDF outline band
+        Glow,           // soft outer glow
+        Jitter,         // animated per-glyph wobble
+        OutlineShadow,  // outline + drop shadow
+        GlowShadow,     // glow + drop shadow
+        Count
+    };
+
+    // Fully-resolved style handed to Font::RenderTextStyled. Widths/offsets are
+    // in baked-glyph pixels (so they scale WITH the text); colours are RGBA8.
+    struct TextEffect
+    {
+        bool    outline      = false;
+        Color32 outlineColor = Color32::Black();
+        float   outlineWidthPx = 2.f;
+
+        bool    glow      = false;
+        Color32 glowColor = Color32::White();
+        float   glowWidthPx = 4.f;
+
+        bool    shadow       = false;
+        Color32 shadowColor  = Color32(0, 0, 0, 160);
+        Vec2    shadowOffsetPx{ 2.f, 2.f };
+
+        bool    jitter       = false;
+        float   jitterAmpPx  = 2.f;
+        float   jitterFreq   = 12.f;
+    };
+
+    // GPU mirror of one SDF effect entry — must match UI.ps.hlsl's UITextEffect
+    // cbuffer layout (16-byte aligned, 48 bytes). Widths are NORMALISED
+    // (pixels / FontMetrics::sdfPixelRange) so the shader is scale-agnostic.
+    struct GpuTextEffect
+    {
+        float outlineColor[4] = { 0.f, 0.f, 0.f, 1.f };
+        float glowColor[4]    = { 1.f, 1.f, 1.f, 1.f };
+        float outlineWidthN   = 0.f;
+        float glowWidthN      = 0.f;
+        float softness        = 0.f;
+        float _pad            = 0.f;
+    };
+
+    // UV address mode for UI images. Clamp = default (atlas / sprite-sheet
+    // sub-rects); Wrap / Mirror tile when uv goes outside [0,1].
+    enum class UIWrapMode : uint32_t { Clamp = 0, Wrap = 1, Mirror = 2 };
+
+    // Sampler slots UIPass creates, indexed by UISamplerId(wrap, point):
+    //   [0..2] linear: Clamp / Wrap / Mirror     [3..5] point: Clamp / Wrap / Mirror
+    static constexpr uint32_t kUISamplerCount = 6;
+    inline uint32_t UISamplerId(UIWrapMode wrap, bool pointFilter)
+    {
+        return (pointFilter ? 3u : 0u) + static_cast<uint32_t>(wrap);
+    }
+
     // Texture binding identity for a draw command. SrvGpuHandle == 0 means
     // "use the engine's default 1×1 white texture" so AddRectFilled doesn't
     // require an atlas.
@@ -78,7 +139,9 @@ namespace UI
         uint32_t     indexCount  = 0;
         Rect         clipRect;       // axis-aligned scissor (pixels)
         UITextureRef texture;
-        uint32_t     materialID = 0; // 0=normal, 1=SDF text (future), 2=mask
+        uint32_t     materialID  = 0; // 0=plain (image/fill), 1=SDF text (live)
+        uint32_t     effectIndex = 0; // index into UIDrawList::Effects() (0 = none)
+        uint32_t     samplerId   = 0; // index into UIPass samplers (0 = clamp-linear)
     };
 
     class UIDrawList
@@ -135,7 +198,23 @@ namespace UI
         void AddImage(const UITextureRef& tex,
                       const Vec2& min, const Vec2& max,
                       const Vec2& uv0 = Vec2(0, 0), const Vec2& uv1 = Vec2(1, 1),
-                      Color32 tint = Color32::White());
+                      Color32 tint = Color32::White(),
+                      uint32_t samplerId = 0);
+
+        // Same as AddImage but tags the draw command with a material id (1 = SDF
+        // text) and an effect-table index. Used by the font renderer so glyph
+        // quads take the SDF branch in UI.ps.hlsl while plain images stay id 0.
+        void AddImageMat(const UITextureRef& tex,
+                         const Vec2& min, const Vec2& max,
+                         const Vec2& uv0, const Vec2& uv1, Color32 tint,
+                         uint32_t materialID, uint32_t effectIndex,
+                         uint32_t samplerId = 0);
+
+        // Append a resolved SDF effect to this frame's effect palette; returns
+        // its index (>= 1). Index 0 is always the no-op effect. UIPass uploads
+        // Effects() to the b2 effects constant buffer each frame.
+        uint32_t AddTextEffect(const GpuTextEffect& fx);
+        const std::vector<GpuTextEffect>& Effects() const { return m_effects; }
 
         // ---- text (Phase 2 will plug in the bitmap/MSDF font) ----
         // Stub interface — no-op until the font system lands so widget code
@@ -159,9 +238,10 @@ namespace UI
         static void SetGlobalFontProvider(IFontProvider* fp);
 
     private:
-        std::vector<UIVertex>  m_verts;
-        std::vector<uint16_t>  m_indices;
-        std::vector<UIDrawCmd> m_cmds;
+        std::vector<UIVertex>     m_verts;
+        std::vector<uint16_t>     m_indices;
+        std::vector<UIDrawCmd>    m_cmds;
+        std::vector<GpuTextEffect> m_effects; // [0] = no-op; appended per styled run
 
         std::vector<Rect>         m_clipStack;
         std::vector<UITextureRef> m_texStack;
@@ -169,8 +249,9 @@ namespace UI
         std::vector<XForm>        m_xformStack;
         Vec2 TransformPoint(const Vec2& p) const;
 
-        // Scratch — last-cmd merging when texture/clip/material match.
-        void EnsureCmd(const UITextureRef& tex, uint32_t materialID);
+        // Scratch — last-cmd merging when texture/clip/material/effect/sampler match.
+        void EnsureCmd(const UITextureRef& tex, uint32_t materialID,
+                       uint32_t effectIndex, uint32_t samplerId);
 
         uint32_t ReserveQuad(); // returns first vertex index (4 verts + 6 indices)
     };

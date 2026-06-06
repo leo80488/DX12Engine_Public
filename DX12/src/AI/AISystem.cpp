@@ -5,6 +5,7 @@
 #include "AI/BTNodes.h"
 #include "ECS/ECS.h"
 #include "System/Log.h"
+#include "Resource/AssetFS.h"
 
 #define SOL_ALL_SAFETIES_ON 1
 #include <sol/sol.hpp>
@@ -214,15 +215,14 @@ namespace AI
             return nullptr;
         }
 
-        std::ifstream f(path);
-        if (!f.good())
+        // Read through AssetFS (pak first, disk fallback) so the BT tree
+        // resolves from game.ipak in a packed build — not just off loose disk.
+        std::string source;
+        if (!Resource::AssetFS::Get().ReadFileText(path, source))
         {
             LOG_ERROR("BT load: cannot open '%s'", path.c_str());
             return nullptr;
         }
-        std::stringstream ss;
-        ss << f.rdbuf();
-        const std::string source = ss.str();
 
         sol::protected_function_result result = m_lua->safe_script(source,
             sol::script_pass_on_error,

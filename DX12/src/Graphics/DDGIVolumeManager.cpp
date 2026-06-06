@@ -541,7 +541,7 @@ namespace
 // smaller gaps → smaller jitter → less per-frame noise → lower stable
 // hysteresis. Still uncorrelated (high-frequency) — only the amplitude shrank.
 void GenerateRandomRotation(uint32_t frame, uint32_t slot, uint32_t raysPerProbe,
-                            float out[9])
+                            float jitterScale, float out[9])
 {
     auto vdc = [](uint32_t i, uint32_t base) {
         float r = 0.0f, f = 1.0f / float(base);
@@ -554,6 +554,13 @@ void GenerateRandomRotation(uint32_t frame, uint32_t slot, uint32_t raysPerProbe
     float kAmp = std::sqrt(3.14159265f / float(raysPerProbe < 1u ? 1u : raysPerProbe));
     if (kAmp < 0.05f) kAmp = 0.05f;
     if (kAmp > 0.35f) kAmp = 0.35f;
+    // Per-volume stability knob (DDGIVolumeComponent.rotationJitterScale): scale
+    // the auto-amplitude down for steadier directional/sun lighting (hard
+    // shadows flicker as the per-frame jitter sweeps sampled points across
+    // lit/shadow edges). Applied AFTER the sanity clamp so the user can take it
+    // all the way to 0 (fully static ray set) when they want maximum stability.
+    float js = jitterScale; if (js < 0.0f) js = 0.0f; else if (js > 1.0f) js = 1.0f;
+    kAmp *= js;
     const float    ax = vdc(k, 2) * kAmp;
     const float    ay = vdc(k, 3) * kAmp;
     const float    az = vdc(k, 5) * kAmp;
@@ -582,7 +589,9 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
                              const DDGIVolumeComponent* const* volumes,
                              DDGIVolumeRuntimeComponent* const* runtimes,
                              uint32_t volumeCount,
-                             uint32_t lightCount)
+                             uint32_t lightCount,
+                             const XMFLOAT3& sunDirection,
+                             const XMFLOAT3& sunColor)
 {
     const uint32_t frameSlot = gfx.GetFrameIndex();
     if (frameSlot >= kFrameCount || !m_volumeBufferMapped[frameSlot]) return;
@@ -609,7 +618,7 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
         // ray count (more rays → tighter Halton gaps → smaller dither needed).
         r.frameCounter++;
         GenerateRandomRotation(r.frameCounter, r.volumeSlot, v.raysPerProbe,
-                               r.randomRotation);
+                               v.rotationJitterScale, r.randomRotation);
 
         VolumeGPUDesc& d = gpuDesc[r.volumeSlot];
         d.origin       = v.origin;
@@ -648,6 +657,8 @@ void DDGIVolumeManager::Tick(IGraphicsDevice& gfx,
         d.diffuseScale = v.diffuseScale;
         d.lightCount   = lightCount;
         d.frameIndex   = r.frameCounter;
+        d.sunDirection = sunDirection;
+        d.sunColor     = sunColor;
 
         // Per-volume CB mirrors the same data — the DDGI passes bind only the
         // CB (not the engine-wide buffer) to keep their root sigs simple.

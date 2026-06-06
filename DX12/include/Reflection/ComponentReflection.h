@@ -60,6 +60,7 @@
 #include "Physics/ChainPhysicsSystem.h"
 #include "Scripting/ScriptComponent.h"
 #include "UI/UIComponents.h"
+#include "UI/UICanvas.h"
 #include "UI/WorldSpaceUI.h"
 
 #include <DirectXMath.h>
@@ -505,6 +506,8 @@ REFLECT_BEGIN(DDGIVolumeComponent)
     REFLECT_INFO   ("64 = perf, 128 = default, 256 = quality.")
     REFLECT_HEADER ("Sampling")
     REFLECT_FLOAT  (hysteresis,        "Hysteresis",         0.5f,   0.999f)
+    REFLECT_FLOAT  (rotationJitterScale, "Ray Jitter Scale", 0.0f,   1.0f)
+    REFLECT_INFO   ("Lower = steadier sun lighting (less flicker on hard shadows), slight bias. ~0.3-0.5 for stable directional GI.")
     REFLECT_FLOAT  (normalBias,        "Normal Bias",        0.f,    2.f)
     REFLECT_FLOAT  (viewBias,          "View Bias",          0.f,    2.f)
     REFLECT_FLOAT  (boundaryFadeRatio, "Boundary Fade",      0.01f,  0.5f)
@@ -1082,24 +1085,53 @@ REFLECT_BEGIN(UI::UIScreenSpaceComponent)
     REFLECT_SLIDER(pivotY,  "Pivot Y",  0.f, 1.f)
 REFLECT_END()
 
+// UV addressing modes shared by both UI image components.
+constexpr Reflect::EnumOption kUIWrapModeOptions[] = {
+    { (int)UI::UIWrapMode::Clamp,  "Clamp" },
+    { (int)UI::UIWrapMode::Wrap,   "Wrap (tile)" },
+    { (int)UI::UIWrapMode::Mirror, "Mirror" },
+};
+
 // Flat-ECS UI image — single textured quad without a Widget tree.
 REFLECT_BEGIN(UI::UIImageComponent)
     REFLECT_BOOL  (visible, "Visible")
+    REFLECT_STRING_DROP(texturePath, "Texture", "ITEX_PATH")
     REFLECT_FLOAT (sizeX,   "Size X (px)", 1.f, 4096.f)
     REFLECT_FLOAT (sizeY,   "Size Y (px)", 1.f, 4096.f)
-    REFLECT_SLIDER(uv0X,    "UV0 X",       0.f, 1.f)
-    REFLECT_SLIDER(uv0Y,    "UV0 Y",       0.f, 1.f)
-    REFLECT_SLIDER(uv1X,    "UV1 X",       0.f, 1.f)
-    REFLECT_SLIDER(uv1Y,    "UV1 Y",       0.f, 1.f)
+    REFLECT_SLIDER(uv0X,    "UV0 X",       0.f, 4.f)
+    REFLECT_SLIDER(uv0Y,    "UV0 Y",       0.f, 4.f)
+    REFLECT_SLIDER(uv1X,    "UV1 X",       0.f, 4.f)
+    REFLECT_SLIDER(uv1Y,    "UV1 Y",       0.f, 4.f)
+    REFLECT_ENUM  (wrapMode,    "UV Wrap",      kUIWrapModeOptions)
+    REFLECT_BOOL  (pointFilter, "Point Filter")
     REFLECT_COLOR4(tint,    "Tint")
 REFLECT_END()
 
 // Flat-ECS UI text — single string. Inspector edits the `text` field live.
+constexpr Reflect::EnumOption kTextEffectOptions[] = {
+    { (int)UI::TextEffectPreset::None,          "None" },
+    { (int)UI::TextEffectPreset::Shadow,        "Drop Shadow" },
+    { (int)UI::TextEffectPreset::Outline,       "Outline" },
+    { (int)UI::TextEffectPreset::Glow,          "Glow" },
+    { (int)UI::TextEffectPreset::Jitter,        "Jitter" },
+    { (int)UI::TextEffectPreset::OutlineShadow, "Outline + Shadow" },
+    { (int)UI::TextEffectPreset::GlowShadow,    "Glow + Shadow" },
+};
 REFLECT_BEGIN(UI::UITextComponent)
     REFLECT_BOOL  (visible, "Visible")
     REFLECT_STRING(text,    "Text")
     REFLECT_COLOR4(color,   "Color")
     REFLECT_SLIDER(scale,   "Scale",       0.1f, 8.f)
+    REFLECT_ENUM  (effectPreset, "Effect", kTextEffectOptions)
+    REFLECT_COLOR4(outlineColor, "Outline Color")
+    REFLECT_FLOAT (outlineWidth, "Outline Width (px)", 0.f, 16.f)
+    REFLECT_COLOR4(glowColor,    "Glow Color")
+    REFLECT_FLOAT (glowWidth,    "Glow Width (px)",    0.f, 32.f)
+    REFLECT_COLOR4(shadowColor,  "Shadow Color")
+    REFLECT_FLOAT (shadowOffsetX, "Shadow Offset X (px)", -32.f, 32.f)
+    REFLECT_FLOAT (shadowOffsetY, "Shadow Offset Y (px)", -32.f, 32.f)
+    REFLECT_FLOAT (jitterAmplitude, "Jitter Amplitude (px)", 0.f, 16.f)
+    REFLECT_FLOAT (jitterFrequency, "Jitter Frequency (Hz)", 0.f, 60.f)
 REFLECT_END()
 
 // Flat-ECS HP / progress bar — bg + filled portion + border. No Widget tree.
@@ -1112,6 +1144,86 @@ REFLECT_BEGIN(UI::UIBarComponent)
     REFLECT_COLOR4(fillColor,       "Fill Color")
     REFLECT_COLOR4(backgroundColor, "Background Color")
     REFLECT_COLOR4(borderColor,     "Border Color")
+REFLECT_END()
+
+// ===== Entity-as-widget Canvas UI (UI/UICanvas.h) =========================
+constexpr Reflect::EnumOption kCanvasRenderModeOptions[] = {
+    { (int)UI::CanvasRenderMode::ScreenSpaceOverlay, "Screen Space - Overlay" },
+};
+constexpr Reflect::EnumOption kCanvasScaleModeOptions[] = {
+    { (int)UI::CanvasScaleMode::ConstantPixelSize,   "Constant Pixel Size" },
+    { (int)UI::CanvasScaleMode::ScaleWithScreenSize, "Scale With Screen Size" },
+};
+REFLECT_BEGIN(UI::UICanvas)
+    REFLECT_ENUM  (renderMode,          "Render Mode",          kCanvasRenderModeOptions)
+    REFLECT_ENUM  (scaleMode,           "Scale Mode",           kCanvasScaleModeOptions)
+    REFLECT_FLOAT2(referenceResolution, "Reference Resolution", 1.f, 8192.f)
+    REFLECT_SLIDER(matchWidthOrHeight,  "Match Width<->Height", 0.f, 1.f)
+    REFLECT_INT   (sortOrder,           "Sort Order",           -1000, 1000)
+REFLECT_END()
+
+REFLECT_BEGIN(UI::UIRect)
+    REFLECT_FLOAT2(anchorMin, "Anchor Min",  0.f, 1.f)
+    REFLECT_FLOAT2(anchorMax, "Anchor Max",  0.f, 1.f)
+    REFLECT_FLOAT2(pivot,     "Pivot",       0.f, 1.f)
+    REFLECT_FLOAT2(size,      "Size (px)",   -8192.f, 8192.f)
+    REFLECT_FLOAT2(offset,    "Offset (px)", -8192.f, 8192.f)
+REFLECT_END()
+
+REFLECT_BEGIN(UI::UIImage)
+    REFLECT_BOOL  (visible,     "Visible")
+    REFLECT_STRING_DROP(texturePath, "Texture", "ITEX_PATH")
+    REFLECT_COLOR4(color,       "Color")
+    REFLECT_FLOAT2(uv0,         "UV0", 0.f, 4.f)
+    REFLECT_FLOAT2(uv1,         "UV1", 0.f, 4.f)
+    REFLECT_ENUM  (wrapMode,    "UV Wrap",      kUIWrapModeOptions)
+    REFLECT_BOOL  (pointFilter, "Point Filter")
+REFLECT_END()
+
+// Sprite-sheet (atlas) animation — drives the entity's UIImage uv0/uv1.
+REFLECT_BEGIN(UI::UISpriteAnimComponent)
+    REFLECT_BOOL (playing,    "Playing")
+    REFLECT_BOOL (loop,       "Loop")
+    REFLECT_BOOL (pingpong,   "Ping-Pong")
+    REFLECT_INT  (columns,    "Columns",            1, 64)
+    REFLECT_INT  (rows,       "Rows",               1, 64)
+    REFLECT_INT  (frameCount, "Frame Count (0=all)", 0, 4096)
+    REFLECT_FLOAT(fps,        "Frames / sec",        0.f, 120.f)
+REFLECT_END()
+
+constexpr Reflect::EnumOption kUITextAlignHOptions[] = {
+    { 0, "Left" }, { 1, "Center" }, { 2, "Right" },
+};
+constexpr Reflect::EnumOption kUITextAlignVOptions[] = {
+    { 0, "Top" }, { 1, "Middle" }, { 2, "Bottom" },
+};
+REFLECT_BEGIN(UI::UIText)
+    REFLECT_BOOL  (visible,   "Visible")
+    REFLECT_STRING(text,      "Text")
+    REFLECT_COLOR4(color,     "Color")
+    REFLECT_SLIDER(fontScale, "Font Scale", 0.1f, 8.f)
+    REFLECT_ENUM  (alignH,    "Align H", kUITextAlignHOptions)
+    REFLECT_ENUM  (alignV,    "Align V", kUITextAlignVOptions)
+    REFLECT_ENUM  (effectPreset,   "Effect", kTextEffectOptions)
+    REFLECT_COLOR4(outlineColor,   "Outline Color")
+    REFLECT_FLOAT (outlineWidth,   "Outline Width (px)", 0.f, 16.f)
+    REFLECT_COLOR4(glowColor,      "Glow Color")
+    REFLECT_FLOAT (glowWidth,      "Glow Width (px)",    0.f, 32.f)
+    REFLECT_COLOR4(shadowColor,    "Shadow Color")
+    REFLECT_FLOAT (shadowOffsetX,  "Shadow Offset X (px)", -32.f, 32.f)
+    REFLECT_FLOAT (shadowOffsetY,  "Shadow Offset Y (px)", -32.f, 32.f)
+    REFLECT_FLOAT (jitterAmplitude,"Jitter Amplitude (px)", 0.f, 16.f)
+    REFLECT_FLOAT (jitterFrequency,"Jitter Frequency (Hz)", 0.f, 60.f)
+REFLECT_END()
+
+REFLECT_BEGIN(UI::UIInteractable)
+    REFLECT_BOOL  (raycastTarget,  "Raycast Target")
+    REFLECT_BOOL  (disabled,       "Disabled")
+    REFLECT_BOOL  (tintTransition, "Tint On State")
+    REFLECT_COLOR4(normalColor,    "Normal Color")
+    REFLECT_COLOR4(hoverColor,     "Hover Color")
+    REFLECT_COLOR4(pressedColor,   "Pressed Color")
+    REFLECT_COLOR4(disabledColor,  "Disabled Color")
 REFLECT_END()
 
 // World-space UI — billboarded 3D quads (HP bars, name plates, damage

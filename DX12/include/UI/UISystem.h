@@ -46,7 +46,9 @@ namespace UI
         bool shift = false, ctrl = false, alt = false;
     };
 
-    struct UICanvas
+    // Render-target pixel size handed to Tick. (Named UIScreen so the new
+    // entity-as-widget `UICanvas` *component* in UI/UICanvas.h can own that name.)
+    struct UIScreen
     {
         Vec2 size{ 0, 0 }; // pixel dimensions of the rendering target
     };
@@ -63,7 +65,7 @@ namespace UI
         // can pass the same struct again next frame.
         void Tick(World& world,
                   UIInputState& input,
-                  const UICanvas& canvas,
+                  const UIScreen& canvas,
                   UIDrawList& drawList,
                   float dt = 0.f);
 
@@ -79,6 +81,11 @@ namespace UI
         static bool GlobalWantsCaptureMouse();
         static bool GlobalWantsCaptureKeyboard();
 
+        // OR an external UI layer's capture into the shared global (call AFTER
+        // UISystem::Tick, which overwrites it). Used by UICanvasSystem so the
+        // window input gate honours canvas-UI hits too.
+        static void MergeExternalCaptureMouse(bool wants);
+
         // Currently-focused widget (Char/Key events route here). Updated by
         // MouseDown on a focusable widget; explicit setter exposed for
         // gameplay code (e.g. opening a menu and forcing focus on a field).
@@ -88,6 +95,7 @@ namespace UI
     private:
         bool         m_wantsCaptureMouse = false;
         WidgetHandle m_focused{};
+        float        m_uiTimeSec = 0.f; // accumulated UI clock — drives text jitter
 
         void DispatchKeyboard(UIInputState& input);
     };

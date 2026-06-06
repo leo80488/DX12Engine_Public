@@ -42,6 +42,10 @@ namespace UI
         float ascender   = 18.f;  // baseline → top of glyph (positive)
         float descender  = 6.f;   // baseline → bottom of glyph (positive)
         float pixelScale = 1.f;   // user-side scale on top of baked size
+        // SDF range: the glyph-space pixel span mapped across the [0,1] alpha
+        // distance field (== 2 * spread). Effect widths in pixels are divided
+        // by this to get the normalised widths the shader expects.
+        float sdfPixelRange = 8.f;
     };
 
     // Codepoint range [first..last] inclusive. 32..126 is printable ASCII.
@@ -53,6 +57,10 @@ namespace UI
         // Default ranges baked when none are supplied: printable ASCII only.
         static const CodepointRange kDefaultRanges[];
         static const int            kDefaultRangeCount;
+
+        // SDF spread (glyph-space pixels of distance stored on each side of the
+        // edge). Glyph cells are padded by this so outline/glow have room.
+        static constexpr int kSdfSpread = 4;
 
         // Bake @p ttfPath at @p pixelSize into a fresh GPU atlas.
         // Returns false if the TTF cannot be opened or atlas allocation fails;
@@ -68,8 +76,15 @@ namespace UI
         void Reset();
 
         // ---- IFontProvider --------------------------------------------------
+        // Plain SDF text (no effects). Thin wrapper over RenderTextStyled.
         Vec2 RenderText(UIDrawList& out, const Vec2& pos,
                         Color32 col, const char* utf8Text) override;
+
+        // SDF text with effects (outline / glow / drop-shadow / animated jitter).
+        // @p timeSec drives jitter; pass the UI clock. Returns the pen advance.
+        Vec2 RenderTextStyled(UIDrawList& out, const Vec2& pos, Color32 col,
+                              const char* utf8Text, const TextEffect& fx,
+                              float timeSec);
 
         // Convenience: pixel-space size of @p utf8Text at the current scale.
         Vec2 MeasureText(const char* utf8Text) const;

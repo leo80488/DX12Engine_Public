@@ -2,26 +2,26 @@
 #include "Graphics/DDGIVolumeManager.h"
 #include "Graphics/GraphicsDX12.h"
 #include "Graphics/DxcCompiler.h"
+#include "Resource/AssetFS.h"   // pak-first read so the probe-debug shaders load in packed builds
 #include "ECS/ECS.h"
 #include "ECS/DDGIComponents.h"
 #include "System/Log.h"
 
-#include <fstream>
 #include <vector>
 #include <string>
 
 namespace
 {
+// Read a shader source file via AssetFS (game.ipak first, then loose disk).
+// Mirrors the same fix in DDGIPass.cpp — a raw std::ifstream couldn't see the
+// .hlsl inside game.ipak, so this debug-viz pass silently failed Init in packed
+// builds. Returns empty vector on failure.
 std::vector<uint8_t> ReadFileBytes(const std::string& path)
 {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) return {};
-    std::streamsize sz = f.tellg();
-    if (sz <= 0) return {};
-    f.seekg(0);
-    std::vector<uint8_t> buf((size_t)sz);
-    f.read(reinterpret_cast<char*>(buf.data()), sz);
-    return buf;
+    std::vector<std::uint8_t> buf;
+    if (Resource::AssetFS::Get().ReadFile(path, buf))
+        return buf;
+    return {};
 }
 
 std::vector<uint8_t> CompileShaderFile(const std::string& path,

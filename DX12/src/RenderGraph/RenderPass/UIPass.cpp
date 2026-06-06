@@ -45,20 +45,37 @@ void UIPass::Init(IGraphicsDevice& gfx)
     // UI CB (canvas size at b1 space0).
     m_cb.Create(gfx, "UI.CB");
 
+    // SDF text effects table (b2 space0).
+    m_effectsCB.Create(gfx, "UI.EffectsCB");
+
     // 1×1 white default texture — bound when a draw cmd has no texture so the
     // PS branch stays unified (sample × tint = tint when sampling white).
     if (!CreateWhiteTexture())
         LOG_ERROR("UIPass: white texture creation failed");
 
-    // Linear/clamp sampler at s0.
+    // UV samplers: clamp/wrap/mirror × linear/point. Order MUST match
+    // UI::UISamplerId(wrap, point): [0..2] linear, [3..5] point.
     {
-        RHI::SamplerDesc sd{};
-        sd.filter    = RHI::Filter::MIN_MAG_MIP_LINEAR;
-        sd.address_u = RHI::TextureAddressMode::CLAMP;
-        sd.address_v = RHI::TextureAddressMode::CLAMP;
-        sd.address_w = RHI::TextureAddressMode::CLAMP;
-        if (!gfx.CreateSampler(sd, m_samplerIdx))
-            LOG_ERROR("UIPass: sampler creation failed");
+        const RHI::TextureAddressMode kAddr[3] = {
+            RHI::TextureAddressMode::CLAMP,
+            RHI::TextureAddressMode::WRAP,
+            RHI::TextureAddressMode::MIRROR,
+        };
+        const RHI::Filter kFilter[2] = {
+            RHI::Filter::MIN_MAG_MIP_LINEAR,
+            RHI::Filter::MIN_MAG_MIP_POINT,
+        };
+        for (uint32_t f = 0; f < 2; ++f)
+            for (uint32_t a = 0; a < 3; ++a)
+            {
+                RHI::SamplerDesc sd{};
+                sd.filter    = kFilter[f];
+                sd.address_u = kAddr[a];
+                sd.address_v = kAddr[a];
+                sd.address_w = kAddr[a];
+                if (!gfx.CreateSampler(sd, m_samplers[f * 3 + a]))
+                    LOG_ERROR("UIPass: sampler %u creation failed", f * 3 + a);
+            }
     }
 
     if (m_psoCache.GetOrCreate(BuildPSODesc()))
@@ -165,6 +182,9 @@ void UIPass::Execute(RHI::CommandList cl,
         uint32_t          vertexCount;
         UI::Rect          clipRect;
         uint64_t          texSrv;
+        uint32_t          materialID;
+        uint32_t          effectIndex;
+        uint32_t          samplerId;
     };
     std::vector<ExpandedCmd> expanded;
     expanded.reserve(srcCmds.size());
@@ -188,7 +208,8 @@ void UIPass::Execute(RHI::CommandList cl,
         if (expandCount == 0) continue;
         expanded.push_back({
             expandStart, expandCount, cmd.clipRect,
-            cmd.texture.srvGpuHandle ? cmd.texture.srvGpuHandle : m_whiteTexSrv
+            cmd.texture.srvGpuHandle ? cmd.texture.srvGpuHandle : m_whiteTexSrv,
+            cmd.materialID, cmd.effectIndex, cmd.samplerId
         });
         if (writeOff >= kMaxIndices) break;
     }
@@ -200,6 +221,15 @@ void UIPass::Execute(RHI::CommandList cl,
     {
         UIPass::UICB cb{ static_cast<float>(canvasW), static_cast<float>(canvasH), 0, 0 };
         *slot = cb;
+    }
+
+    // ---- Upload SDF text effects table (b2 space0) ----------------------
+    if (auto* fxTable = m_effectsCB.Current(gfx))
+    {
+        const auto& effects = m_drawList.Effects();
+        const size_t n = std::min<size_t>(effects.size(), kMaxEffectSlots);
+        for (size_t i = 0; i < n; ++i)        fxTable->fx[i] = effects[i];
+        for (size_t i = n; i < kMaxEffectSlots; ++i) fxTable->fx[i] = UI::GpuTextEffect{};
     }
 
     // ---- Transition target → RT ----------------------------------
@@ -236,8 +266,9 @@ void UIPass::Execute(RHI::CommandList cl,
 
     // CB at b1 space0 — engine helper: slot=0 → b1.
     gfx.BindConstantBuffer(m_cb.CurrentBuffer(gfx), 0, cl);
-    // Sampler at s0 — engine helper: slot=0 → root param 15.
-    if (m_samplerIdx >= 0) gfx.BindSampler(m_samplerIdx, 0, cl);
+    // Effects table at b2 space0 — engine helper: slot=1 → b2.
+    gfx.BindConstantBuffer(m_effectsCB.CurrentBuffer(gfx), 1, cl);
+    // Samplers are bound per draw command (s0) from m_samplers[ecmd.samplerId].
 
     // VB ByteAddressBuffer at t2 space0.
     const uint64_t vbHandle = gfx.GetBufferSRVGpuHandle(m_vertexBuffer[frameSlot]);
@@ -256,6 +287,11 @@ void UIPass::Execute(RHI::CommandList cl,
     }
 
     uint64_t lastTex = 0;
+    // b0 root constants carry (materialID, effectIndex) for the PS. UIPass
+    // otherwise never writes b0, so it holds stale per-mesh constants from an
+    // earlier pass — we MUST set it before the first SDF draw and on any change,
+    // else the PS reads garbage. Init to UINT32_MAX to force the first write.
+    uint32_t lastMat = UINT32_MAX, lastEff = UINT32_MAX, lastSampler = UINT32_MAX;
     int cmdIdx = 0;
     for (const auto& ecmd : expanded)
     {
@@ -281,7 +317,30 @@ void UIPass::Execute(RHI::CommandList cl,
             gfx.BindDescriptorTableGpuHandle(kRootSlot_TextureSRV, ecmd.texSrv, cl);
             lastTex = ecmd.texSrv;
         }
-        gfx.DrawInstanced(ecmd.vertexCount, 1, ecmd.vertexOffset, 0, cl);
+        // Per-command UV sampler at s0 (clamp/wrap/mirror × linear/point).
+        if (ecmd.samplerId != lastSampler)
+        {
+            const uint32_t sid = (ecmd.samplerId < UI::kUISamplerCount) ? ecmd.samplerId : 0u;
+            if (m_samplers[sid] >= 0) gfx.BindSampler(m_samplers[sid], 0, cl);
+            lastSampler = ecmd.samplerId;
+        }
+        // b0 root constants: [0]=materialID (0 plain / 1 SDF text), [1]=effectIndex,
+        // [2]=vertexOffset (the VS adds it; we draw from StartVertexLocation 0).
+        if (ecmd.materialID != lastMat)
+        {
+            gfx.SetGraphicsRootConstant(/*rootSlot*/0, ecmd.materialID, /*offsetWords*/0, cl);
+            lastMat = ecmd.materialID;
+        }
+        if (ecmd.effectIndex != lastEff)
+        {
+            gfx.SetGraphicsRootConstant(/*rootSlot*/0, ecmd.effectIndex, /*offsetWords*/1, cl);
+            lastEff = ecmd.effectIndex;
+        }
+        // Always set the per-draw vertex offset (it changes every command).
+        gfx.SetGraphicsRootConstant(/*rootSlot*/0, ecmd.vertexOffset, /*offsetWords*/2, cl);
+        // StartVertexLocation = 0: the VS applies g_vertexOffset itself, so we
+        // never depend on SV_VertexID including StartVertexLocation.
+        gfx.DrawInstanced(ecmd.vertexCount, 1, 0, 0, cl);
         if (uiPassLog) {
             // Dump first 4 vertex positions for this cmd so we can correlate
             // with screen-space expectations. Each vertex is 20 bytes; we

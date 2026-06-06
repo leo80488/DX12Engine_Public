@@ -1,13 +1,24 @@
-// UI.vs.hlsl — orthographic projection of UI quads/triangles.
+// UI.vs.hlsl -- orthographic projection of UI quads/triangles.
 //
 // Vertex layout (UIVertex, 20 bytes packed):
 //   [0..7]   float2 pos (screen-space pixels, origin top-left)
 //   [8..15]  float2 uv  (0..1 if textured)
 //   [16..19] uint32 col (RGBA8: byte order R,G,B,A)
 //
-// Vertices are fetched from a ByteAddressBuffer at t2 space0 by SV_VertexID,
-// matching DebugWire's pattern (no IA input layout, share the engine's default
-// root signature, minimise PSO permutations).
+// Vertices are fetched from a ByteAddressBuffer at t2 space0 by SV_VertexID.
+// The per-draw vertex offset is passed EXPLICITLY through b0 (g_vertexOffset)
+// and every draw uses StartVertexLocation = 0 -- relying on SV_VertexID to
+// include StartVertexLocation is NOT portable across this draw path, which
+// caused every command after the first to read from vertex 0 (last glyph
+// dropped, 2nd image vanished, text sampling the whole atlas).
+
+cbuffer UIDrawConsts : register(b0, space0)
+{
+    uint g_materialID;    // (PS) 0 = plain, 1 = SDF text
+    uint g_effectIndex;   // (PS) index into the effects table
+    uint g_vertexOffset;  // (VS) first vertex of this draw command
+    uint g_uiPad1;
+};
 
 cbuffer UICB : register(b1, space0)
 {
@@ -28,7 +39,7 @@ struct VSOut
 VSOut main(uint vid : SV_VertexID)
 {
     const uint stride = 20u;
-    const uint off    = vid * stride;
+    const uint off    = (vid + g_vertexOffset) * stride;
 
     float2 px;
     px.x = asfloat(g_UIVB.Load(off + 0u));
@@ -45,7 +56,7 @@ VSOut main(uint vid : SV_VertexID)
     col.b = float((packed >> 16) & 0xFFu) / 255.0;
     col.a = float((packed >> 24) & 0xFFu) / 255.0;
 
-    // Orthographic: pixel (0,0) → NDC (-1,+1), pixel (W,H) → NDC (+1,-1).
+    // Orthographic: pixel (0,0) -> NDC (-1,+1), pixel (W,H) -> NDC (+1,-1).
     float2 inv = 1.0 / max(g_canvasSizePx, float2(1.0, 1.0));
     float2 ndc = float2(px.x * inv.x * 2.0 - 1.0,
                         1.0 - px.y * inv.y * 2.0);

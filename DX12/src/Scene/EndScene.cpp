@@ -71,10 +71,13 @@ void EndScene::Update(float /*dt*/)
 {
     if (!m_ctx) return;
 
-    if (Input::Get().WasKeyPressed(VK_RETURN) && m_ctx->requestReplaceMode)
+    if (Input::Get().WasKeyPressed(VK_RETURN))
     {
         LOG_INFO("EndScene: -> TitleScene");
-        m_ctx->requestReplaceMode(std::make_unique<TitleScene>());
+        if (m_ctx->beginTransition)
+            m_ctx->beginTransition(std::make_unique<TitleScene>());
+        else if (m_ctx->requestReplaceMode)
+            m_ctx->requestReplaceMode(std::make_unique<TitleScene>());
     }
 }
 

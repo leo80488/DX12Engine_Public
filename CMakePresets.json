@@ -5,16 +5,10 @@
         {
             "name": "vs-x64",
             "displayName": "Visual Studio 2022 (x64)",
-            "description": "Multi-config VS generator. Pick Debug/Release in the IDE.",
+            "description": "Multi-config VS generator. Pick Debug/Release in the IDE. All deps vendored under DX12/external/.",
             "generator": "Visual Studio 17 2022",
             "architecture": "x64",
-            "binaryDir": "${sourceDir}/build",
-            "cacheVariables": {
-                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-            },
-            "environment": {
-                "VCPKG_ROOT": "$penv{VCPKG_ROOT}"
-            }
+            "binaryDir": "${sourceDir}/build"
         },
         {
             "name": "ninja-debug",
@@ -22,8 +16,7 @@
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/ninja-debug",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Debug",
-                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                "CMAKE_BUILD_TYPE": "Debug"
             }
         },
         {
@@ -32,29 +25,14 @@
             "generator": "Ninja",
             "binaryDir": "${sourceDir}/build/ninja-release",
             "cacheVariables": {
-                "CMAKE_BUILD_TYPE": "Release",
-                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+                "CMAKE_BUILD_TYPE": "Release"
             }
         }
     ],
     "buildPresets": [
-        {
-            "name": "vs-x64-debug",
-            "configurePreset": "vs-x64",
-            "configuration": "Debug"
-        },
-        {
-            "name": "vs-x64-release",
-            "configurePreset": "vs-x64",
-            "configuration": "Release"
-        },
-        {
-            "name": "ninja-debug",
-            "configurePreset": "ninja-debug"
-        },
-        {
-            "name": "ninja-release",
-            "configurePreset": "ninja-release"
-        }
+        { "name": "vs-x64-debug",   "configurePreset": "vs-x64", "configuration": "Debug" },
+        { "name": "vs-x64-release", "configurePreset": "vs-x64", "configuration": "Release" },
+        { "name": "ninja-debug",    "configurePreset": "ninja-debug" },
+        { "name": "ninja-release",  "configurePreset": "ninja-release" }
     ]
 }

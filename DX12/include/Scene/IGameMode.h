@@ -31,6 +31,7 @@ namespace Resource
     class MaterialSystem;
     class AssetManager;
 }
+namespace Nav { class NavMeshSystem; }
 
 // ---------------------------------------------------------------------------
 // GameModeContext — shared services/data accessible to every game mode.
@@ -65,11 +66,26 @@ struct GameModeContext
     // Unified asset cache (wraps meshSys + textureSys with path-based dedup).
     Resource::AssetManager*    assetMgr    = nullptr;
 
+    // Navmesh — owned by App. The Game build's scene loader (GameScene) feeds
+    // the .iscene's baked navmesh path here so runtime FindPath / NavAgent
+    // path-following are live. The editor does the equivalent in
+    // EditorLayer::LoadWorldFromFile; without it the Game build leaves
+    // Nav::IsReady() false and all AI path-following silently dies (enemies
+    // load with full components but never move).
+    Nav::NavMeshSystem*        navSys      = nullptr;
+
     // Mode transition request — call from inside an IGameMode::Update to
     // replace the current mode with a new one. App processes the request
     // AFTER the current Update returns (so GameModeStack isn't mutated
     // mid-iteration). null until App wires it up.
     std::function<void(std::unique_ptr<IGameMode>)> requestReplaceMode = nullptr;
+
+    // Like requestReplaceMode, but routes the switch through the
+    // SceneTransitionManager so it is wrapped in a fade-out -> loading screen ->
+    // fade-in instead of an instant cut. Prefer this for player-facing scene
+    // changes; requestReplaceMode stays the raw instant swap (and is what the
+    // transition manager itself uses internally). null until App wires it up.
+    std::function<void(std::unique_ptr<IGameMode>)> beginTransition = nullptr;
 };
 
 // ---------------------------------------------------------------------------

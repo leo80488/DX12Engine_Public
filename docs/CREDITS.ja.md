@@ -10,6 +10,7 @@
 
 | ライブラリ                          | 用途                                                       | ライセンス（上流） |
 | ---------------------------------- | --------------------------------------------------------- | ------------------ |
+| **Assimp**                         | メッシュ／シーン／スケルトン／アニメーションのインポート（オフラインクック） | BSD-3-Clause       |
 | **DirectX-Headers**                | 最新の `d3d12.h` + Agility SDK ヘッダー                    | MIT                |
 | **DirectXTex**                     | テクスチャ読み込み、BC圧縮、WIC保存（PNGキャプチャ）       | MIT                |
 | **DXC (dxcompiler.dll, dxil.dll)** | HLSL → DXIL コンパイル、リフレクション                     | LLVM (Apache 2.0)  |
@@ -23,12 +24,6 @@
 | **Recast & Detour**                | ナビメッシュ生成（Recast）+ 経路探索（Detour）             | zlib               |
 | **FFmpeg** (avcodec/format/util/swscale) | 動画のデマックス + ハードウェア（D3D12VA）デコード + スケーリング | LGPL-2.1+          |
 | **XAudio2 / X3DAudio**             | オーディオミキサー + 3D空間化                              | Windows SDK        |
-
-## vcpkg 経由のライブラリ
-
-| ライブラリ | 用途                                                     | ライセンス   |
-| ---------- | ------------------------------------------------------- | ------------ |
-| **Assimp** | メッシュ／シーン／スケルトン／アニメーションのインポート（オフラインクック） | BSD-3-Clause |
 
 > DXC バイナリは Windows SDK 10.0.26100.0 からコピーされている。
 
@@ -50,7 +45,6 @@
 | **Outline**                | 反転ハル (Genshin / NPR スタイル) + オブジェクトID／法線／深度に対するスクリーンスペース Roberts エッジ                                       |
 | **Glass Shatter**          | Voronoi 破片プリカット + 破片ごとの2D剛体シミュレーション                                                                                    |
 | **Decals**                 | ボリューム投影（キューブ）クラスタ化デカール、Doom 2016 / Wicked Engine のデカールクラスタパスと類似                                          |
-| **Beam (procedural tube)** | 平行移動フレーム、Rodrigues の回転、セグメントごとのハッシュノイズ揺らぎ                                                                      |
 | **Tracer (cyl. billboard)** | `cross(beamAxis, toCamera)` による円柱ビルボード、平行縮退フォールバック付き                                                                 |
 | **TAA Velocity Dilation**  | Drobot / Lottes の最近傍深度ダイレーション                                                                                                   |
 | **Reverse-Z Depth**        | Reed/Persson — D32_FLOAT 深度精度向けに推奨                                                                                                  |
@@ -71,6 +65,5 @@
 
 - **Sponza** (Crytek / Frank Meinl / Intel) — 古典的な GI／ライティングの参照シーン。
 - **Bistro** (Amazon Lumberyard) — DDGI 検証シーン。
-- **soldier2** — スキンドアニメーションのサンプル。
 - **PMX/VMD test rig** — MMD パイプラインの検証。
 - **IBL** — 事前ベイク済みのirradiance + radianceを持つ複数の HDRI キューブマップ。

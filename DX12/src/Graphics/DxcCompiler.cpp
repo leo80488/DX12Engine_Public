@@ -1,6 +1,7 @@
 #include "Graphics/DxcCompiler.h"
 
 #include "System/Log.h"
+#include "Resource/AssetFS.h"   // AssetFS-backed #include resolution for packed builds
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -56,6 +57,83 @@ namespace
                             static_cast<int>(s.size()), w.data(), wlen);
         return w;
     }
+
+    // UTF-16 → UTF-8 (DXC hands include paths back as wide strings).
+    std::string Narrow(const wchar_t* w)
+    {
+        if (!w || !*w) return {};
+        const int len = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+        if (len <= 1) return {};
+        std::string s(static_cast<size_t>(len - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, s.data(), len, nullptr, nullptr);
+        return s;
+    }
+
+    std::string NormalizeKey(std::string s)
+    {
+        for (char& c : s) if (c == '\\') c = '/';
+        while (s.rfind("./", 0) == 0) s.erase(0, 2);
+        return s;
+    }
+
+    // IDxcIncludeHandler that resolves #include "X.hlsli" through AssetFS
+    // (game.ipak first, loose-disk fallback). The stock CreateDefaultIncludeHandler
+    // reads the real filesystem ONLY, so in a PACKED build every runtime DXC compile
+    // that #includes a shared header failed — all DDGI compute shaders pull
+    // DDGICommon.hlsli / DDGISampling.hlsli / cluster_common.hlsli, which live
+    // inside game.ipak, so DDGI was silently dead in shipped builds. dirA/dirB hold
+    // the source-file parent + explicit -I dir so a bare basename still resolves.
+    class AssetFSIncludeHandler : public IDxcIncludeHandler
+    {
+    public:
+        std::string dirA;   // source-file parent (normalised, no trailing slash)
+        std::string dirB;   // explicit includeDir (normalised, no trailing slash)
+
+        HRESULT STDMETHODCALLTYPE LoadSource(LPCWSTR pFilename,
+                                             IDxcBlob** ppIncludeSource) override
+        {
+            if (ppIncludeSource) *ppIncludeSource = nullptr;
+            if (!pFilename || !g_utils) return E_FAIL;
+
+            const std::string norm = NormalizeKey(Narrow(pFilename));
+            std::string base = norm;
+            if (auto s = norm.find_last_of('/'); s != std::string::npos)
+                base = norm.substr(s + 1);
+
+            std::string cands[4];
+            int n = 0;
+            cands[n++] = norm;                                   // as DXC joined it
+            if (!dirA.empty()) cands[n++] = dirA + "/" + base;   // source-relative
+            if (!dirB.empty()) cands[n++] = dirB + "/" + base;   // -I relative
+            cands[n++] = base;                                   // last resort
+
+            std::vector<std::uint8_t> bytes;
+            for (int i = 0; i < n; ++i)
+            {
+                if (!Resource::AssetFS::Get().ReadFile(cands[i], bytes) || bytes.empty())
+                    continue;
+                ComPtr<IDxcBlobEncoding> blob;
+                if (FAILED(g_utils->CreateBlob(bytes.data(),
+                                               static_cast<UINT32>(bytes.size()),
+                                               DXC_CP_UTF8, &blob)))
+                    return E_FAIL;
+                *ppIncludeSource = blob.Detach();
+                return S_OK;
+            }
+            return E_FAIL;   // not found → DXC emits the include error
+        }
+
+        // Stack-scoped per Compile() call; no real refcounting needed.
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override
+        {
+            if (ppv && (riid == __uuidof(IDxcIncludeHandler) || riid == __uuidof(IUnknown)))
+            { *ppv = this; return S_OK; }
+            if (ppv) *ppv = nullptr;
+            return E_NOINTERFACE;
+        }
+        ULONG STDMETHODCALLTYPE AddRef()  override { return 1; }
+        ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    };
 } // namespace
 
 namespace DxcCompiler
@@ -194,21 +272,22 @@ CompileResult Compile(const void* src, std::size_t srcSize, const CompileOptions
     srcBuf.Size     = srcSize;
     srcBuf.Encoding = DXC_CP_UTF8;
 
-    // Default include handler: resolves "X.hlsli" first against the source's
-    // virtual path, then against -I directories. Each Compile() call gets a
-    // fresh handler so DXC can keep its include cache scoped per compile.
-    ComPtr<IDxcIncludeHandler> includeHandler;
-    HRESULT hr = g_utils->CreateDefaultIncludeHandler(&includeHandler);
-    if (FAILED(hr))
-    {
-        out.errorMsg = "CreateDefaultIncludeHandler failed";
-        return out;
-    }
+    // AssetFS-backed include handler: resolves #include "X.hlsli" through
+    // game.ipak (pak-first, loose-disk fallback) so runtime DXC compiles work in
+    // PACKED builds. The stock CreateDefaultIncludeHandler reads the real
+    // filesystem only, which made every live DDGI shader compile fail in a packed
+    // build (the shared .hlsli headers live inside game.ipak).
+    AssetFSIncludeHandler includeHandler;
+    if (!opts.sourceName.empty())
+        includeHandler.dirA = NormalizeKey(
+            std::filesystem::path(opts.sourceName).parent_path().string());
+    if (!opts.includeDir.empty())
+        includeHandler.dirB = NormalizeKey(opts.includeDir);
 
     ComPtr<IDxcResult> result;
-    hr = g_compiler->Compile(&srcBuf,
+    HRESULT hr = g_compiler->Compile(&srcBuf,
                              args.data(), static_cast<UINT32>(args.size()),
-                             includeHandler.Get(),
+                             &includeHandler,
                              IID_PPV_ARGS(&result));
 
     // Error/warning text — present even on success when there are warnings.

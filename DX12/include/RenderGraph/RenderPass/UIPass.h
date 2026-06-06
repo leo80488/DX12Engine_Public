@@ -73,12 +73,21 @@ private:
     struct alignas(16) UICB { float w, h; uint32_t pad0, pad1; };
     FrameCB<UICB>    m_cb;
 
+    // SDF text effects table — uploaded from UIDrawList::Effects() each frame
+    // and bound at b2 space0. Indexed by the draw command's effectIndex (which
+    // the PS reads from b0 root constants). Element 0 is the no-op effect.
+    static constexpr uint32_t kMaxEffectSlots = 64;
+    struct alignas(16) UIEffectsTable { UI::GpuTextEffect fx[kMaxEffectSlots]; };
+    FrameCB<UIEffectsTable> m_effectsCB;
+
     // 1×1 white default texture (used when a draw cmd has no texture bound).
     RHI::Texture     m_whiteTex;
     uint64_t         m_whiteTexSrv = 0;
 
-    // Linear/clamp sampler (registered once in Init, bound at slot 0).
-    int              m_samplerIdx = -1;
+    // UV samplers, indexed by UI::UISamplerId(wrap, pointFilter):
+    //   [0..2] linear Clamp/Wrap/Mirror, [3..5] point Clamp/Wrap/Mirror.
+    // Bound per draw command at s0. SDF text always uses [0] (clamp-linear).
+    int              m_samplers[UI::kUISamplerCount] = { -1, -1, -1, -1, -1, -1 };
 
     PSODesc BuildPSODesc() const;
     bool    CreateWhiteTexture();

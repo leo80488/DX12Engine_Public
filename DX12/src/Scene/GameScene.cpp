@@ -9,6 +9,7 @@
 #include "Resource/AnimationClipSystem.h"
 #include "Graphics/Renderer.h"
 #include "Input/InputSystem.h"
+#include "Nav/NavMeshSystem.h"
 #include "System/Log.h"
 
 #include "Resource/AssetFS.h"
@@ -123,10 +124,11 @@ void GameScene::Init(GameModeContext* ctx)
     {
         LOG_INFO("GameScene: loading scene '%s'", scenePath.c_str());
         std::string ppcPath;
+        std::string navPath;
         const bool ok = Resource::LoadScene(
             scenePath, world, *m_ctx->assetMgr,
             &m_ctx->renderer, /*animClipSys=*/nullptr,
-            /*outName=*/nullptr, &ppcPath);
+            /*outName=*/nullptr, &ppcPath, &navPath);
         if (!ok)
         {
             LOG_ERROR("GameScene: LoadScene('%s') failed — falling back to defaults",
@@ -136,6 +138,24 @@ void GameScene::Init(GameModeContext* ctx)
         else
         {
             m_loadedFromManifest = true;
+
+            // Load the navmesh baked into the .iscene. The editor does this in
+            // EditorLayer::LoadWorldFromFile; the Game build had no equivalent,
+            // so Nav::IsReady() stayed false → FindPath returned empty → BT
+            // NavReady never passed → NavAgent got no path → AI never moved.
+            if (!navPath.empty() && m_ctx->navSys)
+            {
+                if (m_ctx->navSys->Load(navPath))
+                    LOG_INFO("GameScene: navmesh '%s' loaded", navPath.c_str());
+                else
+                    LOG_ERROR("GameScene: navmesh '%s' failed to load — AI path-following disabled",
+                              navPath.c_str());
+            }
+            else if (navPath.empty())
+            {
+                LOG_WARNING("GameScene: scene '%s' has no navmesh; AI path-following disabled",
+                            scenePath.c_str());
+            }
         }
     }
     else
@@ -151,10 +171,13 @@ void GameScene::Update(float /*dt*/)
 
     // Placeholder game-over trigger: press Q. Replace with real win/lose
     // detection (player HP <= 0, boss defeated, timer expired, …).
-    if (Input::Get().WasKeyPressed('Q') && m_ctx->requestReplaceMode)
+    if (Input::Get().WasKeyPressed('Q'))
     {
         LOG_INFO("GameScene: -> EndScene");
-        m_ctx->requestReplaceMode(std::make_unique<EndScene>());
+        if (m_ctx->beginTransition)
+            m_ctx->beginTransition(std::make_unique<EndScene>());
+        else if (m_ctx->requestReplaceMode)
+            m_ctx->requestReplaceMode(std::make_unique<EndScene>());
     }
 }
 

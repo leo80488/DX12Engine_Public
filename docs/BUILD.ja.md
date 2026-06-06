@@ -12,27 +12,17 @@
 | **Visual Studio 2022**    | 17.x                 | 「C++ によるデスクトップ開発」+「C++ によるゲーム開発」            |
 | **Windows 10 SDK**        | 10.0.26100.0 以降    | D3D12、DXGI、XAudio2 のヘッダーを提供                              |
 | **CMake**                 | ≥ 3.21               | VS 2022 に同梱                                                     |
-| **vcpkg**                 | manifest mode        | Assimp 用（`vcpkg.json` 参照）。`VCPKG_ROOT` 環境変数を設定する    |
+
+> パッケージマネージャは不要 —— サードパーティ依存はすべて `DX12/external/` 配下にプリビルド済みで同梱されている。
 
 ### Bundled dependencies
 
-それ以外はすべて `DX12/external/` 配下にプリビルド済みで同梱されており、インストールは不要: DirectXTex、Jolt、DXC、
-FreeType、Dear ImGui (+ ImGuizmo)、Lua 5.4、sol2、nlohmann/json、**meshoptimizer**、**Recast/Detour**、
-**FFmpeg**（avcodec/avformat/avutil/swscale + バージョンサフィックス付きランタイム DLL を `DX12/` に配置）、および
-DirectX-Headers。ほとんどは `#pragma comment(lib, ...)` 経由でインラインリンクされ、CMake ビルドは単にそれらの
-`external/<lib>/lib` フォルダをリンカの検索パスに追加するだけである。DXC + FFmpeg のランタイム DLL はビルド時に各
-`.exe` の隣にコピーされる。
-
-## One-time setup
-
-```bat
-:: Clone vcpkg somewhere (or reuse an existing checkout)
-git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-C:\vcpkg\bootstrap-vcpkg.bat
-
-:: Tell CMake where it lives
-setx VCPKG_ROOT C:\vcpkg
-```
+サードパーティ依存はすべて `DX12/external/` 配下にプリビルド済みで同梱されており、インストールは不要 —— パッケージ
+マネージャ（vcpkg / Conan）も不要: **Assimp**、DirectXTex、Jolt、DXC、FreeType、Dear ImGui (+ ImGuizmo)、Lua 5.4、
+sol2、nlohmann/json、**meshoptimizer**、**Recast/Detour**、**FFmpeg**（avcodec/avformat/avutil/swscale + バージョン
+サフィックス付きランタイム DLL を `DX12/` に配置）、および DirectX-Headers。ほとんどは `#pragma comment(lib, ...)` 経由で
+インラインリンクされ、CMake ビルドは単にそれらの `external/<lib>/lib` フォルダをリンカの検索パスに追加するだけである。
+DXC、FFmpeg、Assimp のランタイム DLL はビルド時に各 `.exe` の隣にコピーされる。
 
 ## Configure & build
 
@@ -55,8 +45,7 @@ cmake --build --preset ninja-release
 ### Manual configure (no preset)
 
 ```bat
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 ^
-      -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
@@ -88,8 +77,7 @@ exe、ランタイム DLL（DXC、Assimp、FFmpeg）、シェーダー、スク�
 
 ## Troubleshooting
 
-- **`Could not find package 'assimp'`** — `VCPKG_ROOT` が未設定か、ツールチェインファイルが渡されていない。プリセットで再実行する。
 - **起動時のメッシュシェーダー / DXR エラー** — D3D12 SM 6.6 + Mesh Shaders + DXR 1.1 をサポートする GPU + ドライバが必要。GPU ドライバを更新する。
 - **ビューポートが黒い / シーンが表示されない** — `DX12/asset/` 配下のアセットが欠落している。作業ディレクトリが `DX12/` と一致していることを確認する（VS からの起動では CMake が設定する）。
-- **`LNK1104: cannot open file '<lib>.lib'`** — 同梱の `external/<lib>/lib` フォルダがリンカの検索パスから欠落している。ビルドはほとんどのサードパーティライブラリを `#pragma comment(lib, ...)` 経由でリンクする。`DX12/external/`（Recast/Detour、meshoptimizer、FFmpeg、DirectXTex、Jolt、FreeType、DXC）が無傷であることを確認する。
+- **`LNK1104: cannot open file '<lib>.lib'`** — 同梱の `external/<lib>/lib` フォルダがリンカの検索パスから欠落している。ビルドはほとんどのサードパーティライブラリを `#pragma comment(lib, ...)` 経由でリンクする。`DX12/external/`（Assimp、Recast/Detour、meshoptimizer、FFmpeg、DirectXTex、Jolt、FreeType、DXC）が無傷であることを確認する。
 - **動画が黒く再生される / デコードエラー** — D3D12 のビデオデコードには、クリップのコーデック（H.264 / HEVC）をサポートする GPU + ドライバが必要。FFmpeg パスはソフトウェアデコードにフォールバックする。`avcodec-*.dll` / `avformat-*.dll` / `avutil-*.dll` / `swscale-*.dll`（+ `swresample-*.dll`）が exe の隣にあることを確認する。

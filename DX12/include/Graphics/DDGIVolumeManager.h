@@ -99,6 +99,11 @@ struct VolumeGPUDesc
     uint32_t          frameIndex   = 0;
     uint32_t          _padFI0      = 0;
     uint32_t          _padFI1      = 0;
+
+    // Directional sun (mirrors LightCB.lightDir / lightColor). See the matching
+    // comment in DDGICommon.hlsli — keep these two structs byte-for-byte in sync.
+    DirectX::XMFLOAT3 sunDirection{ 0.0f, -1.0f, 0.0f }; float _padSun0 = 0;
+    DirectX::XMFLOAT3 sunColor    { 0.0f,  0.0f, 0.0f }; float _padSun1 = 0;
 };
 
 // Per-probe state stored in ProbeData buffer (kept compact — written by classify
@@ -144,12 +149,18 @@ public:
     // AllocateOrUpdate for every active volume earlier this frame.
     //
     // @p lightCount comes from ClusterPass::GetLightCount() — the trace CS
-    // picks a random light index in [0..lightCount-1] per ray.
+    // picks a random light index in [0..lightCount-1] per ray (point/spot only;
+    // directional entries are skipped). @p sunDirection / @p sunColor are the
+    // final LightCB sun (authored directional, or TOD active body when enabled),
+    // evaluated deterministically by the trace CS so DDGI's directional GI
+    // matches the deferred lighting and the Time-of-Day cycle.
     void Tick(IGraphicsDevice& gfx,
               const DDGIVolumeComponent* const* volumes,
               DDGIVolumeRuntimeComponent* const* runtimes,
               uint32_t volumeCount,
-              uint32_t lightCount);
+              uint32_t lightCount,
+              const DirectX::XMFLOAT3& sunDirection,
+              const DirectX::XMFLOAT3& sunColor);
 
     // SRV GPU handle of the packed StructuredBuffer<VolumeGPUDesc> — bound by
     // Lighting.ps + DDGI passes. Triple-buffered; returns the current frame's

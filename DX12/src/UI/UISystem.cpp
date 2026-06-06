@@ -85,6 +85,9 @@ namespace UI
     bool UISystem::GlobalWantsCaptureKeyboard()
     { return g_wantsCaptureKeyboard.load(std::memory_order_relaxed); }
 
+    void UISystem::MergeExternalCaptureMouse(bool wants)
+    { if (wants) g_wantsCaptureMouse.store(true, std::memory_order_relaxed); }
+
     void UISystem::SetFocused(WidgetHandle h)
     {
         if (Widget* old = WidgetRegistry::Get().Get(m_focused))
@@ -129,12 +132,41 @@ namespace UI
         input.keysThisFrame.clear();
     }
 
+    // Resolve a UITextComponent's preset + override fields into the runtime
+    // TextEffect handed to Font::RenderTextStyled.
+    static UI::TextEffect BuildTextEffect(const UI::UITextComponent& tc)
+    {
+        auto toC = [](const DirectX::XMFLOAT4& c) {
+            return UI::Color32(
+                static_cast<uint8_t>(std::clamp(c.x, 0.f, 1.f) * 255.f),
+                static_cast<uint8_t>(std::clamp(c.y, 0.f, 1.f) * 255.f),
+                static_cast<uint8_t>(std::clamp(c.z, 0.f, 1.f) * 255.f),
+                static_cast<uint8_t>(std::clamp(c.w, 0.f, 1.f) * 255.f));
+        };
+        using P = UI::TextEffectPreset;
+        const P p = tc.effectPreset;
+        UI::TextEffect fx;
+        fx.outline = (p == P::Outline || p == P::OutlineShadow);
+        fx.glow    = (p == P::Glow    || p == P::GlowShadow);
+        fx.shadow  = (p == P::Shadow  || p == P::OutlineShadow || p == P::GlowShadow);
+        fx.jitter  = (p == P::Jitter);
+        fx.outlineColor   = toC(tc.outlineColor);
+        fx.outlineWidthPx = tc.outlineWidth;
+        fx.glowColor      = toC(tc.glowColor);
+        fx.glowWidthPx    = tc.glowWidth;
+        fx.shadowColor    = toC(tc.shadowColor);
+        fx.shadowOffsetPx = { tc.shadowOffsetX, tc.shadowOffsetY };
+        fx.jitterAmpPx    = tc.jitterAmplitude;
+        fx.jitterFreq     = tc.jitterFrequency;
+        return fx;
+    }
+
     void UISystem::Tick(World& world, UIInputState& input,
-                        const UICanvas& canvas, UIDrawList& drawList,
+                        const UIScreen& canvas, UIDrawList& drawList,
                         float dt)
     {
         m_wantsCaptureMouse = false;
-        if (dt > 0.f) TweenSystem::Get().Tick(dt);
+        if (dt > 0.f) { TweenSystem::Get().Tick(dt); m_uiTimeSec += dt; }
 
         // Build entries — UIRootComponent pool sorted by sortOrder.
         struct Entry { Entity e; UIRootComponent* root; };
@@ -227,7 +259,8 @@ namespace UI
                                    { minPx.x + visualSize.x, minPx.y + visualSize.y },
                                    { img.uv0X, img.uv0Y },
                                    { img.uv1X, img.uv1Y },
-                                   float4ToColor(img.tint));
+                                   float4ToColor(img.tint),
+                                   UISamplerId(img.wrapMode, img.pointFilter));
             }
         }
 
@@ -275,8 +308,10 @@ namespace UI
                 const Vec2 visualSize = DefaultFont().MeasureText(tc.text.c_str());
                 Vec2 minPx{};
                 resolveScreenPos(*ss, visualSize, minPx);
-                DefaultFont().RenderText(drawList, minPx,
-                                          float4ToColor(tc.color), tc.text.c_str());
+                const UI::TextEffect fx = BuildTextEffect(tc);
+                DefaultFont().RenderTextStyled(drawList, minPx,
+                                               float4ToColor(tc.color), tc.text.c_str(),
+                                               fx, m_uiTimeSec);
                 DefaultFont().Metrics().pixelScale = oldScale;
             }
         }

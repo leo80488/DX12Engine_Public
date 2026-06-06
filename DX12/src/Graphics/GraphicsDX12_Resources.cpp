@@ -337,10 +337,20 @@ bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
     // there triggers a debug-layer "subresource not initialized but used" error
     // (observed on GBuffer_Depth). Also NOT for SRV/UAV-only textures, which may
     // be sampled before their first write (history / accumulation buffers).
+    //
+    // Also NOT for textures that ALSO carry UNORDERED_ACCESS: these are usually
+    // written first by a COMPUTE UAV pass and only later bound as an RT (e.g.
+    // ToneMapPass.FinalOutput — the tone-map dispatch writes it via UAV, then
+    // UIPass draws the HUD onto it as a render target). A UAV write does NOT
+    // satisfy the CREATE_NOT_ZEROED rule that an RT/DS subresource be initialized
+    // via Clear/Discard/Copy, so the validator flags the later RT DrawInstanced
+    // as "not initialized but is used". Excluding RT+UAV textures costs only a
+    // one-time zero-fill at allocation (no per-frame cost) and is debug clean.
     D3D12_HEAP_FLAGS heapFlags = D3D12_HEAP_FLAG_NONE;
     if (hp.Type == D3D12_HEAP_TYPE_DEFAULT
         && RHI::HasFlag(desc.bind_flags, RHI::BindFlag::RENDER_TARGET)
-        && !RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL))
+        && !RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL)
+        && !RHI::HasFlag(desc.bind_flags, RHI::BindFlag::UNORDERED_ACCESS))
         heapFlags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
 
     if (FAILED(m_device->CreateCommittedResource(

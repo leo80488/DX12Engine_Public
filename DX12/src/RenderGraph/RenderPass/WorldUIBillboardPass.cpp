@@ -227,7 +227,12 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
     // Bar / border use kInvalidTexIdx (PS short-circuits).  Text uses the
     // font atlas's bindless index.  Image uses the component-supplied
     // bindless index. ONE bind of the bindless table, ONE DrawInstanced.
-    const uint32_t fontTexIdx = UI::DefaultFont().AtlasBindlessIndex();
+    // High bit flags SDF font glyphs in the PS (the atlas alpha is a signed
+    // distance field). Plain image quads leave it clear; bars use the sentinel.
+    constexpr uint32_t kSdfTexFlag  = 0x80000000u;
+    const uint32_t fontTexIdx       = UI::DefaultFont().AtlasBindlessIndex();
+    const uint32_t fontTexIdxSdf    = (fontTexIdx == kInvalidTexIdx)
+                                    ? kInvalidTexIdx : (fontTexIdx | kSdfTexFlag);
 
     const auto& wsEnts = wsPool->Entities();
     auto&       wsData = wsPool->Data();
@@ -385,7 +390,7 @@ void WorldUIBillboardPass::Execute(RHI::CommandList cl,
                         XMFLOAT3 cc3; XMStoreFloat3(&cc3, center);
                         if (verts.size() + 6 > kMaxVertices) break;
                         EmitQuad(verts, cc3, cameraRightWS, cameraUpWS, gw, gh,
-                                  g.uv0.x, g.uv0.y, g.uv1.x, g.uv1.y, cc, fontTexIdx);
+                                  g.uv0.x, g.uv0.y, g.uv1.x, g.uv1.y, cc, fontTexIdxSdf);
                     }
                     penWS = XMVectorAdd(penWS,
                         XMVectorScale(XMLoadFloat3(&cameraRightWS), g.advance * worldPerPixel));

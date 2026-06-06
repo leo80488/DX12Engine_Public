@@ -20,6 +20,7 @@
 #include "ECS/DDGIComponents.h"
 #include "ECS/VolumeComponent.h"
 #include "UI/UIComponents.h"
+#include "UI/UICanvas.h"
 #include "UI/WorldSpaceUI.h"
 #include "Physics/ChainPhysicsSystem.h"
 #include "ECS/PhysicsComponents.h"     // RigidBodyComponent + ColliderComponent
@@ -329,7 +330,7 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 "  DDGIVolume: ox=%.4f oy=%.4f oz=%.4f"
                 " ex=%.4f ey=%.4f ez=%.4f"
                 " px=%u py=%u pz=%u rays=%u"
-                " hyst=%.4f nb=%.4f vb=%.4f bfr=%.4f"
+                " hyst=%.4f jit=%.4f nb=%.4f vb=%.4f bfr=%.4f"
                 // NOTE: debugDraw is intentionally NOT serialized — it is an
                 // editor-only debug toggle, not gameplay/authoring data.
                 " reloc=%u classify=%u prio=%d cascade=%u"
@@ -337,7 +338,8 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 v->origin.x, v->origin.y, v->origin.z,
                 v->extent.x, v->extent.y, v->extent.z,
                 v->probeCountsX, v->probeCountsY, v->probeCountsZ, v->raysPerProbe,
-                v->hysteresis, v->normalBias, v->viewBias, v->boundaryFadeRatio,
+                v->hysteresis, v->rotationJitterScale,
+                v->normalBias, v->viewBias, v->boundaryFadeRatio,
                 v->enableRelocation     ? 1u : 0u,
                 v->enableClassification ? 1u : 0u,
                 v->priority, v->cascadeLevel,
@@ -353,6 +355,7 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             v.probeCountsZ = static_cast<uint32_t>(GetI(kv, "pz",   static_cast<int>(v.probeCountsZ)));
             v.raysPerProbe = static_cast<uint32_t>(GetI(kv, "rays", static_cast<int>(v.raysPerProbe)));
             v.hysteresis        = GetF(kv, "hyst", v.hysteresis);
+            v.rotationJitterScale = GetF(kv, "jit", v.rotationJitterScale);
             v.normalBias        = GetF(kv, "nb",   v.normalBias);
             v.viewBias          = GetF(kv, "vb",   v.viewBias);
             v.boundaryFadeRatio = GetF(kv, "bfr",  v.boundaryFadeRatio);
@@ -2305,11 +2308,15 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             char buf[256];
             snprintf(buf, sizeof(buf),
                 "  UIImage: sizeX=%.4f sizeY=%.4f uv0X=%.4f uv0Y=%.4f"
-                " uv1X=%.4f uv1Y=%.4f tint=%.4f_%.4f_%.4f_%.4f visible=%u\n",
+                " uv1X=%.4f uv1Y=%.4f tint=%.4f_%.4f_%.4f_%.4f visible=%u",
                 i->sizeX, i->sizeY, i->uv0X, i->uv0Y, i->uv1X, i->uv1Y,
                 i->tint.x, i->tint.y, i->tint.z, i->tint.w,
                 i->visible ? 1u : 0u);
             ss << buf;
+            ss << " wrap=" << static_cast<uint32_t>(i->wrapMode)
+               << " point=" << (i->pointFilter ? 1u : 0u);
+            // texturePath is the stable identity (srvGpuHandle/texture are runtime).
+            ss << " tex=" << PercentEncode(i->texturePath) << "\n";
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
             UI::UIImageComponent i;
@@ -2323,8 +2330,12 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             if (!ts.empty())
                 sscanf_s(ts.c_str(), "%f_%f_%f_%f",
                     &i.tint.x, &i.tint.y, &i.tint.z, &i.tint.w);
-            i.visible = GetI(kv, "visible", 1) != 0;
-            // srvGpuHandle stays 0 — repopulate via TextureSystem after spawn.
+            i.visible     = GetI(kv, "visible", 1) != 0;
+            i.wrapMode    = static_cast<UI::UIWrapMode>(GetI(kv, "wrap", 0));
+            i.pointFilter = GetI(kv, "point", 0) != 0;
+            i.texturePath = GetS(kv, "tex");
+            // srvGpuHandle/texture stay default — re-resolved each frame from
+            // texturePath by App's UI-image refresh (see App::Run).
             w.AddComponent<UI::UIImageComponent>(e, i);
         }
     });
@@ -2340,17 +2351,41 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                << " color=" << t->color.x << "_" << t->color.y << "_"
                << t->color.z << "_" << t->color.w
                << " scale=" << t->scale
-               << " visible=" << (t->visible ? 1u : 0u) << "\n";
+               << " visible=" << (t->visible ? 1u : 0u)
+               << " effect=" << static_cast<uint32_t>(t->effectPreset)
+               << " outlineCol=" << t->outlineColor.x << "_" << t->outlineColor.y << "_"
+                                 << t->outlineColor.z << "_" << t->outlineColor.w
+               << " outlineW=" << t->outlineWidth
+               << " glowCol=" << t->glowColor.x << "_" << t->glowColor.y << "_"
+                              << t->glowColor.z << "_" << t->glowColor.w
+               << " glowW=" << t->glowWidth
+               << " shadowCol=" << t->shadowColor.x << "_" << t->shadowColor.y << "_"
+                                << t->shadowColor.z << "_" << t->shadowColor.w
+               << " shadowOX=" << t->shadowOffsetX << " shadowOY=" << t->shadowOffsetY
+               << " jitterA=" << t->jitterAmplitude << " jitterF=" << t->jitterFrequency
+               << "\n";
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
             UI::UITextComponent t;
             t.text = GetS(kv, "text");
-            const std::string cs = GetS(kv, "color");
-            if (!cs.empty())
-                sscanf_s(cs.c_str(), "%f_%f_%f_%f",
-                    &t.color.x, &t.color.y, &t.color.z, &t.color.w);
+            auto parseV4 = [&](const char* k, DirectX::XMFLOAT4& out) {
+                const std::string s = GetS(kv, k);
+                if (!s.empty()) sscanf_s(s.c_str(), "%f_%f_%f_%f", &out.x, &out.y, &out.z, &out.w);
+            };
+            parseV4("color", t.color);
             t.scale   = GetF(kv, "scale", 1.f);
             t.visible = GetI(kv, "visible", 1) != 0;
+            // Effects (defaults match the struct so legacy .iscn load unchanged).
+            t.effectPreset = static_cast<UI::TextEffectPreset>(GetI(kv, "effect", 0));
+            parseV4("outlineCol", t.outlineColor);
+            t.outlineWidth = GetF(kv, "outlineW", 2.f);
+            parseV4("glowCol", t.glowColor);
+            t.glowWidth = GetF(kv, "glowW", 4.f);
+            parseV4("shadowCol", t.shadowColor);
+            t.shadowOffsetX   = GetF(kv, "shadowOX", 2.f);
+            t.shadowOffsetY   = GetF(kv, "shadowOY", 2.f);
+            t.jitterAmplitude = GetF(kv, "jitterA", 2.f);
+            t.jitterFrequency = GetF(kv, "jitterF", 12.f);
             w.AddComponent<UI::UITextComponent>(e, t);
         }
     });
@@ -2389,6 +2424,213 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             parseV4("border", b.borderColor);
             b.visible = GetI(kv, "visible", 1) != 0;
             w.AddComponent<UI::UIBarComponent>(e, b);
+        }
+    });
+
+    // ==== Entity-as-widget Canvas UI (UI/UICanvas.h) ====
+    // UIComputedRect + dirty tags are runtime-only (not serialized).
+    reg.Register(std::type_index(typeid(UI::UICanvas)), {
+        "CvCanvas",
+        [](World& w, Entity e) { return w.GetComponent<UI::UICanvas>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* c = w.GetComponent<UI::UICanvas>(e);
+            if (!c) return;
+            ss << "  CvCanvas: renderMode=" << static_cast<uint32_t>(c->renderMode)
+               << " scaleMode=" << static_cast<uint32_t>(c->scaleMode)
+               << " refW=" << c->referenceResolution.x << " refH=" << c->referenceResolution.y
+               << " match=" << c->matchWidthOrHeight
+               << " sortOrder=" << c->sortOrder << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UICanvas c;
+            c.renderMode = static_cast<UI::CanvasRenderMode>(GetI(kv, "renderMode", 0));
+            c.scaleMode  = static_cast<UI::CanvasScaleMode>(GetI(kv, "scaleMode", 1));
+            c.referenceResolution = { GetF(kv, "refW", 1920.f), GetF(kv, "refH", 1080.f) };
+            c.matchWidthOrHeight  = GetF(kv, "match", 0.5f);
+            c.sortOrder           = GetI(kv, "sortOrder", 0);
+            w.AddComponent<UI::UICanvas>(e, c);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UIRect)), {
+        "CvRect",
+        [](World& w, Entity e) { return w.GetComponent<UI::UIRect>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* r = w.GetComponent<UI::UIRect>(e);
+            if (!r) return;
+            ss << "  CvRect: aMinX=" << r->anchorMin.x << " aMinY=" << r->anchorMin.y
+               << " aMaxX=" << r->anchorMax.x << " aMaxY=" << r->anchorMax.y
+               << " pivX=" << r->pivot.x << " pivY=" << r->pivot.y
+               << " szX=" << r->size.x << " szY=" << r->size.y
+               << " offX=" << r->offset.x << " offY=" << r->offset.y << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UIRect r;
+            r.anchorMin = { GetF(kv, "aMinX", 0.5f), GetF(kv, "aMinY", 0.5f) };
+            r.anchorMax = { GetF(kv, "aMaxX", 0.5f), GetF(kv, "aMaxY", 0.5f) };
+            r.pivot     = { GetF(kv, "pivX", 0.5f),  GetF(kv, "pivY", 0.5f) };
+            r.size      = { GetF(kv, "szX", 160.f),  GetF(kv, "szY", 40.f) };
+            r.offset    = { GetF(kv, "offX", 0.f),   GetF(kv, "offY", 0.f) };
+            w.AddComponent<UI::UIRect>(e, r);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UIParent)), {
+        "CvParent",
+        [](World& w, Entity e) { return w.GetComponent<UI::UIParent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* p = w.GetComponent<UI::UIParent>(e);
+            if (!p) return;
+            // Stamp the parent's GUID (idempotent) so the edge round-trips.
+            ECS::Guid g = p->parentGuid;
+            if (p->parent != NullEntity && w.IsAlive(p->parent))
+                g = ECS::EnsureGuidOn(w, p->parent);
+            if (g.IsValid())
+                ss << "  CvParent: parentGuid=" << g.ToHex() << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UIParent p;
+            const std::string gh = GetS(kv, "parentGuid");
+            if (!gh.empty()) p.parentGuid = ECS::Guid::FromHex(gh);
+            // parent entity resolved from parentGuid by UICanvasSystem at tick.
+            w.AddComponent<UI::UIParent>(e, p);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UIImage)), {
+        "CvImage",
+        [](World& w, Entity e) { return w.GetComponent<UI::UIImage>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* i = w.GetComponent<UI::UIImage>(e);
+            if (!i) return;
+            ss << "  CvImage: visible=" << (i->visible ? 1u : 0u)
+               << " color=" << i->color.x << "_" << i->color.y << "_" << i->color.z << "_" << i->color.w
+               << " uv0=" << i->uv0.x << "_" << i->uv0.y
+               << " uv1=" << i->uv1.x << "_" << i->uv1.y
+               << " wrap=" << static_cast<uint32_t>(i->wrapMode)
+               << " point=" << (i->pointFilter ? 1u : 0u)
+               << " tex=" << PercentEncode(i->texturePath) << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UIImage i;
+            i.visible = GetI(kv, "visible", 1) != 0;
+            const std::string cs = GetS(kv, "color");
+            if (!cs.empty()) sscanf_s(cs.c_str(), "%f_%f_%f_%f", &i.color.x, &i.color.y, &i.color.z, &i.color.w);
+            const std::string u0 = GetS(kv, "uv0");
+            if (!u0.empty()) sscanf_s(u0.c_str(), "%f_%f", &i.uv0.x, &i.uv0.y);
+            const std::string u1 = GetS(kv, "uv1");
+            if (!u1.empty()) sscanf_s(u1.c_str(), "%f_%f", &i.uv1.x, &i.uv1.y);
+            i.wrapMode    = static_cast<UI::UIWrapMode>(GetI(kv, "wrap", 0));
+            i.pointFilter = GetI(kv, "point", 0) != 0;
+            i.texturePath = GetS(kv, "tex");
+            w.AddComponent<UI::UIImage>(e, i);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UISpriteAnimComponent)), {
+        "CvSpriteAnim",
+        [](World& w, Entity e) { return w.GetComponent<UI::UISpriteAnimComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* s = w.GetComponent<UI::UISpriteAnimComponent>(e);
+            if (!s) return;
+            ss << "  CvSpriteAnim: cols=" << s->columns << " rows=" << s->rows
+               << " frames=" << s->frameCount << " fps=" << s->fps
+               << " loop=" << (s->loop ? 1u : 0u)
+               << " playing=" << (s->playing ? 1u : 0u)
+               << " pingpong=" << (s->pingpong ? 1u : 0u) << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UISpriteAnimComponent s;
+            s.columns    = GetI(kv, "cols", 4);
+            s.rows       = GetI(kv, "rows", 4);
+            s.frameCount = GetI(kv, "frames", 0);
+            s.fps        = GetF(kv, "fps", 12.f);
+            s.loop       = GetI(kv, "loop", 1) != 0;
+            s.playing    = GetI(kv, "playing", 1) != 0;
+            s.pingpong   = GetI(kv, "pingpong", 0) != 0;
+            w.AddComponent<UI::UISpriteAnimComponent>(e, s);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UIText)), {
+        "CvText",
+        [](World& w, Entity e) { return w.GetComponent<UI::UIText>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* t = w.GetComponent<UI::UIText>(e);
+            if (!t) return;
+            ss << "  CvText: visible=" << (t->visible ? 1u : 0u)
+               << " text=" << PercentEncode(t->text)
+               << " color=" << t->color.x << "_" << t->color.y << "_" << t->color.z << "_" << t->color.w
+               << " fontScale=" << t->fontScale
+               << " alignH=" << t->alignH << " alignV=" << t->alignV
+               << " effect=" << static_cast<uint32_t>(t->effectPreset)
+               << " outlineCol=" << t->outlineColor.x << "_" << t->outlineColor.y << "_"
+                                 << t->outlineColor.z << "_" << t->outlineColor.w
+               << " outlineW=" << t->outlineWidth
+               << " glowCol=" << t->glowColor.x << "_" << t->glowColor.y << "_"
+                              << t->glowColor.z << "_" << t->glowColor.w
+               << " glowW=" << t->glowWidth
+               << " shadowCol=" << t->shadowColor.x << "_" << t->shadowColor.y << "_"
+                                << t->shadowColor.z << "_" << t->shadowColor.w
+               << " shadowOX=" << t->shadowOffsetX << " shadowOY=" << t->shadowOffsetY
+               << " jitterA=" << t->jitterAmplitude << " jitterF=" << t->jitterFrequency << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UIText t;
+            t.text = GetS(kv, "text");
+            auto parseV4 = [&](const char* k, DirectX::XMFLOAT4& out) {
+                const std::string s = GetS(kv, k);
+                if (!s.empty()) sscanf_s(s.c_str(), "%f_%f_%f_%f", &out.x, &out.y, &out.z, &out.w);
+            };
+            parseV4("color", t.color);
+            t.visible   = GetI(kv, "visible", 1) != 0;
+            t.fontScale = GetF(kv, "fontScale", 1.f);
+            t.alignH    = GetI(kv, "alignH", 1);
+            t.alignV    = GetI(kv, "alignV", 1);
+            t.effectPreset = static_cast<UI::TextEffectPreset>(GetI(kv, "effect", 0));
+            parseV4("outlineCol", t.outlineColor); t.outlineWidth = GetF(kv, "outlineW", 2.f);
+            parseV4("glowCol", t.glowColor);       t.glowWidth    = GetF(kv, "glowW", 4.f);
+            parseV4("shadowCol", t.shadowColor);
+            t.shadowOffsetX   = GetF(kv, "shadowOX", 2.f);
+            t.shadowOffsetY   = GetF(kv, "shadowOY", 2.f);
+            t.jitterAmplitude = GetF(kv, "jitterA", 2.f);
+            t.jitterFrequency = GetF(kv, "jitterF", 12.f);
+            w.AddComponent<UI::UIText>(e, t);
+        }
+    });
+
+    reg.Register(std::type_index(typeid(UI::UIInteractable)), {
+        "CvInteract",
+        [](World& w, Entity e) { return w.GetComponent<UI::UIInteractable>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* it = w.GetComponent<UI::UIInteractable>(e);
+            if (!it) return;
+            ss << "  CvInteract: raycast=" << (it->raycastTarget ? 1u : 0u)
+               << " disabled=" << (it->disabled ? 1u : 0u)
+               << " tint=" << (it->tintTransition ? 1u : 0u)
+               << " normal=" << it->normalColor.x << "_" << it->normalColor.y << "_"
+                             << it->normalColor.z << "_" << it->normalColor.w
+               << " hover=" << it->hoverColor.x << "_" << it->hoverColor.y << "_"
+                            << it->hoverColor.z << "_" << it->hoverColor.w
+               << " pressed=" << it->pressedColor.x << "_" << it->pressedColor.y << "_"
+                              << it->pressedColor.z << "_" << it->pressedColor.w
+               << " disabledCol=" << it->disabledColor.x << "_" << it->disabledColor.y << "_"
+                                  << it->disabledColor.z << "_" << it->disabledColor.w << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            UI::UIInteractable it;
+            it.raycastTarget  = GetI(kv, "raycast", 1) != 0;
+            it.disabled       = GetI(kv, "disabled", 0) != 0;
+            it.tintTransition = GetI(kv, "tint", 0) != 0;
+            auto parseV4 = [&](const char* k, DirectX::XMFLOAT4& out) {
+                const std::string s = GetS(kv, k);
+                if (!s.empty()) sscanf_s(s.c_str(), "%f_%f_%f_%f", &out.x, &out.y, &out.z, &out.w);
+            };
+            parseV4("normal", it.normalColor);
+            parseV4("hover", it.hoverColor);
+            parseV4("pressed", it.pressedColor);
+            parseV4("disabledCol", it.disabledColor);
+            w.AddComponent<UI::UIInteractable>(e, it);
         }
     });
 

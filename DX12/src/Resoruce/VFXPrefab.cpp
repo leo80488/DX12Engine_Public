@@ -1,5 +1,6 @@
 #include "Resource/VFXPrefab.h"
 
+#include "Resource/AssetFS.h"   // pak-first read so .ivfx prefabs load in packed builds
 #include "System/Log.h"
 
 #include <DirectXMath.h>
@@ -207,11 +208,15 @@ bool LoadVFXPrefab(const std::string& path, VFXPrefab& out)
     out.emitters.clear();
     out.defaultDuration = 2.0f;
 
-    std::ifstream f(path);
-    if (!f) {
+    // Read via AssetFS (game.ipak first, then loose disk). A raw std::ifstream
+    // here made notify-driven VFX (particles/trails/beams/decals/tracers/...)
+    // silently never spawn in PACKED builds — the .ivfx lives only in game.ipak.
+    std::string text;
+    if (!::Resource::AssetFS::Get().ReadFileText(path, text)) {
         LOG_WARNING("VFXPrefab: cannot open '%s'", path.c_str());
         return false;
     }
+    std::istringstream f(text);
 
     int    version       = -1;
     bool   inEmitter     = false;
