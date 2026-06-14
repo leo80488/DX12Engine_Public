@@ -126,6 +126,11 @@ private:
     // instance count + BLAS pointers. When the count changes (more BLASes
     // finished building this frame, or scene churn), force a full rebuild.
     uint32_t                                              m_lastInstanceCount = 0;
+    // Fingerprint (FNV-1a) of last frame's TLAS instance descs (transforms +
+    // BLAS VAs). When it matches and no BLAS swapped, the TLAS is byte-identical
+    // to what we'd rebuild — skip WriteTLASInstances + BuildTLAS entirely
+    // (static scene / camera-only motion). 0 = no valid build yet.
+    uint64_t                                              m_lastInstanceHash = 0;
 
     // Monotonic BuildOrRefit call counter, used to time BLAS-compaction
     // readbacks: a COMPACTED_SIZE query recorded this call is GPU-ready after

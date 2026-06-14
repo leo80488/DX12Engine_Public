@@ -139,11 +139,21 @@ private:
     // skip this check entirely — the snap is sub-pixel-precise so thickness
     // would always pass anyway. 0.5 wu is a safe fall-through default; tight
     // values rejected legitimate "grazing" hits that the forward walk failed
-    // to converge on within 16 steps.
+    // to converge on within 16 steps. The shader additionally floors the
+    // tolerance at 0.4% of the hit's linear depth — a fixed 0.5 wu at km
+    // range sat below D24 quantization + grazing-terrain depth gradients
+    // and speckled distant water reflections with sky-fallback holes.
     float    m_traceThickness     = 0.5f;
     uint32_t m_hizMostDetailed    = 0;
     float    m_coneMipMax         = 4.0f;
-    float    m_depthBiasFactor    = 0.005f;
+    // 0: the depth-PROPORTIONAL ray-origin push visibly offsets reflections
+    // near contact lines (0.005 ≈ 25 cm at 50 m — the water/terrain seam
+    // gaps open under vertical camera motion). The shader keeps a 0.02 wu
+    // absolute floor PLUS a D24-quantization-aware floor (2 quantization
+    // steps at the origin's linear depth — sub-mm near, ~1 wu at 900 m) so
+    // far-away surfaces still clear the Hi-Z self-intersection; the linear
+    // proportional term stays off.
+    float    m_depthBiasFactor    = 0.0f;
     float    m_maxRayLength       = 100.0f;
     float    m_roughnessCutoff    = 0.5f;
     // Finish trace refines from the Hi-Z hit position with ±maxSteps/2

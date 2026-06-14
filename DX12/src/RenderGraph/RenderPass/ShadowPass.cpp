@@ -314,9 +314,16 @@ PSODesc ShadowPass::BuildPSODesc(PermutationKey perm, RHI::CullMode cullMode) co
     switch (cullMode)
     {
     case RHI::CullMode::FRONT:
-        // Trust the cull. Tiny bias just as precision safety.
-        desc.rs.depth_bias              = -2;
-        desc.rs.slope_scaled_depth_bias = -0.25f;
+        // ZERO bias — trust the cull. The comment block above is literal:
+        // back faces are mostly GRAZING w.r.t. the light (silhouette
+        // regions, thin limbs), where max|dz/dx| explodes, so even the
+        // former "tiny" -0.25 slope term (unclamped: depth_bias_clamp=0)
+        // pushed the stored depth metres past the receiver and the mesh
+        // simply stopped casting ("front-cull = no shadow" bug). The
+        // front↔back separation IS the object's thickness — orders of
+        // magnitude above D32 precision — so no safety bias is needed.
+        desc.rs.depth_bias              = 0;
+        desc.rs.slope_scaled_depth_bias = 0.0f;
         break;
     case RHI::CullMode::NONE:
         // Alpha-test cards / single-sided geometry. Both sides rasterize,

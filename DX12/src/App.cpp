@@ -17,9 +17,8 @@
 
 // ---- Scene -----------------------------------------------------------------
 #include "Scene/TestScene.h"
-#include "Scene/TitleScene.h"
-#include "Scene/GameScene.h"
-#include "Scene/EndScene.h"
+#include "Scene/DataScene.h"
+#include "Scene/LuaSceneBindings.h"
 #include "Scene/ShaderLabScene.h"
 #include "Scene/MeshSpawner.h"
 #include "Scene/TransformSystem.h"
@@ -70,6 +69,10 @@
 #include "Intent/LuaIntentBindings.h"
 #include "Intent/LuaAIBindings.h"
 #include "Physics/LuaPhysicsBindings.h"
+#include "Resource/PrefabSerializer.h"   // Resource::LoadPrefab (Engine.SpawnPrefab)
+#include "Scripting/LuaMathTypes.h"      // LuaVec3 (camera getters)
+#include "PostProcess/LuaPostProcessBindings.h"
+#include "ECS/PostProcessResolveSystem.h"
 
 // ---- System / Input --------------------------------------------------------
 #include "System/TaskSystem.h"
@@ -165,6 +168,7 @@ int App::Run()
     ctx.assetMgr    = &m_assetMgr;
     ctx.world       = &m_world;
     ctx.navSys      = &m_navSystem;
+    ctx.sceneManager = &m_sceneManager;
 
     std::unique_ptr<IGameMode> pendingMode;
     ctx.requestReplaceMode = [&pendingMode](std::unique_ptr<IGameMode> next) {
@@ -177,13 +181,32 @@ int App::Run()
         m_transition.Begin(std::move(next));
     };
 
+    // ---- Data-driven scene system ----------------------------------------
+    // SceneManager owns the scene registry (game.json) + the unified, blocking
+    // world-reload path. It routes Scene.Load() through the SAME transition
+    // closures the game modes use, wrapping a new DataScene in the fade.
+    m_sceneManager.Configure(&backend, &renderer, &m_world, &m_assetMgr,
+                             &m_animClipSys, &m_navSystem, &m_scriptSystem,
+                             &m_physicsSystem);
+    m_sceneManager.SetTransitionHooks(ctx.beginTransition, ctx.requestReplaceMode);
+    m_sceneManager.LoadManifest("game.json");
+
     // Initial mode varies by build: ShaderLab tool / Editor target / Game flow.
+    // Editor/ShaderLab keep their dedicated code-driven tool modes; the Game
+    // build boots the data-driven startup scene declared in game.json via the
+    // single generic DataScene (no more hardcoded TitleScene/GameScene/EndScene).
 #ifdef WITH_SHADERLAB
     m_gameModeStack.PushMode(std::make_unique<ShaderLabScene>(), ctx);
 #elif defined(WITH_EDITOR)
     m_gameModeStack.PushMode(std::make_unique<TestScene>(), ctx);
 #else
-    m_gameModeStack.PushMode(std::make_unique<TitleScene>(), ctx);
+    {
+        const std::string startup = m_sceneManager.StartupScene();
+        if (startup.empty())
+            LOG_WARNING("App: game.json has no startup_scene — DataScene will fall "
+                        "back to a default world");
+        m_gameModeStack.PushMode(std::make_unique<DataScene>(startup), ctx);
+    }
 #endif
 
     // Renderer-side system wiring needed by BOTH Game and Editor builds. These
@@ -448,7 +471,7 @@ void App::InitUIFont(IGraphicsDevice& backend)
 {
     // FGMiraiRen ships with the engine. Falls back silently to a no-op text
     // path if the TTF isn't on disk.
-    constexpr const char* kDefaultTTF = "asset/font/arial.ttf";
+    constexpr const char* kDefaultTTF = "asset/font/FGMiraiRen.ttf";
     if (UI::DefaultFont().Init(backend, kDefaultTTF, /*pixelSize*/ 24.f))
         UI::DefaultFont().InstallAsGlobal();
     else
@@ -465,9 +488,11 @@ void App::InitLuaBindings(Renderer& renderer)
     Nav::RegisterLuaNavBindings(*lua, m_navSystem, m_world);
     Intent::RegisterLuaIntentBindings(*lua, m_world);
     Intent::RegisterLuaAIBindings(*lua, m_world);
-    DX12Physics::RegisterLuaPhysicsBindings(*lua, m_physicsSystem);
+    DX12Physics::RegisterLuaPhysicsBindings(*lua, m_physicsSystem, m_world);
     RegisterLuaCharacterStateBindings(*lua, m_world);
     RegisterLuaPlayerBindings(*lua, m_world);
+    PostProcess::RegisterLuaPostProcessBindings(*lua, m_world);
+    Scene::RegisterLuaSceneBindings(*lua, m_sceneManager);
     m_aiSystem.Init(lua);
 
     // VFX.SpawnAfterimage(entity, lifetime, r, g, b) — pushes a skinned-pose
@@ -480,6 +505,40 @@ void App::InitLuaBindings(Renderer& renderer)
                 if (auto* sys = renderer.GetAfterimageSystem())
                     sys->Spawn(static_cast<Entity>(entity), lifetime,
                                DirectX::XMFLOAT4{ r, g, b, 1.0f });
+            });
+    }
+
+    // Engine.SpawnPrefab + active-camera world pose. These live HERE (not in
+    // ScriptSystem) because only App::InitLuaBindings holds the Renderer&; they
+    // are appended to the Engine table that ScriptSystem::RegisterBindings has
+    // already created (Initialize() runs before InitLuaBindings).
+    {
+        sol::table engineTbl = (*lua)["Engine"];
+
+        // Engine.SpawnPrefab(path, x,y,z) -> entityId. Instantiates a .ipfb
+        // tree (root + descendants) then re-positions the root's LocalTransform.
+        engineTbl.set_function("SpawnPrefab",
+            [this, &renderer](const std::string& path,
+                              float x, float y, float z) -> uint32_t
+            {
+                Entity root = Resource::LoadPrefab(
+                    path, m_world, m_assetMgr, &renderer, &m_animClipSys);
+                if (root == NullEntity) return static_cast<uint32_t>(NullEntity);
+                if (auto* lt = m_world.GetComponent<LocalTransform>(root))
+                    lt->translation = { x, y, z };
+                return static_cast<uint32_t>(root);
+            });
+
+        // Active-camera world pose (mirrors RenderView in Renderer::GetView()).
+        engineTbl.set_function("GetCameraPosition",
+            [&renderer]() -> LuaVec3 {
+                const RenderView& v = renderer.GetView();
+                return LuaVec3{ v.cameraPosition.x, v.cameraPosition.y, v.cameraPosition.z };
+            });
+        engineTbl.set_function("GetCameraForward",
+            [&renderer]() -> LuaVec3 {
+                const RenderView& v = renderer.GetView();
+                return LuaVec3{ v.cameraForward.x, v.cameraForward.y, v.cameraForward.z };
             });
     }
 
@@ -674,6 +733,9 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
     reg.Add<CameraStackTickSystem>();
     reg.Add<CameraResolveTickSystem>();
     reg.Add<CameraShakeTickSystem>();
+    // After the camera blend resolves: turn volumes + override stack into the
+    // frame's ResolvedPostProcessSettings (PostProcess::Runtime).
+    reg.Add<PostProcessResolveSystem>();
 
     // Render — the GPU recording block (backend.BeginFrame → Renderer →
     // backend.EndFrame, with UI pump + EditorLayer ImGui chrome) runs as a
@@ -838,6 +900,9 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
         // buckets BEFORE BeginFrame's wire-gather reads them. Editor-only:
         // Game builds never enable debug visuals.
         m_debugDraw.ApplyTo(renderer, m_navSystem);
+        // Force the debug wire pass on (before BeginFrame runs Clear()) when the
+        // selected entity has authored chain-physics groups to visualize.
+        m_editorLayer.PrepareChainPhysicsOverlay(renderer, world);
 #endif
         renderer.BeginFrame(world, ctx.frame, ctx.deltaTime,
                             ctx.viewportW, ctx.viewportH);
@@ -848,6 +913,9 @@ void App::RegisterTickSystems(IGraphicsDevice& backend, Renderer& renderer,
         // AFTER BeginFrame (DebugWirePass ring slot is live) and BEFORE
         // renderer.Render (which uploads + draws the wire buffer).
         m_debugDraw.Submit(renderer, world, frameCtx, m_physicsSystem, m_navSystem);
+        // Chain-physics (KawaiiPhysics-style) authoring overlay — root bone,
+        // simulated chain bones + links, and excluded bones for the selection.
+        m_editorLayer.EmitChainPhysicsOverlay(renderer, world);
 #endif
 
         pumpUIInput();

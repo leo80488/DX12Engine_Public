@@ -6,7 +6,7 @@
 | ---------------- | ------------------------------------------------------------------------------- |
 | **ECS World**    | すべてのエンティティ／コンポーネントのデータ — 純粋なゲーム側の状態。            |
 | **Scheduler**    | ECS World に対する 16 フェーズの依存関係を考慮した並列システムtick。             |
-| **Renderer**     | ECS データを GPU 用の `DrawPacket` に変換する（DX12 型は含まない）。`Renderer.cpp` と `Renderer_Scene/_DDGI/_IBL/_Terrain/_Accessors.cpp` に分割。 |
+| **Renderer**     | ECS データを GPU 用の `DrawPacket` に変換する（DX12 型は含まない）。`Renderer.cpp` と `Renderer_Scene/_DDGI/_IBL/_Terrain/_GrassWater/_Accessors.cpp` に分割。 |
 | **RenderGraph**  | ラムダおよびクラスベースのパス DAG、トランジェントリソース、自動バリア挿入。     |
 | **RenderPass**   | 個々のパス。RHI 型のみを扱う。                                                  |
 | **RHI**          | 抽象的なコマンドリストおよびリソースハンドル（`RHICommandList`、`RGTextureHandle`）。 |

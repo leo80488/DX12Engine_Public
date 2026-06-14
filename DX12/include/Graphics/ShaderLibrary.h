@@ -131,14 +131,27 @@ enum class ShaderID : uint32_t
     FXAA_CS                    = 98,  // NVIDIA FXAA 3.11 quality preset, single-pass HDR-aware
     OutlineObjectID_VS         = 99,  // Minimal PVF VS for outline ObjectID sub-pass (un-jittered VP)
     AfterimageCopy_CS          = 100, // Afterimage: copy skinned pos/nrm slice into snapshot pool
-    CloudNoiseBake_CS          = 101, // Volumetric clouds: bake 128^3 Worley/Perlin noise once
-    CloudRaymarch_CS           = 102, // Volumetric clouds: quarter-res raymarch through cloud slab
+    CloudNoiseBake_CS          = 101, // Volumetric clouds: bake 128^3 Perlin-Worley base shape (RGBA)
+    CloudRaymarch_CS           = 102, // Volumetric clouds: quarter-res raymarch through cloud shell
     CloudComposite_VS          = 103, // Volumetric clouds: fullscreen-triangle VS
     CloudComposite_PS          = 104, // Volumetric clouds: bilinear upsample + alpha-over composite
     VideoComposite_VS          = 105, // Video playback: fullscreen-triangle VS
     VideoComposite_PS          = 106, // Video playback: NV12 Y/UV plane → linear RGB composite
     VideoQuad_VS               = 107, // Video playback: world-space quad VS (procedural 6-vert)
     VideoQuad_PS               = 108, // Video playback: NV12 sample for world-space video quad
+    Underwater_CS              = 109, // Underwater screen distortion + tint (HDR, pre-tonemap)
+    DepthOfField_CS            = 110, // Focus-distance depth of field (HDR, depth-driven CoC gather)
+    Stylize_CS                 = 111, // NPR stylize: Kuwahara/Posterize/Halftone/Dither/Crosshatch
+    BillboardFX_VS             = 112, // Animated sprite-sheet billboard VS (3D quad, viewProj)
+    BillboardFX_PS             = 113, // Animated sprite-sheet billboard PS (bindless atlas × HDR tint)
+    Grass_AS                   = 114, // Procedural grass: per-patch frustum/distance cull + LOD
+    Grass_MS                   = 115, // Procedural grass: Bezier blade generation (GoT-style)
+    Grass_PS                   = 116, // Procedural grass: GBuffer write (deferred)
+    Water_VS                   = 117, // Water surface: SV_VertexID grid over the water tile
+    Water_PS                   = 118, // Water surface: Fresnel sky reflection + flow normals
+    CloudDetailNoiseBake_CS    = 119, // Volumetric clouds: bake 32^3 high-freq Worley erosion noise
+    CloudWeatherBake_CS        = 120, // Volumetric clouds: bake 512^2 weather map (coverage/type)
+    HeightFogApply_PS          = 121, // UE-style analytic exponential height fog (fullscreen, post-cloud)
     Count,
 };
 

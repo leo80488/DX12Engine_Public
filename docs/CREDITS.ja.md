@@ -41,9 +41,14 @@
 | **Bloom**                  | 「Sledgehammer」13タップダウンサンプル + 3×3 テントアップサンプル、初回ダウンサンプルにKaris平均 (Jorge Jiménez / Call of Duty Advanced Warfare 2014) |
 | **Atmosphere**             | Hillaire 2020 — *"A Scalable and Production Ready Sky and Atmosphere Rendering Technique"*                                                   |
 | **Volumetric Fog**         | Bart Wronski 2014 (*"Volumetric Fog: Unified Compute Shader Based Solution"*) — froxel グリッド + テンポラルリプロジェクション               |
+| **Volumetric Clouds**      | Schneider 2015 / 2017 (*"The Real-time Volumetric Cloudscapes of Horizon Zero Dawn"* / Nubis) — Perlin-Worley + 気象マップ；Hillaire/Frostbite エネルギー保存マルチスキャッター；Wrenninge マルチスキャッター近似 |
+| **Height Fog**             | 解析的指数ハイトフォグ（Unreal スタイル）— 視線レイ光学的深度の閉形式積分 + Henyey-Greenstein サンインスキャッター                          |
 | **Clustered Shading**      | Olsson / Billeter / Assarsson 2012、Doom 2016 実装                                                                                           |
 | **Outline**                | 反転ハル (Genshin / NPR スタイル) + オブジェクトID／法線／深度に対するスクリーンスペース Roberts エッジ                                       |
 | **Glass Shatter**          | Voronoi 破片プリカット + 破片ごとの2D剛体シミュレーション                                                                                    |
+| **Procedural Grass**       | GPU メッシュシェーダーによる二次 Bézier リボンブレード、*Ghost of Tsushima* のクランプ／風モデル (Wohllaib, GDC 2021)                       |
+| **Depth of Field**         | フォーカス距離の錯乱円、scatter-as-gather の 2 リングギャザー                                                                                |
+| **NPR Stylize**            | Kuwahara フィルタ (Kuwahara 1976; 異方性 Kyprianidis et al. 2009)、4×4 Bayer 順序ディザ、輝度ハーフトーン、複数角度クロスハッチ              |
 | **Decals**                 | ボリューム投影（キューブ）クラスタ化デカール、Doom 2016 / Wicked Engine のデカールクラスタパスと類似                                          |
 | **Tracer (cyl. billboard)** | `cross(beamAxis, toCamera)` による円柱ビルボード、平行縮退フォールバック付き                                                                 |
 | **TAA Velocity Dilation**  | Drobot / Lottes の最近傍深度ダイレーション                                                                                                   |
@@ -65,5 +70,3 @@
 
 - **Sponza** (Crytek / Frank Meinl / Intel) — 古典的な GI／ライティングの参照シーン。
 - **Bistro** (Amazon Lumberyard) — DDGI 検証シーン。
-- **PMX/VMD test rig** — MMD パイプラインの検証。
-- **IBL** — 事前ベイク済みのirradiance + radianceを持つ複数の HDRI キューブマップ。

@@ -40,7 +40,8 @@ struct PSIn
     float3 wn        : NORMAL;
     float3 wt        : TANGENT;     // world-space tangent
     float3 wbt       : BINORMAL;    // world-space bitangent (cross(N,T)*T.w)
-    float3 col       : COLOR;
+    float3 col       : COLOR;       // per-vertex color (rgb; white when absent)
+    float2 uv1       : TEXCOORD3;   // second UV set (0,0 when absent)
     float4 curClip   : TEXCOORD1;   // current clip-space position (for velocity)
     float4 prevClip  : TEXCOORD2;   // previous clip-space position (for velocity)
 };
@@ -59,7 +60,8 @@ PSIn main(uint rawID : SV_VertexID, uint instID : SV_InstanceID)
     float3 localNrm = FETCH_NORMAL(md, vid);
     float4 localTan = FETCH_TANGENT4(md, vid);  // xyz = tangent, w = handedness
     float2 uv0      = FETCH_UV0(md, vid);
-    float3 color    = FETCH_COLOR(md, vid);
+    float2 uv1      = FETCH_UV1(md, vid);   // second UV set (0,0 when absent)
+    float4 color    = FETCH_COLOR(md, vid); // per-vertex color (white when absent)
 
     // Fetch per-instance world matrix (column-major on GPU → transpose on CPU).
     float4x4 world = InstanceBuffer[instanceOffset + instID].world;
@@ -148,7 +150,8 @@ PSIn main(uint rawID : SV_VertexID, uint instID : SV_InstanceID)
     o.wn       = wn;
     o.wt       = wt;
     o.wbt      = wbt;
-    o.col      = color;
+    o.col      = color.rgb;
+    o.uv1      = uv1;
 
     // Velocity: current and previous clip-space positions, BOTH UNJITTERED.
     // o.sv (above) is jittered so rasterization hits the sub-pixel sample

@@ -35,6 +35,11 @@ struct ReflectionProbeComponent
     // Half-extents of the outer falloff box. Must be >= innerExtents per axis.
     DirectX::XMFLOAT3 outerExtents = { 6.0f, 3.0f, 6.0f };
 
+    // Per-probe brightness multiplier on the reflected radiance. Independent of
+    // the sky/atmosphere IBL master scale (AtmosphereComponent::iblStrength) —
+    // a local probe contributes even when sky IBL is 0. 1.0 = captured energy.
+    float             intensity = 1.0f;
+
     // Renderer-assigned slice into the cubemap array. ~0u until first bake.
     static constexpr uint32_t kInvalidSlice = ~0u;
     uint32_t cubemapSlice = kInvalidSlice;

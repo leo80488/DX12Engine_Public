@@ -529,12 +529,15 @@ struct LightData
     DirectX::XMFLOAT3 direction = { 0.f, -1.f, 0.f }; // local-space direction (directional/spot)
     float             spotAngle = 0.5236f;    // spot half-angle in radians (default 30°)
     LightType         type      = LightType::Directional;
-    // Opt-in shadow caster flag for spot lights. When true, SpotShadowPass
-    // renders a depth map from the light's POV into the shared atlas; the
-    // Lighting and VolumetricFog shaders then sample it to mask both surface
-    // contribution and volumetric scatter behind walls. Directional lights
-    // always use CSM regardless. Point lights currently ignore the flag
-    // (omni shadows would need a cubemap atlas — future work).
+    // Opt-in shadow caster flag for spot AND point lights. When true:
+    //   Spot  → SpotShadowPass renders a single depth map from the light's POV
+    //           into the shared 2D atlas; Lighting + VolumetricFog sample it.
+    //   Point → PointShadowPass renders 6 faces into a depth cube atlas;
+    //           Lighting.ps samples it omnidirectionally (surface only — not
+    //           yet wired into VolumetricFog).
+    // Both are capacity-limited (Spot/PointShadowPass::kMaxCasters); excess
+    // casters silently fall back to no shadow. Directional lights always use
+    // CSM regardless of this flag.
     bool              castsShadow = false;
 };
 

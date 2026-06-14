@@ -24,8 +24,9 @@ cbuffer ShadowPerViewCB : register(b1, space0)
     float4   g_shadowFrustumPlanes[6];
 };
 
-// TerrainCB — only g_tilesPerSide / g_worldOrigin / g_worldSize / heightScale /
-// worldCenterY are used here. Full layout for parity with Terrain.as.hlsl.
+// TerrainCB — geometry prefix only (the shadow AS culls against the per-cascade
+// planes in b1, NOT TerrainCB). Declaring fewer trailing fields than the bound
+// buffer is legal; offsets of the declared geometry fields match Renderer.h.
 cbuffer TerrainCB : register(b2, space0)
 {
     float2 g_worldOrigin;
@@ -40,25 +41,10 @@ cbuffer TerrainCB : register(b2, space0)
     uint   _g_hasSplatmap;
     float  g_worldCenterY;
 
-    int4   _g_layerBindlessIdx;
-    float4 _g_layerTilingScale;
-    int4   _g_layerNormalIdx;
-    int4   _g_layerARMIdx;
-    int4   _g_layerDispIdx;
-
     uint   g_tilesPerSide;
     uint   _g_enableFrustumCull;
-    float  _g_pad8a;
-    float  _g_pad8b;
-
-    float4 _g_layerMinHeight;
-    float4 _g_layerMaxHeight;
-    float4 _g_layerFadeHeight;
-    float4 _g_layerMinSlopeDeg;
-    float4 _g_layerMaxSlopeDeg;
-    float4 _g_layerFadeSlopeDeg;
-
-    float4 _g_frustumPlanes[6];        // colour pass — unused here
+    uint   _g_layerCount;
+    uint   _g_pad0;
 };
 
 struct TerrainPayload

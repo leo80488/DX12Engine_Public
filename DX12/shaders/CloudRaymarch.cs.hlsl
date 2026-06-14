@@ -1,121 +1,187 @@
 // CloudRaymarch.cs.hlsl
 // -----------------------------------------------------------------------------
-// Quarter-resolution volumetric cloud raymarch.
+// Quarter-resolution volumetric cloud raymarch -- Nubis (Schneider 2015/2017)
+// density model + Frostbite (Hillaire 2016) lighting, after UE5's
+// VolumetricCloud.usf.
 //
 //   1. Reconstruct world-space ray from pixel UV via invViewProj.
-//   2. Sample scene depth at pixel center — clamp ray exit to opaque geometry.
-//   3. Intersect view ray with horizontal cloud slab [bottomAlt, topAlt].
-//   4. March front-to-back: sample density volume + cone-trace toward sun.
-//   5. Accumulate premultiplied scatter + transmittance using Beer's law +
-//      Henyey-Greenstein phase function.
+//   2. Intersect with a SPHERICAL cloud shell around the planet (clouds dip
+//      below the horizon instead of forming a flat fog band).
+//   3. Clamp exit to opaque scene depth + max trace distance.
+//   4. Adaptive march: coarse steps sampling the cheap base shape only;
+//      on a hit, back up and switch to fine steps with detail erosion;
+//      revert to coarse after several empty fine samples.
+//   5. Density  = Perlin-Worley base, remap-eroded by weather coverage,
+//      per-type height gradient, then high-freq Worley edge erosion
+//      (wispy at the base -> billowy at the top).
+//   6. Lighting = 5-tap cone + far-tap optical depth toward the sun,
+//      3 Wrenninge multi-scatter octaves (a=b=c=0.5), dual-lobe HG with a
+//      silver-lining lobe, Nubis in-scatter probability, height-gradient
+//      ambient -- integrated with Frostbite's energy-conserving step formula.
 //
-// Output: RGBA16F where rgb = premultiplied in-scatter radiance, a = final
-// transmittance (1 = clear sky, 0 = fully opaque cloud).
+// Output: RGBA16F, rgb = premultiplied in-scatter radiance, a = transmittance.
+//         + R32F per-texel march distance (CloudDistOut) consumed by the
+//           depth-aware composite upsample.
 // -----------------------------------------------------------------------------
 
-// invViewProj is uploaded transposed (engine convention — LightCB style),
-// so leave the default column-major qualifier and use row-vector mul.
-cbuffer CloudCB : register(b0, space2)
-{
-    float4x4 invViewProj;
+// Shared CB layout + RaySphere/ShellInterval/HeightInLayer.
+#define CLOUD_CB_REGISTER register(b0, space2)
+#include "CloudCommon.hlsli"
 
-    // Each declaration block below is 16 bytes — DO NOT reorder without
-    // re-verifying the C++ CloudConstants struct in CloudPass.cpp.
-    float3 cameraPos;       float nearZ;             // row 4
-    float  farZ;            float bottomAltitude;
-    float  topAltitude;     float coverage;          // row 5
-    float  density;         float noiseScale;
-    float  anisotropy;      float extinction;        // row 6
+Texture3D<float4>         BaseNoise   : register(t0, space2);  // 128^3 R=PW GBA=worley FBM
+Texture3D<float4>         DetailNoise : register(t1, space2);  // 32^3 worley erosion
+Texture2D<float4>         WeatherTex  : register(t2, space2);  // 512^2 coverage/fill/type
+Texture2D<float>          SceneDepth  : register(t3, space2);
 
-    float3 sunDir;          float ambientStrength;   // row 7
-    float3 sunColor;        float _pad0;             // row 8
-    float3 cloudColor;      float _pad1;             // row 9
-    float3 windOffset;      float _pad2;             // row 10
-
-    float  halfResW;        float halfResH;
-    float  fullResW;        float fullResH;          // row 11
-};
-
-Texture3D<float>          NoiseTex   : register(t0, space2);
-Texture2D<float>          SceneDepth : register(t3, space2);
-// Engine's static s0 space2 is CLAMP — we wrap manually with frac() in
-// SampleDensity to make the tileable noise volume repeat across the sky.
 SamplerState              LinearClamp : register(s0, space2);
+SamplerState              LinearWrap  : register(s2, space2);  // tileable noise/weather
 
-RWTexture2D<float4>       CloudOut   : register(u0, space2);
-
-#define RM_STEPS         64
-#define RM_LIGHT_STEPS    6
-#define RM_LIGHT_DIST   150.0   // metres per light step (cone-trace)
-
-// Horizon clamp — without this, near-horizontal rays slice the cloud slab
-// for tens of kilometres and the integrated density turns into a solid
-// band that visually "clumps" all distant clouds together. Limit total
-// march length and feather density toward the horizon distance.
-#define RM_MAX_DIST     20000.0
-#define RM_FADE_BEGIN   12000.0
+RWTexture2D<float4>       CloudOut    : register(u0, space2);
+RWTexture2D<float>        CloudDistOut : register(u1, space2); // scene dist marched against
 
 // ---------------------------------------------------------------------------
+static const float PI             = 3.14159265;
+
+// Sample-count ramp: full maxSteps once the in-shell segment reaches this
+// length (UE: r.VolumetricCloud.DistanceToSampleMaxCount = 15 km).
+static const float kDistToMaxSteps   = 15000.0;
+// Horizon fade -- entry distances beyond this range blend the result away
+// (the geometric horizon for a 1.5 km layer bottom is ~138 km).
+static const float kHorizonFadeStart = 90000.0;
+static const float kHorizonFadeEnd   = 140000.0;
+// Fine->coarse hysteresis: empty fine samples before reverting to coarse.
+static const int   kEmptyToCoarse    = 8;
+static const float kCoarseMul        = 3.0;   // coarse step = fine step * this
+
+// Multi-scattering octaves (Wrenninge): scatter a^n, extinction b^n, phase
+// eccentricity c^n. a <= b or energy is created.
+static const int   kMSOctaves = 3;
+static const float kMSScatter = 0.5;   // a
+static const float kMSExtinct = 0.5;   // b
+static const float kMSPhase   = 0.5;   // c
+
+// Cone kernel for the sun-light march -- decorrelated unit-ish offsets.
+static const float3 kCone[5] = {
+    float3( 0.30,  0.45, -0.25),
+    float3(-0.35,  0.20,  0.40),
+    float3( 0.45, -0.10,  0.30),
+    float3(-0.20,  0.60, -0.20),
+    float3( 0.15, -0.35,  0.45),
+};
+
+// ---------------------------------------------------------------------------
+float Remap(float v, float lo, float hi, float newLo, float newHi)
+{
+    return newLo + (v - lo) * (newHi - newLo) / max(1e-5, hi - lo);
+}
+
 float HenyeyGreenstein(float cosT, float g)
 {
     const float g2 = g * g;
     const float denom = 1.0 + g2 - 2.0 * g * cosT;
-    return (1.0 - g2) / (4.0 * 3.14159265 * pow(max(denom, 1e-4), 1.5));
+    return (1.0 - g2) / (4.0 * PI * pow(max(denom, 1e-4), 1.5));
+}
+
+// Interleaved gradient noise (Jimenez) -- STATIC, deliberately not
+// frame-indexed. Clouds write no velocity, so TAA partially rejects their
+// history whenever the camera moves; an animated ray-start jitter then shows
+// up as the whole cloudscape boiling/bobbing with camera motion. A static
+// per-pixel offset converts banding into a stable spatial dither instead.
+float IGN(float2 pixel)
+{
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
 // ---------------------------------------------------------------------------
-// Slab intersect — ray P + t*D with y-planes [yLo, yHi]. Returns true if the
-// ray passes through the slab, with entry/exit distances along the ray.
-bool IntersectSlab(float3 P, float3 D, float yLo, float yHi,
-                   out float tEntry, out float tExit)
+// Per-cloud-type density-over-height profile. gradient4 = (start0, full0,
+// full1, end1); community-standard Nubis constants.
+float HeightGradient(float h, float type)
 {
-    tEntry = 0.0; tExit = 1e9;
-    if (abs(D.y) < 1e-4)
-    {
-        // Ray is parallel — entirely inside slab or entirely outside.
-        if (P.y < yLo || P.y > yHi) return false;
-        return true;
-    }
-    float t0 = (yLo - P.y) / D.y;
-    float t1 = (yHi - P.y) / D.y;
-    tEntry = max(0.0, min(t0, t1));
-    tExit  = max(t0, t1);
-    return tExit > tEntry;
+    const float4 kStratus       = float4(0.00, 0.07, 0.08, 0.15);
+    const float4 kStratocumulus = float4(0.00, 0.20, 0.42, 0.60);
+    const float4 kCumulus       = float4(0.00, 0.08, 0.75, 0.98);
+    float4 g = (type < 0.5)
+        ? lerp(kStratus,       kStratocumulus, saturate(type * 2.0))
+        : lerp(kStratocumulus, kCumulus,       saturate(type * 2.0 - 1.0));
+    return smoothstep(g.x, g.y, h) * (1.0 - smoothstep(g.z, g.w, h));
 }
 
 // ---------------------------------------------------------------------------
-// Sample the cloud density at a world position. Includes wind offset + coverage
-// threshold + density multiplier + altitude falloff at the slab edges.
-float SampleDensity(float3 wp)
+// Cloud density at a world position. `cheap` skips the detail erosion (used
+// for coarse marching and far light taps -- detail only ever REMOVES density,
+// so the cheap sample is a conservative bound). `baseShape` returns the
+// pre-erosion shaped density in [0,1] -- the Nubis in-scatter "lodded density"
+// proxy.
+float SampleDensity(float3 wp, float h, bool cheap, out float baseShape)
 {
-    float3 samplePos = frac((wp + windOffset) * noiseScale);
-    float n = NoiseTex.SampleLevel(LinearClamp, samplePos, 0);
+    baseShape = 0.0;
 
-    // Coverage threshold — pixels below `1-coverage` are erased.
-    float d = saturate(n - (1.0 - coverage));
+    // Weather map -- planar world XZ, scrolled at 1/4 wind speed.
+    float2 wuv = (wp.xz + windOffset.xz * 0.25) * weatherScale;
+    float3 weather = WeatherTex.SampleLevel(LinearWrap, wuv, 0).rgb;
 
-    // Altitude-based shape: fade at top and bottom so the slab edges aren't
-    // hard rectangles. Peak around the middle of the slab.
-    float h = saturate((wp.y - bottomAltitude) / max(1.0, topAltitude - bottomAltitude));
-    float verticalProfile = saturate(h * 4.0) * saturate((1.0 - h) * 4.0);
-    d *= verticalProfile;
+    // Dual-coverage (Haggstrom): R = distinct formations; G floods toward
+    // overcast as the author slider passes 0.5.
+    float wCov = max(weather.r, saturate(2.0 * coverage - 1.0) * weather.g);
+    float cov  = saturate(wCov * saturate(2.0 * coverage));
 
-    return d * density;
+    // Anvil: inflate coverage toward the layer top (pow < 1 raises).
+    float anvilExp = Remap(saturate(h), 0.7, 0.8, 1.0, lerp(1.0, 0.5, anvilBias));
+    cov = pow(cov, clamp(anvilExp, 0.5, 1.0));
+    if (cov <= 1e-4) return 0.0;
+
+    float type = saturate(weather.b + cloudTypeBias);
+
+    // Base shape: Perlin-Worley dilated by the Worley FBM (remap-erosion,
+    // not multiplication -- keeps cores opaque).
+    float3 sp = wp + windOffset;
+    float4 lf = BaseNoise.SampleLevel(LinearWrap, sp * baseNoiseScale, 0);
+    float lfFbm = lf.g * 0.625 + lf.b * 0.25 + lf.a * 0.125;
+    float base  = saturate(Remap(lf.r, lfFbm - 1.0, 1.0, 0.0, 1.0));
+    base *= HeightGradient(h, type);
+
+    // Coverage as erosion threshold; trailing *cov softens low-coverage
+    // bottoms (GP7).
+    float shaped = saturate(Remap(base, 1.0 - cov, 1.0, 0.0, 1.0)) * cov;
+    baseShape = shaped;
+    if (cheap || shaped <= 1e-4) return shaped * density;
+
+    // Detail erosion: wispy (inverted worley) near the base, billowy above.
+    float3 hf = DetailNoise.SampleLevel(LinearWrap, sp * detailNoiseScale, 0).rgb;
+    float hfFbm = hf.r * 0.625 + hf.g * 0.25 + hf.b * 0.125;
+    float hfMod = lerp(hfFbm, 1.0 - hfFbm, saturate(h * 10.0));
+    float eroded = saturate(Remap(shaped, hfMod * detailStrength, 1.0, 0.0, 1.0));
+    return eroded * density;
 }
 
-// Cone-trace toward sun: short march sampling density at increasing steps so
-// nearby features dominate but distant features still contribute.
-float SunLightTransmittance(float3 wp)
+// ---------------------------------------------------------------------------
+// Optical depth toward the sun: 5 cone taps over half the layer thickness
+// (full detail for the first two, cheap beyond) plus one long-range tap for
+// shadows cast by distant cloud towers (HZD).
+float SunOpticalDepth(float3 wp)
 {
-    float opticalDepth = 0.0;
-    [unroll] for (int i = 0; i < RM_LIGHT_STEPS; ++i)
+    const float layerThick = max(topAltitude - bottomAltitude, 1.0);
+    const float stepLen    = (layerThick * 0.5) / 5.0;
+
+    float od = 0.0;
+    [unroll] for (int i = 0; i < 5; ++i)
     {
-        // Increasing step length so far samples cover more ground.
-        float stepLen = RM_LIGHT_DIST * (1.0 + float(i) * 0.5);
-        float3 sp = wp + sunDir * stepLen * (float(i) + 0.5);
-        opticalDepth += SampleDensity(sp) * stepLen * extinction;
+        float dist = stepLen * (float(i) + 0.5);
+        float3 sp  = wp + sunDir * dist + kCone[i] * (dist * 0.3);
+        float  hh  = HeightInLayer(sp);
+        if (hh <= 0.0 || hh >= 1.0) continue;
+        float dummy;
+        od += SampleDensity(sp, hh, i >= 2, dummy) * stepLen;
     }
-    return exp(-opticalDepth);
+
+    float3 fp = wp + sunDir * (layerThick * 1.5);
+    float  fh = HeightInLayer(fp);
+    if (fh > 0.0 && fh < 1.0)
+    {
+        float dummy;
+        od += SampleDensity(fp, fh, true, dummy) * (layerThick * 0.5);
+    }
+    return od * extinction;
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +190,7 @@ void main(uint2 dt : SV_DispatchThreadID)
 {
     if (dt.x >= (uint)halfResW || dt.y >= (uint)halfResH) return;
 
-    // Reconstruct world-space ray. UV → NDC → world (via invViewProj).
+    // Reconstruct world-space ray. UV -> NDC -> world (via invViewProj).
     float2 uv  = (float2(dt) + 0.5) / float2(halfResW, halfResH);
     float2 ndc = uv * 2.0 - 1.0;
     ndc.y = -ndc.y;
@@ -136,88 +202,185 @@ void main(uint2 dt : SV_DispatchThreadID)
     float3 rayQ  = farW.xyz  / farW.w;
     float3 rayD  = normalize(rayQ - rayP);
 
-    // Looking down through the bottom of the slab → no cloud (camera below).
-    // Looking up through clouds is also fine.
+    // FARTHEST opaque depth in this texel's 4x4 full-res footprint
+    // (reversed-Z: min raw value; sky 0 is naturally the farthest). Marching
+    // to the farthest surface guarantees a texel straddling a silhouette
+    // holds valid cloud data for its sky pixels — the depth-aware composite
+    // then picks per full-res pixel. A single centre Load made the whole
+    // 4x4 block an all-or-nothing cloud decision (the terrain-outline halo).
+    // Four corner gathers cover the footprint exactly.
+    float sceneNdcZ;
+    {
+        float2 invFull = 1.0 / float2(fullResW, fullResH);
+        float2 b  = float2(dt * 4u);
+        float4 g0 = SceneDepth.GatherRed(LinearClamp, (b + float2(1.0, 1.0)) * invFull);
+        float4 g1 = SceneDepth.GatherRed(LinearClamp, (b + float2(3.0, 1.0)) * invFull);
+        float4 g2 = SceneDepth.GatherRed(LinearClamp, (b + float2(1.0, 3.0)) * invFull);
+        float4 g3 = SceneDepth.GatherRed(LinearClamp, (b + float2(3.0, 3.0)) * invFull);
+        float4 m  = min(min(g0, g1), min(g2, g3));
+        sceneNdcZ = min(min(m.x, m.y), min(m.z, m.w));
+    }
+
+    // Scene distance this texel marches against — written for the composite's
+    // depth-aware weights on EVERY exit path. Reproject (ndc, sceneNdcZ)
+    // through invViewProj: convention-independent (reversed-Z safe) and
+    // already a distance along this pixel's ray.
+    float sceneDist = kCloudSkyDist;
+    if (sceneNdcZ > 0.0)   // reversed-Z: 0 = far clear (sky), >0 = geometry
+    {
+        float4 surfW = mul(float4(ndc, sceneNdcZ, 1.0), invViewProj);
+        sceneDist = length(surfW.xyz / surfW.w - cameraPos);
+    }
+    CloudDistOut[dt] = sceneDist;
+
     float tEntry, tExit;
-    if (!IntersectSlab(cameraPos, rayD, bottomAltitude, topAltitude, tEntry, tExit))
+    if (!ShellInterval(cameraPos, rayD, tEntry, tExit) || tEntry > kHorizonFadeEnd)
     {
         CloudOut[dt] = float4(0, 0, 0, 1);
         return;
     }
 
-    // Clamp ray exit to scene depth — opaque geometry occludes clouds.
-    // Sample the centre of the full-res pixel cluster covered by this output texel.
-    float2 fullUv = (float2(dt) + 0.5) / float2(halfResW, halfResH);
-    int2 dpx = int2(fullUv * float2(fullResW, fullResH));
-    float sceneNdcZ = SceneDepth.Load(int3(dpx, 0));
-    // Reversed-Z: ndcZ=1 → near, 0 → far. Linear distance via the projection.
-    // Use the linearised distance: linDist = nearZ * farZ / (farZ - ndcZ * (farZ - nearZ)).
-    float sceneDist = 1e9;
-    if (sceneNdcZ > 0.0)
-    {
-        // Linear view-space depth (reversed-Z, infinite-far-not-assumed).
-        float linZ = (nearZ * farZ) / (farZ - sceneNdcZ * (farZ - nearZ));
-        // Distance along ray ~= linZ / dot(rayD, cameraForward). Cameraforward
-        // is not available here, but for tight FOV the approximation linZ /
-        // dot(rayD, forward) ≈ linZ for centre rays; for off-axis rays the
-        // approximation under-shoots. Acceptable for an MVP — the clouds get
-        // capped at slightly conservative depths, never bleed through opaque.
-        sceneDist = linZ;
-    }
     tExit = min(tExit, sceneDist);
-    // Hard horizon cap — without this, near-horizontal rays accumulate density
-    // across tens of km and the result is a thick continuous band.
-    tExit = min(tExit, RM_MAX_DIST);
+
+    // Cap the marched distance from the shell entry point (UE mode 0) and
+    // remember whether the cap (not geometry/shell) ended the march so the
+    // tail can be feathered instead of hard-cut.
+    bool clampedByMax = (tEntry + maxTraceDist) < tExit;
+    tExit = min(tExit, tEntry + maxTraceDist);
     if (tExit <= tEntry)
     {
         CloudOut[dt] = float4(0, 0, 0, 1);
         return;
     }
 
-    // March from entry to exit.
-    const float marchLen = tExit - tEntry;
-    const float stepLen  = marchLen / float(RM_STEPS);
-    float3 p             = cameraPos + rayD * tEntry;
+    const float marchLen  = tExit - tEntry;
+    const float stepCount = clamp(maxSteps * saturate(marchLen / kDistToMaxSteps),
+                                  32.0, maxSteps);
+    const float stepFine   = marchLen / stepCount;
+    const float stepCoarse = stepFine * kCoarseMul;
+    const float fadeStart  = tExit - 0.25 * marchLen;   // only applied when clampedByMax
 
-    float cosT      = dot(rayD, sunDir);
-    float phase     = HenyeyGreenstein(cosT, anisotropy);
-    float ambient   = ambientStrength;
-
-    float3 scatter        = 0;
-    float  transmittance  = 1.0;
-
-    [loop] for (int i = 0; i < RM_STEPS; ++i)
+    // Per-octave phase: dual-lobe HG blended fwd/back, plus a silver-lining
+    // lobe combined with max() (Nubis). Eccentricity attenuates by c^n.
+    float cosT = dot(rayD, sunDir);
+    float phaseOct[kMSOctaves];
     {
-        float d = SampleDensity(p);
-
-        // Distance fade — feather density toward the horizon so far clouds
-        // disappear rather than smearing into a solid wall.
-        float rayDist = tEntry + (float(i) + 0.5) * stepLen;
-        float distFade = 1.0 - smoothstep(RM_FADE_BEGIN, RM_MAX_DIST, rayDist);
-        d *= distFade;
-
-        if (d > 0.001)
+        float cN = 1.0;
+        [unroll] for (int n = 0; n < kMSOctaves; ++n)
         {
-            float sigmaT     = d * extinction;       // extinction coefficient
-            float stepT      = exp(-sigmaT * stepLen);
-
-            // Sun-direction transmittance (cone trace) + ambient skylight fill.
-            float sunT       = SunLightTransmittance(p);
-            float3 directL   = sunColor * (sunT * phase);
-            float3 ambientL  = sunColor * ambient * 0.25;
-            float3 L         = (directL + ambientL) * cloudColor;
-
-            // Integrate scattering: in-scatter mass = (1 - stepT) / sigmaT,
-            // weighted by current transmittance. Drop the σ_s factor — folded
-            // into density.
-            float3 integ     = L * (1.0 - stepT);
-            scatter         += transmittance * integ;
-            transmittance   *= stepT;
-
-            if (transmittance < 0.01) { transmittance = 0; break; }
+            float ph = lerp(HenyeyGreenstein(cosT, phaseFwdG * cN),
+                            HenyeyGreenstein(cosT, phaseBackG * cN),
+                            phaseBlend);
+            float silver = silverIntensity
+                         * HenyeyGreenstein(cosT, (0.99 - silverSpread) * cN);
+            phaseOct[n] = max(ph, silver);
+            cN *= kMSPhase;
         }
-        p += rayD * stepLen;
     }
+
+    // Ambient skylight: authored tint scaled by the sun's luminance (tracks
+    // time-of-day) and a bottom-occlusion height gradient (UE: 0.5).
+    const float sunLum = dot(sunColor, float3(0.299, 0.587, 0.114));
+    const float3 ambientBase = ambientTint * (ambientStrength * sunLum);
+
+    // Jittered, adaptive march. Coarse steps sample the conservative base
+    // shape only; a hit backs up one coarse step and switches to fine.
+    // Jitter spans ONE FINE STEP: enough to break banding, small enough that
+    // the dither amplitude stays subtle in world space.
+    float jitter = IGN(float2(dt));
+    float t = tEntry + jitter * stepFine;
+
+    float3 scatter       = 0;
+    float  transmittance = 1.0;
+    bool   fineMode      = false;
+    int    sinceHit      = 0;
+
+    const int maxIter = (int)stepCount * 3;   // coarse/fine mode switches + backups
+    [loop] for (int i = 0; i < maxIter; ++i)
+    {
+        if (t >= tExit) break;
+        float3 p = cameraPos + rayD * t;
+        float  h = HeightInLayer(p);
+
+        if (!fineMode)
+        {
+            float dummy;
+            float dc = SampleDensity(p, h, true, dummy);
+            if (dc > 1e-4)
+            {
+                fineMode = true;
+                sinceHit = 0;
+                t = max(t - stepCoarse, tEntry);   // re-cover the skipped span
+                continue;
+            }
+            t += stepCoarse;
+            continue;
+        }
+
+        float baseShape;
+        float d = SampleDensity(p, h, false, baseShape);
+
+        // Feather the tail when the max-trace cap (not geometry) ends the
+        // march, so distant decks fade instead of slicing off.
+        if (clampedByMax)
+            d *= 1.0 - smoothstep(fadeStart, tExit, t);
+
+        if (d > 1e-4)
+        {
+            sinceHit = 0;
+
+            float od = SunOpticalDepth(p);
+
+            // Nubis in-scatter probability -- replaces the 2015 powder term.
+            // depth: how much material surrounds the sample (base shape as
+            // the low-mip proxy); vertical: bases are dark, nothing scatters
+            // up from below.
+            float depthProb = 0.05 + pow(saturate(baseShape),
+                                         clamp(Remap(h, 0.3, 0.85, 0.5, 2.0), 0.5, 2.0));
+            float vertProb  = pow(clamp(Remap(h, 0.07, 0.14, 0.1, 1.0), 0.1, 1.0), 0.8);
+            float inscatter = depthProb * vertProb;
+
+            float3 ambientL = ambientBase * saturate(0.5 + h);
+
+            // Frostbite energy-conserving integration, one term per
+            // multi-scatter octave; only octave 0 advances view transmittance.
+            float sigmaT = max(d * extinction, 1e-7);
+            float aN = 1.0, bN = 1.0;
+            float stepTr0 = 1.0;
+            [unroll] for (int n = 0; n < kMSOctaves; ++n)
+            {
+                float sigmaS_n = sigmaT * aN;            // albedo ~ 1 (water)
+                float sigmaT_n = max(sigmaT * bN, 1e-7);
+                float trN = exp(-sigmaT_n * stepFine);
+                float tlN = exp(-od * bN);
+
+                float3 L = sunColor * (tlN * phaseOct[n] * inscatter);
+                if (n == 0) L += ambientL;
+                L *= cloudColor;
+
+                float3 Lscat = L * sigmaS_n;
+                scatter += transmittance * (Lscat - Lscat * trN) / sigmaT_n;
+                if (n == 0) stepTr0 = trN;
+
+                aN *= kMSScatter;
+                bN *= kMSExtinct;
+            }
+            transmittance *= stepTr0;
+
+            if (transmittance < 0.005) break;
+        }
+        else if (++sinceHit >= kEmptyToCoarse)
+        {
+            fineMode = false;
+        }
+        t += stepFine;
+    }
+
+    // Horizon fade -- entry distance, not sample distance, so a whole distant
+    // deck fades as one.
+    float horizonFade = 1.0 - smoothstep(kHorizonFadeStart, kHorizonFadeEnd, tEntry);
+    scatter       *= horizonFade;
+    transmittance  = lerp(1.0, transmittance, horizonFade);
 
     CloudOut[dt] = float4(scatter, transmittance);
 }

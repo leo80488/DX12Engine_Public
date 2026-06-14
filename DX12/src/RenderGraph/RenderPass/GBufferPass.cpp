@@ -165,7 +165,7 @@ PSODesc GBufferPass::BuildPSODesc(PermutationKey perm, uint32_t customPSID) cons
     desc.rtvFormats[4] = RHI::Format::R16G16B16A16_FLOAT;     // extra (shading-model scratch: SSS thickness, clearcoat, …)
     desc.rtvFormats[5] = RHI::Format::R16G16B16A16_FLOAT;     // HdrSceneColor (Unreal-style direct emissive write)
     desc.rtvCount      = 6;
-    desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
     return desc;
 }
 

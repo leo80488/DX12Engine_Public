@@ -97,7 +97,11 @@ public:
     }
 
     // ===== ECS connection =====
-    void SetWorld(World* world)                  { m_world = world; }
+    // Out-of-line: (re)binds an entity-destroy listener that clears a stale
+    // selection/highlight when the selected entity is destroyed at runtime
+    // (e.g. by a Lua script or LifetimeSystem). Called every frame by App, so it
+    // no-ops unless the World pointer actually changes.
+    void SetWorld(World* world);
     void SetRenderView(const RenderView& view)   { m_renderView = view; }
 
     // ===== Viewport state (driven by App each frame) =====
@@ -141,6 +145,16 @@ public:
     // Read by App to push the editor's selection into Renderer::SetPickingOutlineEntity
     // for the picking-highlight overlay.
     Entity GetSelectedEntity() const { return m_selectedEntity; }
+
+    // Editor-only chain-physics (KawaiiPhysics-style) authoring overlay. Two
+    // phases because DebugWirePass::Clear() is gated by the pass's `enabled`
+    // flag inside BeginFrame, while the lines must be pushed afterwards:
+    //   PrepareChainPhysicsOverlay  -> BEFORE BeginFrame: force the wire pass on
+    //       so Clear() runs and the ring slot accepts this frame's lines.
+    //   EmitChainPhysicsOverlay     -> AFTER BeginFrame (debug-submit window):
+    //       push root / simulated-chain / excluded-bone wire geometry.
+    void PrepareChainPhysicsOverlay(Renderer& renderer, World& world);
+    void EmitChainPhysicsOverlay(Renderer& renderer, World& world);
 
     // ===== Component editor registration =====
     // drawFn receives (live component ptr, world, selected entity).
@@ -308,6 +322,20 @@ private:
     // OnUIRender sync detects the change and re-aligns the two.
     Entity  m_hierarchyHighlight     = NullEntity;
     Entity  m_lastSeenSelectedEntity = NullEntity;
+    // World entity-destroy listener handle (0 = unbound). Clears the selection/
+    // highlight above when their entity is destroyed so a recycled ID can't be
+    // silently re-selected. Bound in SetWorld, removed in SetWorld/~EditorLayer.
+    uint32_t m_entityDestroyListener = 0;
+
+    // Chain-physics (KawaiiPhysics-style) authoring: draw the selected entity's
+    // authored chains in the viewport. Toggled from the Chain Physics inspector;
+    // consumed each frame by EmitChainPhysicsOverlay().
+    bool    m_chainOverlayEnabled    = true;
+    // Index of the chain group whose inspector node is currently expanded; that
+    // group is drawn in a vivid highlight colour (others dimmed) so the designer
+    // can tell which chain they are editing. -1 = none expanded. Written by the
+    // inspector postDraw, read one frame later by EmitChainPhysicsOverlay.
+    int     m_chainHighlightGroup    = -1;
     std::unordered_map<std::type_index, ComponentEditorEntry> m_componentEditors;
     std::unordered_map<std::type_index, std::string>          m_componentLabels;
 
@@ -448,6 +476,9 @@ private:
     // Path of the currently-bound post-process config (.ippc). Updated by
     // Save/Load buttons + LoadScene; passed back into SaveScene.
     std::string m_postProcessConfigPath;
+    // Path of the engine-default post-process profile (.ppprofile) — the base
+    // look. Stamped into the .ippc on Save Config so a scene restores its look.
+    std::string m_engineProfilePath;
 
     // Load Scene is requested from inside the MainMenuBar (mid ImGui frame).
     // Running the tear-down inline frees descriptor heap slots that earlier

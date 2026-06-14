@@ -131,24 +131,21 @@ namespace Resource
                       path.c_str(), meshCount, vertexCount, indexCount);
             return Handle{};
         }
-        // Two layouts supported:
-        //   32B legacy (pos+nrm+uv only)        — older imports
-        //   48B with tangent (+ float4 at +32)  — set MESHLIB_FLAG_HAS_TANGENT
-        // The flag bit must agree with the stride; mismatch indicates a
-        // corrupted / mid-version asset and we refuse to load.
+        // Vertex layout is fully described by meta->flags via the shared
+        // ComputeMeshLibVertexLayout() helper (pos+nrm+uv0 base 32B, plus
+        // optional tangent/uv1/color appended in that order). The on-disk
+        // stride MUST equal the flag-derived stride; a mismatch means a
+        // corrupted or mid-version asset and we refuse to load. This accepts
+        // legacy 32B (flags 0) and 48B (HAS_TANGENT) exactly as before, plus
+        // the new uv1/color variants.
         const bool flagHasTangent = (meta->flags & MESHLIB_FLAG_HAS_TANGENT) != 0u;
-        const bool strideHasTangent = (vStride == 48u);
-        if (vStride != 32u && vStride != 48u)
+        const uint32_t expectedStride =
+            ComputeMeshLibVertexLayout(meta->flags).stride;
+        if (vStride != expectedStride)
         {
-            LOG_ERROR("MeshLibrary::Load: '%s' vertexStride=%u (only 32 or 48 supported)",
-                      path.c_str(), vStride);
-            return Handle{};
-        }
-        if (flagHasTangent != strideHasTangent)
-        {
-            LOG_ERROR("MeshLibrary::Load: '%s' inconsistent layout — flags.hasTangent=%d, "
-                      "stride=%u (expected 48 if flag set, 32 otherwise)",
-                      path.c_str(), int(flagHasTangent), vStride);
+            LOG_ERROR("MeshLibrary::Load: '%s' inconsistent layout — vertexStride=%u "
+                      "but flags=0x%X imply stride=%u",
+                      path.c_str(), vStride, meta->flags, expectedStride);
             return Handle{};
         }
         if (iStride != 4)
@@ -259,6 +256,7 @@ namespace Resource
         slot.indexCountTotal  = indexCount;
         slot.vertexStride     = vStride;
         slot.hasTangent       = flagHasTangent;
+        slot.flags            = meta->flags;
         slot.alive            = true;
         slot.refCount         = 1;
         slot.pathHash         = pathHash;
@@ -341,6 +339,13 @@ namespace Resource
         std::lock_guard<std::mutex> lock(m_mutex);
         const Slot* s = GetSlot(libHandle);
         return s ? s->hasTangent : false;
+    }
+
+    uint32_t MeshLibrary::GetMeshLibFlags(Handle libHandle) const
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const Slot* s = GetSlot(libHandle);
+        return s ? s->flags : 0u;
     }
 
     // -------------------------------------------------------------------------

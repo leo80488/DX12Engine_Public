@@ -67,8 +67,10 @@ public:
     // and ShadowPass.cpp::Execute for the terrain-only render path.
     static constexpr int      kCascadeCount  = 4;
     static constexpr int      kFarCascadeIdx = kCascadeCount - 1;
-    //static constexpr uint32_t kShadowMapSize = 2048;
-    static constexpr uint32_t kShadowMapSize = 4096;
+    // CSM atlas resolution per cascade. 2048 => 4096*4cascades*4B = 64 MB.
+    // (Was 4096 = 256 MB; reverted — near-cascade fill + VRAM not justified.
+    //  Receiver biases are resolution-adaptive so this is a safe knob.)
+    static constexpr uint32_t kShadowMapSize = 2048;
 
     // Wire the ShadowSystem that supplies per-cascade lightVP matrices.
     // Must be called once after Init(), before Execute().

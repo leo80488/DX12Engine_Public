@@ -26,8 +26,11 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+using TerrainLayerGPU = RendererDetail::TerrainLayerGPU;
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainLayerGPU) == 48,
+    "TerrainLayerGPU stride drift — sync StructuredBuffer<TerrainLayerGPU> in Terrain.ps.hlsl");
 
 // Renderer_Terrain.cpp — split out of Renderer.cpp (one TU per Renderer subsystem).
 // All members belong to class Renderer (declared in Graphics/Renderer.h).
@@ -68,10 +71,9 @@ void Renderer::BuildScene_SyncTerrain(World& world)
     // Texture sync helper: acquire/release/promote, writes SRV + optional bindless idx.
     uint64_t heightmapSRV = 0;
     uint64_t splatmapSRV  = 0;
-    int32_t  layerAlbedoIdx[4] = { -1, -1, -1, -1 };
-    int32_t  layerNormalIdx[4] = { -1, -1, -1, -1 };
-    int32_t  layerARMIdx   [4] = { -1, -1, -1, -1 };
-    int32_t  layerDispIdx  [4] = { -1, -1, -1, -1 };
+    // Per-layer bindless indices are written straight onto each layer's mutable
+    // fields below (l.albedoBindlessIdx / normalBindlessIdx / armBindlessIdx)
+    // and read back when packing the TerrainLayerGPU StructuredBuffer.
 
     if (m_texSys && m_resMgr)
     {
@@ -152,10 +154,25 @@ void Renderer::BuildScene_SyncTerrain(World& world)
                         }
                     }
 
+                    // Actual data range — drives the height-range re-anchoring
+                    // below so heightScale edits don't translate the tile.
+                    {
+                        uint16_t mn = 0xFFFF, mx = 0;
+                        for (uint16_t s : hf->samples)
+                        {
+                            mn = std::min(mn, s);
+                            mx = std::max(mx, s);
+                        }
+                        constexpr float kInv65535 = 1.0f / 65535.0f;
+                        hf->dataMin01 = static_cast<float>(mn) * kInv65535;
+                        hf->dataMax01 = static_cast<float>(mx) * kInv65535;
+                    }
+
                     hf->baseY       = activeTC->worldCenter.y;
                     hf->heightScale = activeTC->heightScale;
-                    LOG_INFO("Terrain: HeightField populated (%ux%u, baseY=%.1f, scale=%.1f)",
-                             hf->width, hf->height, hf->baseY, hf->heightScale);
+                    LOG_INFO("Terrain: HeightField populated (%ux%u, baseY=%.1f, scale=%.1f, data range [%.3f, %.3f])",
+                             hf->width, hf->height, hf->baseY, hf->heightScale,
+                             hf->dataMin01, hf->dataMax01);
                     activeTC->heightField = std::move(hf);
                 }
                 else
@@ -166,50 +183,111 @@ void Renderer::BuildScene_SyncTerrain(World& world)
                 }
             }
         }
-        // Sync world-Y every frame so live edits flow to collision without re-decoding.
-        if (activeTC->heightField)
-        {
-            activeTC->heightField->baseY       = activeTC->worldCenter.y;
-            activeTC->heightField->heightScale = activeTC->heightScale;
-        }
+        // (CPU HeightField world-Y mapping is synced below, after the
+        //  height-range re-anchoring computes the effective pair.)
 
         // Splatmap (root[11] descriptor table).
         syncSlot(activeTC->splatmapPath, cache.splatmap, nullptr, &splatmapSRV);
         activeTC->splatmapHandle = cache.splatmap.handle;
         activeTC->splatmapSRV    = splatmapSRV;
 
-        // 4 layers × 4 bindless maps (albedo, normal, ARM, disp).
-        for (int li = 0; li < 4; ++li)
+        // Variable-count layers × 4 bindless maps (albedo, normal, ARM, disp).
+        // Keep the per-entity texture cache sized to the layer list; release
+        // the slots of any layers that were removed in the editor before
+        // shrinking so their TextureHandles don't leak until OnWorldClear.
+        const size_t nLayers = activeTC->layers.size();
+        if (cache.layers.size() > nLayers)
+        {
+            for (size_t li = nLayers; li < cache.layers.size(); ++li)
+            {
+                auto relSlot = [&](TerrainTexSlot& s) {
+                    if (s.handle != Resource::kInvalidTextureHandle)
+                        m_texSys->Release(s.handle, m_gfx);
+                };
+                relSlot(cache.layers[li].albedo);
+                relSlot(cache.layers[li].normal);
+                relSlot(cache.layers[li].arm);
+                relSlot(cache.layers[li].disp);
+            }
+        }
+        cache.layers.resize(nLayers);
+
+        for (size_t li = 0; li < nLayers; ++li)
         {
             auto& l    = activeTC->layers[li];
             auto& slot = cache.layers[li];
-            syncSlot(l.albedoPath, slot.albedo, &layerAlbedoIdx[li], nullptr);
-            syncSlot(l.normalPath, slot.normal, &layerNormalIdx[li], nullptr);
-            syncSlot(l.armPath,    slot.arm,    &layerARMIdx[li],    nullptr);
-            syncSlot(l.dispPath,   slot.disp,   &layerDispIdx[li],   nullptr);
+            // Write bindless indices straight onto the layer's mutable fields;
+            // syncSlot leaves them untouched while a texture is still loading,
+            // so a resolved index persists across frames.
+            syncSlot(l.albedoPath, slot.albedo, &l.albedoBindlessIdx, nullptr);
+            syncSlot(l.normalPath, slot.normal, &l.normalBindlessIdx, nullptr);
+            syncSlot(l.armPath,    slot.arm,    &l.armBindlessIdx,    nullptr);
+            syncSlot(l.dispPath,   slot.disp,   &l.dispBindlessIdx,   nullptr);
 
-            l.albedoHandle      = slot.albedo.handle;
-            l.normalHandle      = slot.normal.handle;
-            l.armHandle         = slot.arm.handle;
-            l.dispHandle        = slot.disp.handle;
-            l.albedoBindlessIdx = layerAlbedoIdx[li];
-            l.normalBindlessIdx = layerNormalIdx[li];
-            l.armBindlessIdx    = layerARMIdx[li];
-            l.dispBindlessIdx   = layerDispIdx[li];
+            l.albedoHandle = slot.albedo.handle;
+            l.normalHandle = slot.normal.handle;
+            l.armHandle    = slot.arm.handle;
+            l.dispHandle   = slot.disp.handle;
         }
 
         // First-resident-per-layer debug print to disambiguate load-failure vs shader bug.
-        static int s_lastLoggedAlbedoIdx[4] = { -2, -2, -2, -2 };
-        for (int li = 0; li < 4; ++li)
+        static int s_lastLoggedAlbedoIdx[Renderer::kMaxTerrainLayers] = {};
+        static bool s_loggedInit = false;
+        if (!s_loggedInit) { for (auto& v : s_lastLoggedAlbedoIdx) v = -2; s_loggedInit = true; }
+        for (size_t li = 0; li < std::min<size_t>(nLayers, Renderer::kMaxTerrainLayers); ++li)
         {
-            const int32_t cur = layerAlbedoIdx[li];
+            const int32_t cur = activeTC->layers[li].albedoBindlessIdx;
             if (cur != s_lastLoggedAlbedoIdx[li])
             {
-                LOG_INFO("Terrain layer[%d] albedo bindlessIdx=%d (path='%s')",
-                         li, cur,
-                         activeTC->layers[li].albedoPath.c_str());
+                LOG_INFO("Terrain layer[%zu] albedo bindlessIdx=%d (path='%s')",
+                         li, cur, activeTC->layers[li].albedoPath.c_str());
                 s_lastLoggedAlbedoIdx[li] = cur;
             }
+        }
+    }
+
+    // ---- Height-range re-anchoring ------------------------------------------
+    // Heightmaps rarely use the full [0,1] encodable range (this project's
+    // HeightMap sits in ~[0.29, 0.48]). With the raw mapping
+    //   Y = worldCenter.y + h * heightScale
+    // the lowest valley sits at worldCenter.y + dataMin * heightScale, so a
+    // heightScale edit TRANSLATES the whole tile vertically. Re-anchor so:
+    //   valley floor (dataMin) → worldCenter.y           (pinned, scale-invariant)
+    //   highest peak (dataMax) → worldCenter.y + heightScale
+    // i.e. heightScale becomes the TRUE total relief. Implemented purely by
+    // feeding adjusted (baseY, scale) into every consumer — shaders unchanged:
+    //   effScale = heightScale / (dataMax - dataMin)
+    //   effBase  = worldCenter.y - dataMin * effScale
+    // Falls back to the raw mapping until the CPU HeightField is decoded
+    // (R16_UNORM only) — a one-time settle at load. Note the range is global
+    // to the heightmap; tiles sampling a sub-rect via heightmapUVScale pin
+    // against the whole map's minimum (conservative).
+    {
+        float effBaseY  = activeTC->worldCenter.y;
+        float effScale  = activeTC->heightScale;
+        if (const auto& hf = activeTC->heightField; hf && hf->IsValid())
+        {
+            const float range = hf->dataMax01 - hf->dataMin01;
+            if (range > 1e-5f)
+            {
+                effScale = activeTC->heightScale / range;
+                effBaseY = activeTC->worldCenter.y - hf->dataMin01 * effScale;
+            }
+            else
+            {
+                effScale = 0.0f;   // flat data → flat tile at the pivot
+                effBaseY = activeTC->worldCenter.y;
+            }
+        }
+        activeTC->effBaseY       = effBaseY;
+        activeTC->effHeightScale = effScale;
+
+        // Keep CPU collision on the SAME re-anchored surface (live edits flow
+        // every frame without re-decoding).
+        if (activeTC->heightField)
+        {
+            activeTC->heightField->baseY       = effBaseY;
+            activeTC->heightField->heightScale = effScale;
         }
     }
 
@@ -220,8 +298,8 @@ void Renderer::BuildScene_SyncTerrain(World& world)
         cb.worldOriginX       = activeTC->worldCenter.x - halfSize;
         cb.worldOriginY       = activeTC->worldCenter.z - halfSize;  // .y is world Z
         cb.worldSize          = activeTC->worldSize;
-        cb.heightScale        = activeTC->heightScale;
-        cb.worldCenterY       = activeTC->worldCenter.y;
+        cb.heightScale        = activeTC->effHeightScale;
+        cb.worldCenterY       = activeTC->effBaseY;
         cb.heightmapUVOffsetX = activeTC->heightmapUVOffset.x;
         cb.heightmapUVOffsetY = activeTC->heightmapUVOffset.y;
         cb.heightmapUVScaleX  = activeTC->heightmapUVScale.x;
@@ -240,21 +318,17 @@ void Renderer::BuildScene_SyncTerrain(World& world)
         cb.hasHeightmap   = (heightmapSRV != 0) ? 1u : 0u;
         cb.hasSplatmap    = (splatmapSRV  != 0) ? 1u : 0u;
 
-        for (int li = 0; li < 4; ++li)
-        {
-            const auto& l            = activeTC->layers[li];
-            cb.layerBindlessIdx[li]  = layerAlbedoIdx[li];
-            cb.layerTilingScale[li]  = l.tilingScale;
-            cb.layerNormalIdx[li]    = layerNormalIdx[li];
-            cb.layerARMIdx[li]       = layerARMIdx[li];
-            cb.layerDispIdx[li]      = layerDispIdx[li];
-            cb.layerMinHeight   [li] = l.minHeight;
-            cb.layerMaxHeight   [li] = l.maxHeight;
-            cb.layerFadeHeight  [li] = (l.fadeHeight   > 1e-3f) ? l.fadeHeight   : 1e-3f;
-            cb.layerMinSlopeDeg [li] = l.minSlopeDeg;
-            cb.layerMaxSlopeDeg [li] = l.maxSlopeDeg;
-            cb.layerFadeSlopeDeg[li] = (l.fadeSlopeDeg > 1e-3f) ? l.fadeSlopeDeg : 1e-3f;
-        }
+        // Per-layer material data lives in the StructuredBuffer (packed below);
+        // the CB only carries the count the PS loops over.
+        cb.layerCount = std::min<uint32_t>(
+            static_cast<uint32_t>(activeTC->layers.size()), Renderer::kMaxTerrainLayers);
+
+        // Height-correlated blend (per-layer disp). Off by default → plain
+        // linear blend, so existing terrains are pixel-identical until opted in.
+        cb.heightBlendEnable   = activeTC->heightBlendEnabled ? 1u : 0u;
+        cb.heightBlendStrength = activeTC->heightBlendStrength;
+        cb.heightBlendRange    = (activeTC->heightBlendRange > 1e-4f)
+                               ? activeTC->heightBlendRange : 1e-4f;
 
         cb.tilesPerSide       = activeTC->tilesPerSide ? activeTC->tilesPerSide : 1u;
         cb.enableFrustumCull  = 1u;     // colour pass uses camera frustum
@@ -273,10 +347,44 @@ void Renderer::BuildScene_SyncTerrain(World& world)
             std::memcpy(dst, &cb, sizeof(cb));
     }
 
+    // ---- Upload the per-layer material table (StructuredBuffer<TerrainLayerGPU>).
+    // One element per layer; the terrain PS loops over cb.layerCount. Bindless
+    // indices come from each layer's mutable fields synced above (-1 = not yet
+    // GPU-resident → PS skips that map). fadeHeight/fadeSlope are clamped > 0
+    // to keep the smoothstep falloff well-defined.
+    const uint32_t frameSlot      = m_gfx.GetFrameIndex();
+    uint64_t       layerBufferSRV = (frameSlot < kFrameSlots) ? m_terrainLayerSrv[frameSlot] : 0;
+    if (frameSlot < kFrameSlots)
+    {
+        const uint32_t layerCount = std::min<uint32_t>(
+            static_cast<uint32_t>(activeTC->layers.size()), kMaxTerrainLayers);
+        if (auto* dst = static_cast<TerrainLayerGPU*>(m_terrainLayerMapped[frameSlot]))
+        {
+            for (uint32_t li = 0; li < layerCount; ++li)
+            {
+                const auto& l = activeTC->layers[li];
+                TerrainLayerGPU g{};
+                g.albedoIdx    = l.albedoBindlessIdx;
+                g.normalIdx    = l.normalBindlessIdx;
+                g.armIdx       = l.armBindlessIdx;
+                g.tilingScale  = l.tilingScale;
+                g.minHeight    = l.minHeight;
+                g.maxHeight    = l.maxHeight;
+                g.fadeHeight   = (l.fadeHeight   > 1e-3f) ? l.fadeHeight   : 1e-3f;
+                g.minSlopeDeg  = l.minSlopeDeg;
+                g.maxSlopeDeg  = l.maxSlopeDeg;
+                g.fadeSlopeDeg = (l.fadeSlopeDeg > 1e-3f) ? l.fadeSlopeDeg : 1e-3f;
+                g.dispIdx      = l.dispBindlessIdx;
+                dst[li] = g;
+            }
+        }
+    }
+
     // Arm the pass; pass self-skips without heightmapSRV. Splatmap optional (PS slope-debug fallback).
     TerrainPass::TileBindings tb;
     tb.heightmapSRV      = heightmapSRV;
     tb.splatmapSRV       = splatmapSRV;
+    tb.layerBufferSRV    = layerBufferSRV;
     // 1 AS group per 32 sub-tiles → tilesPerSide² / 32 dispatches; AS culls + DispatchMesh's survivors.
     {
         constexpr uint32_t kASGroupSize = 32;   // must match Terrain.as.hlsl

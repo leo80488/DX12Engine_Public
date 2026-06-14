@@ -27,6 +27,7 @@ namespace Resource
     constexpr uint32_t MAGIC_WORLD      = 'RWLD'; // 0x52574C44
     constexpr uint32_t MAGIC_MESHLIB    = 'RMLB'; // 0x524D4C42 — new mesh library (P1-P6 rewrite)
     constexpr uint32_t MAGIC_AUDIO      = 'RACL'; // 0x5241434C — .aclip audio sample
+    constexpr uint32_t MAGIC_PPPROFILE  = 'RPPP'; // 0x52505050 — .ppprofile post-process profile
 
     constexpr uint16_t ASSET_VERSION = 1;
 
@@ -100,6 +101,15 @@ namespace Resource
 
     // Payload: raw key=value text of the .mat source file (null-terminated).
     struct MaterialMetadata
+    {
+        uint32_t textLength;     // byte count of the text payload (excluding null terminator)
+        uint32_t reserved[3];
+    };
+
+    // .ppprofile — post-process profile asset (shared look referenced by volumes).
+    // Payload: line-based "group_member=value" text (null-terminated). Only
+    // overridden properties are written; presence of a key encodes overrideState.
+    struct PostProcessProfileMetadata
     {
         uint32_t textLength;     // byte count of the text payload (excluding null terminator)
         uint32_t reserved[3];
@@ -189,11 +199,20 @@ namespace Resource
     // its own vertex/index range into the shared pools, its own AABB, and an
     // optional default material index (into the scene's material registry).
     // ----- MeshLibraryMetadata::flags bits ------------------------------------
-    // bit 0: vertices include float4 tangent at byte offset 32 (xyz = tangent
-    //        direction, w = bitangent handedness sign ±1). When set,
-    //        vertexStride == 48 (12 pos + 12 normal + 8 uv + 16 tangent).
-    //        When clear, vertexStride == 32 (legacy: pos + normal + uv only).
+    // The interleaved vertex layout is fully determined by these flags via
+    // ComputeMeshLibVertexLayout() below. pos(12)+normal(12)+uv0(8) are always
+    // present (base stride 32); tangent / uv1 / color are appended in THAT
+    // order when their bit is set. Importer (writer) and MeshManager (reader)
+    // MUST derive offsets/stride from the same helper.
+    //
+    // bit 0: float4 tangent (16B) — xyz = tangent dir, w = bitangent handedness
+    //        sign ±1. (flags=HAS_TANGENT → stride 48, matches the legacy
+    //        with-tangent format; flags=0 → stride 32, legacy no-tangent.)
+    // bit 1: float2 uv1 (8B)      — second UV set (lightmap / detail / blend).
+    // bit 2: R8G8B8A8 color (4B)  — packed per-vertex color (RGBA, 0..255).
     constexpr uint32_t MESHLIB_FLAG_HAS_TANGENT = 1u << 0;
+    constexpr uint32_t MESHLIB_FLAG_HAS_UV1     = 1u << 1;
+    constexpr uint32_t MESHLIB_FLAG_HAS_COLOR   = 1u << 2;
 
     struct MeshLibraryMetadata
     {
@@ -278,6 +297,55 @@ namespace Resource
     };
     static_assert(sizeof(MeshLibraryEntry) == 48, "MeshLibraryEntry must be 48 bytes");
 #pragma pack(pop)
+
+    // -------------------------------------------------------------------------
+    // Interleaved .meshlib vertex layout — the single source of truth for both
+    // the importer (which packs the VB) and MeshManager (which builds the
+    // MeshDescriptor stream offsets). Offsets are derived purely from the
+    // MeshLibraryMetadata::flags bits so old assets (flags 0 → 32B, HAS_TANGENT
+    // → 48B) keep their exact byte layout while new attributes append cleanly.
+    //   pos(12) + normal(12) + uv0(8)  always present  (base 32B)
+    //   + tangent(16) if HAS_TANGENT
+    //   + uv1(8)      if HAS_UV1
+    //   + color(4)    if HAS_COLOR     (R8G8B8A8 packed)
+    // Every field is a multiple of 4 bytes, so all offsets stay 4-byte aligned
+    // (required by ByteAddressBuffer Load/Load2/Load4 in the PVF fetch path).
+    // -------------------------------------------------------------------------
+    struct MeshLibVertexLayout
+    {
+        uint32_t stride        = 0;
+        uint32_t posOffset     = 0;
+        uint32_t normalOffset  = 0;
+        uint32_t uv0Offset     = 0;
+        uint32_t tangentOffset = 0xFFFFFFFFu;  // 0xFFFFFFFF when the stream is absent
+        uint32_t uv1Offset     = 0xFFFFFFFFu;
+        uint32_t colorOffset   = 0xFFFFFFFFu;
+    };
+
+    inline MeshLibVertexLayout ComputeMeshLibVertexLayout(uint32_t flags)
+    {
+        MeshLibVertexLayout L;
+        uint32_t off = 0;
+        L.posOffset    = off; off += 12;
+        L.normalOffset = off; off += 12;
+        L.uv0Offset    = off; off += 8;
+        if (flags & MESHLIB_FLAG_HAS_TANGENT) { L.tangentOffset = off; off += 16; }
+        if (flags & MESHLIB_FLAG_HAS_UV1)     { L.uv1Offset     = off; off += 8;  }
+        if (flags & MESHLIB_FLAG_HAS_COLOR)   { L.colorOffset   = off; off += 4;  }
+        L.stride = off;
+        return L;
+    }
+
+    // Pack a float RGBA color (0..1) into R8G8B8A8 (byte 0 = R … byte 3 = A),
+    // matching HLSL FetchR8G8B8A8 in pvf_fetch.hlsli.
+    inline uint32_t PackColorRGBA8(float r, float g, float b, float a)
+    {
+        auto q = [](float v) -> uint32_t {
+            float c = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+            return static_cast<uint32_t>(c * 255.f + 0.5f);
+        };
+        return (q(r)) | (q(g) << 8) | (q(b) << 16) | (q(a) << 24);
+    }
 
     // -------------------------------------------------------------------------
     // Accessor helpers — no copies, pure pointer arithmetic.

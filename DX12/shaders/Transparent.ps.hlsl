@@ -221,24 +221,30 @@ float4 main(PSIn i) : SV_TARGET
                                                  probe.boxMin, probe.boxMax);
             float4 sample4 = gReflectionProbeArray.SampleLevel(gIBLSampler,
                                  float4(Rcorr, (float)probe.cubemapSlice), mip);
-            probeAccum  += sample4.rgb * w;
+            // Per-probe intensity scales radiance, not the coverage weight.
+            probeAccum  += sample4.rgb * w * probe.intensity;
             probeWeight += w;
         }
-        float3 skySpecular = gRadiance.SampleLevel(gIBLSampler, R, mip).rgb;
-        float3 iblSpecular = probeAccum + skySpecular * (1.0 - probeWeight);
+        // Probe specular (probeAccum) is INDEPENDENT of iblStrength so local
+        // probes light glass even when the sky master gate is 0; only the sky
+        // specular fallback carries iblStrength (matches Lighting.ps.hlsl).
+        float3 skySpecular  = gRadiance.SampleLevel(gIBLSampler, R, mip).rgb;
+        // Square the sky-fill so probe-covered glass suppresses the bright sky
+        // reflection more (matches Lighting.ps).
+        float  skyFill      = saturate(1.0 - probeWeight);
+        float3 specRadiance = probeAccum + skySpecular * (skyFill * skyFill) * iblStrength;
 
         float3 Fibl    = FresnelSchlickRoughness(NdotV, F0, roughness);
         float2 envBRDF = gBRDFLUT.Sample(gIBLSampler, float2(NdotV, roughness));
-        float3 specIBL = iblSpecular * (Fibl * envBRDF.x + envBRDF.y);
+        float3 specIBL = specRadiance * (Fibl * envBRDF.x + envBRDF.y);
         float3 kDibl   = (1.0 - Fibl) * (1.0 - metalness);
         float3 diffIBL = kDibl * baseColor.rgb * iblDiffuse;
 
-        // iblStrength is the single master scale on indirect lighting
-        // (Unreal-style): gates both diffuse and specular IBL uniformly.
-        // skyIBLDiffuseScale stays as a per-source diffuse weight composed
-        // before the master scale (matches Lighting.ps.hlsl).
+        // Diffuse keeps the iblStrength master gate (sky-derived). Specular
+        // already applied iblStrength to its sky portion above; probes are
+        // independent. AO occludes all indirect terms.
         iblDiffuseTerm  = diffIBL * ao * skyIBLDiffuseScale * iblStrength;
-        iblSpecularTerm = specIBL * ao * iblStrength;
+        iblSpecularTerm = specIBL * ao;
     }
 
     // Emissive — sits with surface terms (it is *emitted* by the surface, not

@@ -176,7 +176,7 @@ void ParticleRenderPass::Init(IGraphicsDevice& gfx)
     d.pt            = RHI::PrimitiveTopology::TRIANGLESTRIP;
     d.rtv_formats[0]= RHI::Format::R16G16B16A16_FLOAT;
     d.rtv_count     = 1;
-    d.dsv_format    = RHI::Format::D24_UNORM_S8_UINT;
+    d.dsv_format    = RHI::Format::D32_FLOAT_S8X24_UINT;
     d.sample_count  = 1;
 
     if (!gfx.CreatePipelineState(d, m_pso))

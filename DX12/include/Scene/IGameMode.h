@@ -22,6 +22,7 @@
 class IGraphicsDevice;
 class Renderer;
 class IGameMode;
+class SceneManager;
 namespace Resource
 {
     class ResourceManager;
@@ -73,6 +74,12 @@ struct GameModeContext
     // Nav::IsReady() false and all AI path-following silently dies (enemies
     // load with full components but never move).
     Nav::NavMeshSystem*        navSys      = nullptr;
+
+    // Data-driven scene registry + loader (owned by App). DataScene::Init uses
+    // it to load .iscene content + activate the scene's Lua scene script; Lua's
+    // Scene.Load() routes through it to switch scenes by name. null until App
+    // wires it up.
+    SceneManager*              sceneManager = nullptr;
 
     // Mode transition request — call from inside an IGameMode::Update to
     // replace the current mode with a new one. App processes the request

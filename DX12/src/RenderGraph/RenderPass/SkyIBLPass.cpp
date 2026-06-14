@@ -458,7 +458,10 @@ void SkyIBLPass::DispatchAerialPerspective(RHI::CommandList cl)
         c.sunColor[0] = m_atmosphereSunColor.x;
         c.sunColor[1] = m_atmosphereSunColor.y;
         c.sunColor[2] = m_atmosphereSunColor.z;
-        c.cameraAltitudeKm = 0.5f;
+        // Real camera altitude (world Y is metres) — the old hardcoded 0.5 km
+        // computed haze for a 500 m viewpoint regardless of where the camera
+        // actually was.
+        c.cameraAltitudeKm = std::max(m_cameraPosWorld.y, 0.0f) * 0.001f;
         c.maxDistKm = kAerialMaxKm;
         for (int i = 0; i < 16; ++i) c.invViewProj[i] = m_invViewProj[i];
         c.cameraPosWorld[0] = m_cameraPosWorld.x;
@@ -638,13 +641,6 @@ RHI::CommandList SkyIBLPass::Execute(RHI::CommandList cl)
             pEnd(r);
         }
 
-        if (m_aerialCompositeEnabled)
-        {
-            uint32_t r = pBegin("SkyIBL.AerialPerspective");
-            DispatchAerialPerspective(cl);
-            pEnd(r);
-        }
-
         {
             uint32_t r = pBegin("SkyIBL.AtmosphereCube");
             DispatchAtmosphere(cl);
@@ -662,6 +658,19 @@ RHI::CommandList SkyIBLPass::Execute(RHI::CommandList cl)
         BakeStaticLUTs(cl);
         if (m_framesSinceCubeUpdate != 0xFFFFFFFFu)
             m_framesSinceCubeUpdate++;
+    }
+
+    // ---- Aerial Perspective: EVERY frame while enabled ----------------------
+    // The AP LUT bakes per-voxel view rays from InvViewProj, so it depends on
+    // the CAMERA, not just the sun — leaving it inside the sun-dirty gate
+    // above froze the LUT to the frame-0 camera (haze smeared in a stale
+    // direction the moment the camera turned). 4×4×32 groups × 6 steps is
+    // tens of microseconds; cheap enough to run unconditionally.
+    if (m_aerialCompositeEnabled)
+    {
+        uint32_t r = pBegin("SkyIBL.AerialPerspective");
+        DispatchAerialPerspective(cl);
+        pEnd(r);
     }
 
     // ---- SH projection — only when the atmosphere cube was re-baked --------

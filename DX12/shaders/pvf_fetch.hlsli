@@ -37,12 +37,13 @@ struct MeshDescriptor
     StreamDesc normal;          // 16 bytes
     StreamDesc tangent;         // 16 bytes
     StreamDesc uv0;             // 16 bytes
-    StreamDesc uv1;             // 16 bytes
+    StreamDesc uv1;             // 16 bytes — second UV set
+    StreamDesc color;           // 16 bytes — per-vertex color
     uint indexBufferIndex;      // 4 bytes
     uint indexByteOffset;       // 4 bytes
     uint indexFormat;           // 0 = uint16, 1 = uint32
     uint vertexCount;           // 4 bytes
-    // Total = 96 bytes
+    // Total = 112 bytes
 };
 
 // ---- Low-level fetch helpers -----------------------------------------------
@@ -106,6 +107,19 @@ float4 FetchAsFloat4(uint idx, uint off, uint fmt)
     return (float4)0;
 }
 
+// Per-vertex color fetch. Handles both packed R8G8B8A8 (imported .meshlib) and
+// float3 (procedural primitives, alpha defaulted to 1). Returns opaque white
+// when the mesh carries no color stream, so an unconditional baseColor multiply
+// is a no-op for uncolored meshes.
+float4 FetchAsColor(uint idx, uint off, uint fmt)
+{
+    if (idx == INVALID_BUFFER)  return float4(1, 1, 1, 1);
+    if (fmt == VF_R8G8B8A8)     return FetchR8G8B8A8(idx, off);
+    if (fmt == VF_FLOAT4)       return FetchFloat4(idx, off);
+    if (fmt == VF_FLOAT3)       return float4(FetchFloat3(idx, off), 1.0);
+    return float4(1, 1, 1, 1);
+}
+
 // ---- Convenience macros (md = MeshDescriptor, vid = resolved vertex index) -
 
 #define FETCH_POS(md, vid) \
@@ -128,11 +142,18 @@ float4 FetchAsFloat4(uint idx, uint off, uint fmt)
                   (md).uv0.byteOffset + (vid) * (md).uv0.byteStride, \
                   (md).uv0.format)
 
-// Color fetched from uv1 slot (per-vertex color; separate from UV coordinates).
-#define FETCH_COLOR(md, vid) \
-    FetchAsFloat3((md).uv1.bufferIndex, \
+// Second UV set (lightmap / detail / blend). Returns (0,0) when absent.
+#define FETCH_UV1(md, vid) \
+    FetchAsFloat2((md).uv1.bufferIndex, \
                   (md).uv1.byteOffset + (vid) * (md).uv1.byteStride, \
                   (md).uv1.format)
+
+// Per-vertex color from its own dedicated stream (no longer aliased to uv1).
+// Returns float4 RGBA; opaque white when the mesh has no color stream.
+#define FETCH_COLOR(md, vid) \
+    FetchAsColor((md).color.bufferIndex, \
+                 (md).color.byteOffset + (vid) * (md).color.byteStride, \
+                 (md).color.format)
 
 // Tangent fetched as float4 (xyz = tangent direction, w = bitangent handedness sign).
 // Returns (1,0,0,1) as a fallback when no tangent buffer is bound.

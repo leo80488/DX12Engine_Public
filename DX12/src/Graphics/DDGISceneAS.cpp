@@ -687,6 +687,27 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
     if (instances.empty()) return 0;
 
     const uint32_t newCount = (uint32_t)instances.size();
+
+    // ---- Dirty check: skip the TLAS write+build when nothing changed ---------
+    // Fingerprint (FNV-1a) the instance descriptors — transforms + BLAS VAs, all
+    // value-initialised so the bytes are stable. If it matches last frame AND no
+    // BLAS swapped this frame AND we already have a fresh TLAS, the existing TLAS
+    // is bit-for-bit identical to what we'd rebuild → reuse it. The TLAS + its
+    // instance upload buffer are single persistent resources (not multi-buffered),
+    // so the trace keeps reading a valid structure. Camera motion never touches the
+    // world-space TLAS, so a static scene costs ZERO TLAS work here.
+    uint64_t fp = 1469598103934665603ull; // FNV-1a offset basis
+    {
+        const auto*  bytes = reinterpret_cast<const uint8_t*>(instances.data());
+        const size_t nb    = static_cast<size_t>(newCount) * sizeof(RT::TLASInstance);
+        for (size_t i = 0; i < nb; ++i) { fp ^= bytes[i]; fp *= 1099511628211ull; }
+    }
+    if (m_tlasFresh && !blasSwapped &&
+        newCount == m_lastInstanceCount && fp == m_lastInstanceHash)
+    {
+        return m_tlas.GPUAddress(); // unchanged — reuse the existing TLAS
+    }
+
     // PERFORM_UPDATE requires the same instance count and same BLAS pointers.
     // Any change in either means we MUST do a full rebuild, otherwise DXR
     // reads garbage on the unchanged-instance assumption and crashes the GPU.
@@ -699,6 +720,7 @@ DDGISceneAS::BuildOrRefit(GraphicsDX12&               gfx,
     RT::BuildTLAS(gfx, cmd, m_tlas, m_scratch, canUpdate);
     m_tlasFresh         = true;
     m_lastInstanceCount = newCount;
+    m_lastInstanceHash  = fp;
 
     return m_tlas.GPUAddress();
 }

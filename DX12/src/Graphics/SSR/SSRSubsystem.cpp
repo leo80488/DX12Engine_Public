@@ -168,6 +168,8 @@ void SSRSubsystem::Render(IGraphicsDevice& gfx,
     const RHI::Texture* normalTex   = graph.GetPhysicalTexture(ctx.normalHandle);
     const RHI::Texture* surfaceTex  = graph.GetPhysicalTexture(ctx.surfaceHandle);
     const RHI::Texture* velocityTex = graph.GetPhysicalTexture(ctx.velocityHandle);
+    // Grass-free pre-GrassPass snapshot — Hi-Z march source (see FrameContext).
+    const RHI::Texture* traceDepthTex = graph.GetPhysicalTexture(ctx.traceDepthHandle);
     if (!depthTex || !normalTex || !surfaceTex) return;
 
     const uint32_t rw = gfx.GetRenderWidth();
@@ -261,6 +263,9 @@ void SSRSubsystem::Render(IGraphicsDevice& gfx,
     const RHI::ResourceState velocityState0 = velocityTex
         ? graph.GetTextureState(ctx.velocityHandle)
         : RHI::ResourceState::SHADER_RESOURCE;
+    const RHI::ResourceState traceDepthState0 = traceDepthTex
+        ? graph.GetTextureState(ctx.traceDepthHandle)
+        : RHI::ResourceState::SHADER_RESOURCE;
 
     auto toSR = [&](const RHI::Texture* t, RHI::ResourceState from) {
         if (!t) return;
@@ -268,10 +273,11 @@ void SSRSubsystem::Render(IGraphicsDevice& gfx,
             gfx.PushBarrier(RHI::GPUBarrier::Image(
                 t, from, RHI::ResourceState::SHADER_RESOURCE), ssrCL);
     };
-    toSR(depthTex,    depthState0);
-    toSR(normalTex,   normalState0);
-    toSR(surfaceTex,  surfaceState0);
-    toSR(velocityTex, velocityState0);
+    toSR(depthTex,      depthState0);
+    toSR(normalTex,     normalState0);
+    toSR(surfaceTex,    surfaceState0);
+    toSR(velocityTex,   velocityState0);
+    toSR(traceDepthTex, traceDepthState0);
 
     // Per-sub-pass GPU timestamps — SSRSubsystem is logically multi-pass,
     // matches the SkyIBL / VolFog convention so each sub-step appears in the
@@ -284,9 +290,12 @@ void SSRSubsystem::Render(IGraphicsDevice& gfx,
     };
 
     // 1. Depth pyramid (internal chain leaves the texture in UAV).
+    //    Built from the grass-free snapshot when available so blades don't
+    //    block the Hi-Z march; falls back to the main depth otherwise.
     {
         uint32_t r = pBegin("SSR.DepthHier");
-        m_depthHier->Execute(ssrCL, gfx.GetTextureSRVGpuHandle(*depthTex));
+        m_depthHier->Execute(ssrCL, gfx.GetTextureSRVGpuHandle(
+            traceDepthTex ? *traceDepthTex : *depthTex));
         pEnd(r);
     }
     const RHI::Texture* hierTex = m_depthHier->GetTexture();
@@ -430,10 +439,11 @@ void SSRSubsystem::Render(IGraphicsDevice& gfx,
             gfx.PushBarrier(RHI::GPUBarrier::Image(
                 t, RHI::ResourceState::SHADER_RESOURCE, to), ssrCL);
     };
-    fromSR(depthTex,    depthState0);
-    fromSR(normalTex,   normalState0);
-    fromSR(surfaceTex,  surfaceState0);
-    fromSR(velocityTex, velocityState0);
+    fromSR(depthTex,      depthState0);
+    fromSR(normalTex,     normalState0);
+    fromSR(surfaceTex,    surfaceState0);
+    fromSR(velocityTex,   velocityState0);
+    fromSR(traceDepthTex, traceDepthState0);
 
     // ====================================================================
     // Phase 4.7 — composite

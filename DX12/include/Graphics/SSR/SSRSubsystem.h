@@ -78,6 +78,12 @@ public:
         RG::RGTextureHandle    surfaceHandle{};
         RG::RGTextureHandle    depthHandle{};
         RG::RGTextureHandle    velocityHandle{};
+        // Optional grass-free depth snapshot (copied pre-GrassPass). When
+        // valid, the Hi-Z march pyramid is built from THIS depth so thin
+        // grass blades don't block reflection rays; per-pixel reads (trace
+        // origins, finish refinement, resolve/temporal/upsample bilateral)
+        // keep using depthHandle. Invalid → pyramid falls back to depthHandle.
+        RG::RGTextureHandle    traceDepthHandle{};
 
         // Jittered camera state. invViewProj is derived internally.
         DirectX::XMFLOAT4X4    viewProj{};

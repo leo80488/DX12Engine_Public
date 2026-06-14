@@ -116,7 +116,12 @@ void main(uint3 GID : SV_GroupID, uint3 GTid : SV_GroupThreadID)
                 float3 S     = m.scattering * (1.0 / (4.0 * ATMO_PI));
                 float3 Sint  = (S - S * sampT) / max(m.extinction, float3(1e-6, 1e-6, 1e-6));
 
-                L_sample += T * Tsun * Sint * (4.0 * ATMO_PI); // undo isotropic factor for radiance
+                // L (Hillaire eq.5) keeps the uniform phase on the in-scatter:
+                // radiance INTO the sample direction is σs·p_u·Tsun — no 4π
+                // un-do (the old *4π made the MS term ~12.6x too bright).
+                // f_ms (eq.7) integrates σs·T with NO phase, so there the 4π
+                // correctly cancels the p_u baked into S.
+                L_sample += T * Tsun * Sint;
                 F_sample += T * Sint * (4.0 * ATMO_PI);
                 T        *= sampT;
             }
@@ -131,7 +136,9 @@ void main(uint3 GID : SV_GroupID, uint3 GTid : SV_GroupThreadID)
                 float  NdotL   = saturate(dot(nGround, sunDir));
                 float3 Tgr     = SampleTrans(0.0, dot(nGround, sunDir));
                 float3 Tview   = T; // transmittance to that ground point
-                L_sample += Tview * kGroundAlbedo * ATMO_INV_PI * NdotL * Tgr * ATMO_PI;
+                // Lambertian bounce = albedo/π · NdotL — the old trailing *π
+                // cancelled the BRDF's 1/π.
+                L_sample += Tview * kGroundAlbedo * ATMO_INV_PI * NdotL * Tgr;
             }
         }
     }

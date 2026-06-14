@@ -68,7 +68,8 @@ ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
     constexpr UINT kDDGIProbeSHSlot     = 43; // t29..t32 space0 (NumDescriptors=4)
     constexpr UINT kDDGIDepthSlot       = 44; // t33..t36 space0 (NumDescriptors=4)
     constexpr UINT kDDGIProbeDataSlot   = 45; // t37..t40 space0 (NumDescriptors=4)
-    constexpr UINT totalParams = 1 + kCBVSlotCount + 2 + kSRVSlotCount + 1 + kSamplerSlotCount + kIBLSRVSlotCount + 1 + kClusterSRVSlotCount + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 2 + 2 + 1 + 4; // = 46
+    constexpr UINT kPointShadowAtlasSlot = 46; // t41 space0 — TextureCubeArray<float> point-light cube shadow atlas
+    constexpr UINT totalParams = 1 + kCBVSlotCount + 2 + kSRVSlotCount + 1 + kSamplerSlotCount + kIBLSRVSlotCount + 1 + kClusterSRVSlotCount + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 1 + 1 + 2 + 2 + 1 + 4 + 1; // = 47
     D3D12_ROOT_PARAMETER params[totalParams] = {};
 
     // [0] Root constants — 4 uint32s at b0 space0
@@ -450,6 +451,21 @@ ComPtr<ID3D12RootSignature> GraphicsDX12::CreateDefaultRootSignature()
     params[kDDGIProbeDataSlot].DescriptorTable.pDescriptorRanges   = &ddgiProbeDataRange;
     params[kDDGIProbeDataSlot].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
 
+    // [46] Descriptor table — 1 SRV at t41 space0 (PointShadowPass cube atlas,
+    // TextureCubeArray<float>). LightingPass binds either the live atlas or a
+    // 1×1 fallback so the table is always satisfied; Lighting.ps only samples
+    // it for point lights whose shadowSliceIdx != 0xFFFFFFFF.
+    static D3D12_DESCRIPTOR_RANGE pointShadowAtlasRange = {};
+    pointShadowAtlasRange.RangeType        = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    pointShadowAtlasRange.NumDescriptors   = 1;
+    pointShadowAtlasRange.BaseShaderRegister = 41; // t41
+    pointShadowAtlasRange.RegisterSpace      = 0;
+    pointShadowAtlasRange.OffsetInDescriptorsFromTableStart = 0;
+    params[kPointShadowAtlasSlot].ParameterType             = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    params[kPointShadowAtlasSlot].DescriptorTable.NumDescriptorRanges = 1;
+    params[kPointShadowAtlasSlot].DescriptorTable.pDescriptorRanges   = &pointShadowAtlasRange;
+    params[kPointShadowAtlasSlot].ShaderVisibility          = D3D12_SHADER_VISIBILITY_PIXEL;
+
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters     = totalParams;
     rootDesc.pParameters       = params;
@@ -551,7 +567,7 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> GraphicsDX12::CreateComputeRootSigna
                             D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE);
     params[17].InitAsDescriptorTable(1, &bindlessTex2DRange, D3D12_SHADER_VISIBILITY_ALL);
 
-    CD3DX12_STATIC_SAMPLER_DESC samplers[2]{};
+    CD3DX12_STATIC_SAMPLER_DESC samplers[3]{};
 
     // s0 space2 — plain linear-clamp (for Sample / SampleLevel).
     samplers[0].Init(0,
@@ -580,8 +596,23 @@ Microsoft::WRL::ComPtr<ID3D12RootSignature> GraphicsDX12::CreateComputeRootSigna
         D3D12_SHADER_VISIBILITY_ALL);
     samplers[1].RegisterSpace = 2;
 
+    // s2 space2 — linear-WRAP for tileable volume/2D noise (volumetric clouds:
+    // base shape / detail erosion / weather map). frac()-based manual wrapping
+    // with the CLAMP sampler leaves a one-texel seam per tile; hardware wrap
+    // filters correctly across the boundary.
+    samplers[2].Init(2,
+        D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        0.0f, 16, D3D12_COMPARISON_FUNC_GREATER_EQUAL, // ignored: non-comparison filter
+        D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        0.0f, D3D12_FLOAT32_MAX,
+        D3D12_SHADER_VISIBILITY_ALL);
+    samplers[2].RegisterSpace = 2;
+
     CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rsDesc;
-    rsDesc.Init_1_1(18, params, 2, samplers,
+    rsDesc.Init_1_1(18, params, 3, samplers,
                     D3D12_ROOT_SIGNATURE_FLAG_NONE);
 
     ComPtr<ID3DBlob> serialized, error;
@@ -1482,6 +1513,12 @@ void GraphicsDX12::EndFrame()
         auto& cl = *m_commandLists[idx];
         const UINT qi = static_cast<UINT>(cl.queue);
 
+        // Drain any debug-marker regions still open on this CL so PIX/RenderDoc
+        // begin/end counts stay balanced at the queue level (a multi-CL worker
+        // pass can leave a marker open on its primary while the matching end ran
+        // on a different list). No-op for the common balanced case.
+        while (cl.markerDepth > 0) { --cl.markerDepth; cl.GetCommandList()->EndEvent(); }
+
         ThrowIfFailed(cl.GetCommandList()->Close());
 
         // Insert GPU-side Wait() for every dependency on a different queue.
@@ -1581,6 +1618,7 @@ RHI::CommandList GraphicsDX12::BeginCommandList(RHI::QUEUE_TYPE queue)
     cl.discards.clear();
     cl.wait_for.clear();
     cl.signal_fence_value = 0;
+    cl.markerDepth        = 0;   // fresh CL → no open debug-marker regions
 
     const UINT qi = static_cast<UINT>(queue);
     const D3D12_COMMAND_LIST_TYPE listType = ToD3D12CommandListType(queue);
@@ -2034,7 +2072,7 @@ RHI::IVideoDecoderBackend* GraphicsDX12::GetVideoBackend()
 
 // ===========================================================================
 // Command recording — state
-// ===========================================================================
+// ===========================================================================ㄊ
 
 void GraphicsDX12::BindPipelineState(const RHI::PipelineState& pso, RHI::CommandList cmd)
 {
@@ -2704,6 +2742,37 @@ void GraphicsDX12::EndGPUTimestamp(RHI::CommandList cmd, uint32_t regionIndex)
     auto* cl = GetPoolEntry(cmd).GetCommandList();
     if (!cl) return;
     m_gpuProfiler.EndTimestamp(cl, regionIndex);
+}
+
+// Debug markers via the legacy PIX UNICODE event format (Metadata == 2). This
+// needs no WinPixEventRuntime dependency and RenderDoc/PIX both decode it, so
+// every pass shows up named in a capture. A malformed marker is harmless (the
+// tool just ignores it) — there is no driver/runtime risk.
+void GraphicsDX12::BeginEventMarker(RHI::CommandList cmd, const char* name)
+{
+    if (!m_debugMarkers) return;          // opt-in (see SetDebugMarkersEnabled)
+    auto& entry = GetPoolEntry(cmd);
+    auto* cl = entry.GetCommandList();
+    if (!cl) return;
+    const char* n = (name && *name) ? name : "<pass>";
+    wchar_t wbuf[128];
+    int wn = MultiByteToWideChar(CP_UTF8, 0, n, -1, wbuf, _countof(wbuf));
+    if (wn <= 0) { wbuf[0] = L'\0'; wn = 1; }           // null-terminated fallback
+    wbuf[_countof(wbuf) - 1] = L'\0';                    // guarantee termination
+    cl->BeginEvent(2 /*PIX_EVENT_UNICODE_VERSION*/, wbuf,
+                   static_cast<UINT>(wn) * sizeof(wchar_t));
+    ++entry.markerDepth;
+}
+
+void GraphicsDX12::EndEventMarker(RHI::CommandList cmd)
+{
+    if (!m_debugMarkers) return;          // opt-in (see SetDebugMarkersEnabled)
+    auto& entry = GetPoolEntry(cmd);
+    auto* cl = entry.GetCommandList();
+    if (!cl) return;
+    if (entry.markerDepth <= 0) return;   // suppress an unmatched End (depth 0)
+    --entry.markerDepth;
+    cl->EndEvent();
 }
 
 void GraphicsDX12::BindDescriptorHeaps(RHI::CommandList cmd)

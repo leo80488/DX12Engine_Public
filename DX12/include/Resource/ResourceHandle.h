@@ -24,6 +24,7 @@ namespace Resource
         Animation = 7,
         MeshLibrary = 8, // new first-class mesh-pool container (P1-P6 rewrite)
         AudioClip   = 9, // .aclip — PCM/compressed audio sample with metadata
+        PostProcessProfile = 10, // .ppprofile — shared post-process look (volume system)
         Count
     };
 

@@ -177,7 +177,7 @@ PSODesc TransparentPass::BuildPSODesc(PermutationKey perm, uint32_t customPSID) 
 
     desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
     desc.rtvCount      = 1;
-    desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
     return desc;
 }
 

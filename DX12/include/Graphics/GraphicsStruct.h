@@ -489,21 +489,25 @@ namespace RHI
     };
 
     // One mesh descriptor slot in the global GPU StructuredBuffer<MeshDescriptor>
-    // Layout must match HLSL MeshDescriptor in pvf_fetch.hlsli (96 bytes)
+    // Layout must match HLSL MeshDescriptor in pvf_fetch.hlsli (112 bytes).
+    // NOTE: any size/field change here must be mirrored in BOTH HLSL copies —
+    // pvf_fetch.hlsli (graphics) and ParticleEmit.cs.hlsl (compute) — or the
+    // StructuredBuffer stride disagrees and reads garbage past element 0.
     struct MeshDescriptor
     {
         StreamDescriptor position;           // always present
         StreamDescriptor normal;             // bufferIndex = kInvalidBufferIndex if absent
         StreamDescriptor tangent;            // bufferIndex = kInvalidBufferIndex if absent
         StreamDescriptor uv0;                // bufferIndex = kInvalidBufferIndex if absent
-        StreamDescriptor uv1;                // bufferIndex = kInvalidBufferIndex if absent
+        StreamDescriptor uv1;                // second UV set; INVALID if absent
+        StreamDescriptor color;              // per-vertex color; INVALID if absent
         uint32_t indexBufferIndex = kInvalidBufferIndex; // INVALID if non-indexed
         uint32_t indexByteOffset  = 0;
         uint32_t indexFormat      = 0;       // 0 = uint16, 1 = uint32
         uint32_t vertexCount      = 0;
-        // Total = 5×16 + 4×4 = 96 bytes
+        // Total = 6×16 + 4×4 = 112 bytes
     };
-    static_assert(sizeof(MeshDescriptor) == 96, "MeshDescriptor must be 96 bytes to match HLSL");
+    static_assert(sizeof(MeshDescriptor) == 112, "MeshDescriptor must be 112 bytes to match HLSL");
 
     struct GPUQueryHeapDesc
     {

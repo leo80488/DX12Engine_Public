@@ -18,9 +18,24 @@ class AutoExposurePass;
 class BloomPass;
 class LensFlarePass;
 class ToneMapPass;
+class UnderwaterPass;
+class DepthOfFieldPass;
+class StylizePass;
 
 namespace PostProcess
 {
+
+class DepthOfFieldEffect final : public IEffect
+{
+public:
+    explicit DepthOfFieldEffect(DepthOfFieldPass* pass) : m_pass(pass) {}
+    Stage       GetStage() const override { return Stage::DepthOfField; }
+    const char* GetName()  const override { return "DepthOfField"; }
+    bool        IsEnabled(const Context& ctx) const override;
+    void        Execute  (Context& ctx) override;
+private:
+    DepthOfFieldPass* m_pass = nullptr;
+};
 
 class CASEffect final : public IEffect
 {
@@ -68,6 +83,30 @@ public:
     void        Execute  (Context& ctx) override;
 private:
     LensFlarePass* m_pass = nullptr;
+};
+
+class UnderwaterEffect final : public IEffect
+{
+public:
+    explicit UnderwaterEffect(UnderwaterPass* pass) : m_pass(pass) {}
+    Stage       GetStage() const override { return Stage::Underwater; }
+    const char* GetName()  const override { return "Underwater"; }
+    bool        IsEnabled(const Context& ctx) const override;
+    void        Execute  (Context& ctx) override;
+private:
+    UnderwaterPass* m_pass = nullptr;
+};
+
+class StylizeEffect final : public IEffect
+{
+public:
+    explicit StylizeEffect(StylizePass* pass) : m_pass(pass) {}
+    Stage       GetStage() const override { return Stage::Stylize; }
+    const char* GetName()  const override { return "Stylize"; }
+    bool        IsEnabled(const Context& ctx) const override;
+    void        Execute  (Context& ctx) override;
+private:
+    StylizePass* m_pass = nullptr;
 };
 
 class ToneMapEffect final : public IEffect

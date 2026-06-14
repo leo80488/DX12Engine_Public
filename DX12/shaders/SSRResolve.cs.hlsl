@@ -246,6 +246,14 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
             float4 s  = gHitBuffer.Load(int3(np, 0));
             float  sd = gDepth.Load(int3(np, 0));
             if (sd <= 0.0) continue;
+            // Taps that aren't part of this mirror surface hold zeros (rough
+            // pixels above the trace cutoff are never traced at all — e.g.
+            // shoreline terrain right next to mirror water). Averaging them
+            // in dilutes confidence + color along every contact line, which
+            // the water shader then back-fills with bright sky — a visible
+            // band. Missing data ≠ black reflection: skip those taps.
+            float sRough = max(gSurface.Load(int3(np, 0)).r, 0.045);
+            if (sRough >= 0.1) continue;
             float linSd  = LinearizeReverseZ(sd);
             float relDz  = abs(linSd - linDepth) / max(linDepth, 0.01);
             float wDepth = exp(-relDz * relDz * 32.0);

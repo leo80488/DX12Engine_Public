@@ -60,6 +60,9 @@ namespace Resource
         std::vector<DirectX::XMFLOAT3> positions;
         std::vector<DirectX::XMFLOAT3> normals;
         std::vector<DirectX::XMFLOAT2> uvs;
+        // First PMX "additional UV" set (.xy of the float4), preserved as uv1.
+        // Empty when the model declares additionalUVCount == 0.
+        std::vector<DirectX::XMFLOAT2> uv1;
         std::vector<uint32_t>           indices;
         std::vector<BlendVertex>        blendData;
 

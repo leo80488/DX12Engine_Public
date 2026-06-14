@@ -45,6 +45,12 @@ public:
         m_spotShadowAtlasHandle = atlasHandle;
         m_spotShadowVPHandle    = vpsHandle;
     }
+    // Point-light omnidirectional cube shadow atlas (TextureCubeArray<float>).
+    // 0 → bind the 1×1 fallback so the root-sig table stays satisfied.
+    void SetPointShadowAtlas(uint64_t cubeAtlasHandle)
+    {
+        m_pointShadowAtlasHandle = cubeAtlasHandle;
+    }
 
     // Clustered lighting (all 3 must be non-zero to take effect).
     void SetClusterSRVs(uint64_t lights, uint64_t indexList, uint64_t grid)
@@ -128,9 +134,10 @@ private:
     uint32_t m_iblRadianceMips     = 7;
     float    m_iblStrength         = 1.0f;
     // Shadows
-    uint64_t m_shadowSrvHandle       = 0;
-    uint64_t m_spotShadowAtlasHandle = 0;
-    uint64_t m_spotShadowVPHandle    = 0;
+    uint64_t m_shadowSrvHandle        = 0;
+    uint64_t m_spotShadowAtlasHandle  = 0;
+    uint64_t m_spotShadowVPHandle     = 0;
+    uint64_t m_pointShadowAtlasHandle = 0;   // t41 space0 TextureCubeArray<float>
     // Clustered lighting
     uint64_t m_clusterLightsSRV    = 0;            // t10 space0
     uint64_t m_clusterIndexListSRV = 0;            // t11 space0
@@ -173,6 +180,9 @@ private:
     uint64_t       m_spotShadowAtlasFallback = 0;
     RHI::GPUBuffer m_spotShadowVPFallbackBuf;
     uint64_t       m_spotShadowVPFallback = 0;
+    // Point-shadow cube atlas 1×1 fallback (TextureCubeArray<float>).
+    RHI::Texture   m_pointShadowAtlasFallbackTex;
+    uint64_t       m_pointShadowAtlasFallback = 0;
     // NPR ramp 1×1 white (lets NPR_COLOR materials run NPR PSO without a ramp).
     RHI::Texture m_rampFallbackTex;
     uint64_t     m_rampFallbackHandle = 0;

@@ -74,6 +74,19 @@ public:
     // and drives the returned table's :Open()/:Close() conventions.
     bool LoadUIScript(const std::string& path);
 
+    // ---- Scene script (singleton bound to the ACTIVE scene, not an entity) -
+    // One scene script at a time. It is the data-driven replacement for the old
+    // hardcoded TitleScene/GameScene/EndScene::Update logic: a Lua table
+    // returning OnSceneEnter(self, sceneName) / OnSceneUpdate(self, dt) /
+    // OnSceneExit(self). The SceneManager calls SetActiveSceneScript on every
+    // scene load (empty path = the new scene has no script → the old one still
+    // exits cleanly). The actual OnSceneExit(old)+OnSceneEnter(new) swap is
+    // DEFERRED to the next Update() so it runs while m_world is valid and
+    // honours the editor's play/pause gating (Unity-style: Enter fires on the
+    // first played frame). OnSceneUpdate ticks every frame the scene is active.
+    void SetActiveSceneScript(const std::string& path, const std::string& sceneName);
+    const std::string& ActiveSceneScript() const { return m_sceneScriptPath; }
+
     // ---- Animation event dispatch (called by AnimationSystem / gameplay) ---
     // Fires OnAnimEvent(self, name, payload) on the entity's Logic instance.
     // Lua side equivalent: Engine.PublishAnimEvent(entityId, name, payload).
@@ -160,6 +173,13 @@ private:
     void RegisterBindings();
     void RegisterCppEventBridges();        // C++ EventBus → Lua bus
 
+    // Scene-script plumbing. ProcessSceneScriptSwap runs the deferred
+    // OnSceneExit(old)+OnSceneEnter(new) handshake; TickSceneScript fires
+    // OnSceneUpdate. Both are called from Update() while m_world is valid.
+    void ProcessSceneScriptSwap();
+    void TickSceneScript(float dt);
+    void FireSceneExitIfEntered();         // best-effort exit on teardown/quit
+
     // Logic template / instance plumbing.
     bool LoadLogicTemplate(const std::string& path);
     // creates the slot's instance via metatable, injects exposed vars, fires
@@ -215,6 +235,18 @@ private:
     // UI script registry — same shape as services; separate map so the
     // category is preserved (Editor / tooling can list them apart).
     std::unordered_map<std::string, ServiceEntry>    m_uiScripts;
+
+    // ---- Scene script (single active; instance table lives in Lua under
+    //      __scene_script). m_sceneScriptPending requests a swap that
+    //      ProcessSceneScriptSwap() services on the next Update tick. ----
+    std::string m_sceneScriptPath;             // currently-entered script (empty = none)
+    std::string m_sceneScriptName;             // scene name passed to OnSceneEnter
+    std::string m_pendingSceneScriptPath;      // requested next script (empty = none)
+    std::string m_pendingSceneScriptName;
+    bool        m_sceneScriptPending   = false; // a SetActiveSceneScript request is queued
+    bool        m_sceneScriptEntered   = false; // OnSceneEnter fired for m_sceneScriptPath
+    bool        m_sceneScriptHasUpdate = false;
+    bool        m_sceneScriptHasExit   = false;
 
     std::unordered_map<std::string,
         std::filesystem::file_time_type>             m_fileTimestamps;

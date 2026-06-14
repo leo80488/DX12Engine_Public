@@ -7,9 +7,14 @@
 // Root parameter slots — must match GraphicsDX12.cpp's default root signature.
 //   [10] descriptor table, t2 space0  ← per-draw SRV slot 0 (heightmap, ALL vis)
 //   [11] descriptor table, t3 space0  ← per-draw SRV slot 1 (splatmap, ALL vis)
+//   [12] descriptor table, t4 space0  ← per-draw SRV slot 2 (layer table, ALL vis)
 //   [27] descriptor table, t0 space2  ← bindless g_AllTextures[] (PIXEL vis)
+// Slot 12 (t4 space0) is one of the four generic per-draw SRV tables the root
+// signature already declares (params 10..13 = t2..t5 space0). Terrain only used
+// 10/11, so binding the layer StructuredBuffer here needs NO root-sig change.
 static constexpr uint32_t kHeightmapRootSlot = 10;
 static constexpr uint32_t kSplatmapRootSlot  = 11;
+static constexpr uint32_t kLayerBufRootSlot  = 12;
 static constexpr uint32_t kBindlessTexSlot   = 27;
 
 TerrainPass::TerrainPass(RG::RGTextureHandle albedo,
@@ -91,7 +96,7 @@ bool TerrainPass::BuildPSO(IGraphicsDevice& gfx, bool wireframe, RHI::PipelineSt
     pd.rtv_formats[3] = RHI::Format::R16G16_FLOAT;          // velocity
     pd.rtv_formats[4] = RHI::Format::R16G16B16A16_FLOAT;    // extra (shading-model scratch)
     pd.rtv_formats[5] = RHI::Format::R16G16B16A16_FLOAT;    // HdrSceneColor (direct emissive write)
-    pd.dsv_format     = RHI::Format::D24_UNORM_S8_UINT;     // matches GBufferPass
+    pd.dsv_format     = RHI::Format::D32_FLOAT_S8X24_UINT;     // matches GBufferPass
     pd.sample_count   = 1;
 
     if (!gfx.CreatePipelineState(pd, outPso))
@@ -195,6 +200,13 @@ RHI::CommandList TerrainPass::Execute(RHI::CommandList cl)
     const uint64_t splatBind = m_tile.splatmapSRV ? m_tile.splatmapSRV
                                                   : m_tile.heightmapSRV;
     cl.BindDescriptorTableHandle(kSplatmapRootSlot, splatBind);
+
+    // Per-layer material table at t4 space0 (PS loops over it by layerCount).
+    // Fall back to a benign valid descriptor (splatmap/heightmap) when unset so
+    // D3D12 validation never sees an empty table — the PS guards on layerCount.
+    const uint64_t layerBind = m_tile.layerBufferSRV ? m_tile.layerBufferSRV
+                                                     : splatBind;
+    cl.BindDescriptorTableHandle(kLayerBufRootSlot, layerBind);
 
     // Bindless texture array for layer albedo lookups (PS only).
     auto& dx12 = static_cast<GraphicsDX12&>(*cl.gfx);

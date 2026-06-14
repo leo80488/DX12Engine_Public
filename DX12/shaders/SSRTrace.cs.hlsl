@@ -460,7 +460,18 @@ float ValidateHit(float3 hit, float surfaceDepthAtHit, float2 prevHitUV)
     float linRay = LinearizeReverseZ(hit.z);
     float linSrf = LinearizeReverseZ(surfaceDepthAtHit);
     float thickness = abs(linRay - linSrf);
-    float confidence = 1.0 - smoothstep(0.0, max(traceThickness, 1e-4), thickness);
+    // Tolerance scales with hit distance. Only rays whose finish trace did
+    // NOT converge reach a non-trivial thickness here (clean crossings land
+    // at thickness ≈ 0), and at range the honest uncertainty grows: one
+    // Hi-Z cell of screen offset on grazing terrain spans several wu of
+    // depth (and a UNORM depth buffer would add ~0.15 wu of quantization at
+    // 500 m on top). The fixed 0.5 wu rejected nearly every far
+    // fall-through hit → speckled bright-sky holes inside distant water
+    // reflections. 0.4% of hit depth (2 wu at 500 m) trades those holes for
+    // slightly tolerant acceptance — a marginally-off reflection color
+    // reads far better than a sky speckle.
+    float tol = max(max(traceThickness, 1e-4), linSrf * 0.004);
+    float confidence = 1.0 - smoothstep(0.0, tol, thickness);
 
     return vignette * confidence;
 }
@@ -510,7 +521,21 @@ bool TraceOneReflection(uint2 pixel, float3 worldPos, float depth,
         startSS.z       = startNDC.z;
 
         float linZ       = LinearizeReverseZ(startSS.z);
-        float biasAbs    = max(linZ * depthBiasFactor, 0.02);
+        // The push toward the camera must beat the depth buffer's local
+        // quantization step, or the first Hi-Z cell's max still reads >=
+        // origin.z and the walk "hits" at the origin — the self-hit then
+        // fails minRayLen and the whole ray drops (speckled sky holes on
+        // far-away water). quantStep models the D24_UNORM worst case
+        // (linZ²·(far−near)/(near·far·2²⁴), ~0.5 wu at 900 m with near 0.1 /
+        // far 1000). Main depth is now D32_FLOAT_S8X24 whose error is
+        // orders of magnitude below this bound — the term is kept as a
+        // conservative, sub-pixel-at-range safety margin that also protects
+        // any future format change. Near the camera the 0.02 wu absolute
+        // floor rules, so contact lines stay tight.
+        float quantStep  = linZ * linZ * (farZ - nearZ)
+                         / max(nearZ * farZ * 16777216.0, 1e-4);
+        float biasAbs    = max(linZ * depthBiasFactor,
+                               max(0.02, quantStep * 2.0));
         float linZBiased = max(linZ - biasAbs, nearZ);
         startSS.z        = saturate(InverseLinearDepth(linZBiased));
     }
@@ -556,8 +581,18 @@ bool TraceOneReflection(uint2 pixel, float3 worldPos, float depth,
         int2 hitPxFull = clamp(int2(hit.xy * float2(renderW, renderH)),
                                int2(0, 0), int2(renderW - 1, renderH - 1));
         float3 hitN  = normalize(gNormal.Load(int3(hitPxFull, 0)).rgb * 2.0 - 1.0);
+        // Backface rejection — but GRAZING hits are legitimate and common:
+        // a near-horizontal water/floor reflection ray skimming onto
+        // upward-facing ground has front = sin(slope − rayElevation) ≈ 0,
+        // often slightly NEGATIVE on flat shores. The old (0.05, 0.20)
+        // window rejected every such hit, leaving a bright sky-fallback
+        // band ("seam") along every shoreline / wall-floor contact in
+        // mirror reflections. Keep grazing hits; reject only clearly
+        // back-facing ones (ray emerging from inside geometry — front
+        // strongly negative). Pass-through leaks are still caught by the
+        // thickness check in ValidateHit above.
         float  front = dot(hitN, -L);
-        confidence  *= smoothstep(0.05, 0.20, front);
+        confidence  *= smoothstep(-0.25, -0.05, front);
     }
     if (confidence <= 0.0) return false;
 

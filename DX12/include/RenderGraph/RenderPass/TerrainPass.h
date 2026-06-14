@@ -68,6 +68,11 @@ public:
     {
         uint64_t heightmapSRV         = 0;
         uint64_t splatmapSRV          = 0;
+        // StructuredBuffer<TerrainLayerGPU> SRV — per-layer material table the
+        // PS loops over by layerCount. Bound to the free per-draw SRV table at
+        // t4 space0 (root param 12); 0 falls back to the splatmap as a benign
+        // placeholder so the descriptor slot is always valid.
+        uint64_t layerBufferSRV       = 0;
         uint32_t dispatchAsGroupCount = 0;
     };
     void SetActiveTile(const TileBindings& b) { m_tile = b; }

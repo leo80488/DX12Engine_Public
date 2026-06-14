@@ -212,6 +212,7 @@ ScriptSystem::~ScriptSystem()
     // BEFORE deleting m_lua — otherwise their destructors run *after*
     // `delete m_lua` (members destruct in reverse declaration order) and
     // call luaL_unref on a freed lua_State.
+    FireSceneExitIfEntered();   // best-effort scene OnSceneExit on app quit
     ClearAll();
 
     delete m_lua;
@@ -223,6 +224,19 @@ void ScriptSystem::ClearAll()
     m_logicTemplates.clear();
     m_services.clear();
     m_uiScripts.clear();
+    // Scene script: drop the active instance + flags. OnSceneExit is NOT fired
+    // here (ClearAll has drop-without-callback semantics, like services); the
+    // dtor fires FireSceneExitIfEntered() just before ClearAll for app quit,
+    // and scene-to-scene transitions exit via ProcessSceneScriptSwap.
+    m_sceneScriptPending   = false;
+    m_sceneScriptEntered   = false;
+    m_sceneScriptHasUpdate = false;
+    m_sceneScriptHasExit   = false;
+    m_sceneScriptPath.clear();
+    m_sceneScriptName.clear();
+    m_pendingSceneScriptPath.clear();
+    m_pendingSceneScriptName.clear();
+    if (m_lua) (*m_lua)["__scene_script"] = sol::lua_nil;
     // m_systems intentionally NOT cleared here — destructor calls TeardownSystem
     // first (needs OnShutdown), then clears. Live ClearAll callers that want
     // shutdown semantics should iterate TeardownSystem manually.
@@ -230,6 +244,132 @@ void ScriptSystem::ClearAll()
     if (m_timers) m_timers->entries.clear();
     m_timeScale = 1.f;
     // Don't destroy m_lua — bindings stay valid.
+}
+
+// ===========================================================================
+// Scene script — singleton bound to the active scene (data-driven flow).
+// ===========================================================================
+void ScriptSystem::SetActiveSceneScript(const std::string& path,
+                                        const std::string& sceneName)
+{
+    // Queue the swap; ProcessSceneScriptSwap services it on the next Update so
+    // OnSceneExit(old)/OnSceneEnter(new) run while m_world is valid and under
+    // the editor's play/pause gating.
+    m_pendingSceneScriptPath = path;
+    m_pendingSceneScriptName = sceneName;
+    m_sceneScriptPending     = true;
+}
+
+void ScriptSystem::FireSceneExitIfEntered()
+{
+    if (!m_sceneScriptEntered || !m_lua) { m_sceneScriptEntered = false; return; }
+
+    if (m_sceneScriptHasExit)
+    {
+        // OnSceneExit routinely touches world bindings (despawn UI, save state).
+        // Those guard on m_world, which Update sets only for its own duration;
+        // when exiting from the dtor / a teardown path m_world is null, so
+        // borrow the persistently-bound world like TickTimers does.
+        World* const saved = m_world;
+        if (!m_world) m_world = m_boundWorld;
+
+        sol::table inst = (*m_lua)["__scene_script"];
+        if (inst.valid())
+        {
+            sol::protected_function exit = inst["OnSceneExit"];
+            if (exit.valid())
+            {
+                auto res = exit(inst);
+                if (!res.valid())
+                {
+                    sol::error err = res;
+                    LOG_ERROR("Lua OnSceneExit error [%s]: %s",
+                              m_sceneScriptName.c_str(), err.what());
+                }
+            }
+        }
+        m_world = saved;
+    }
+
+    m_sceneScriptEntered = false;
+    (*m_lua)["__scene_script"] = sol::lua_nil;
+}
+
+void ScriptSystem::ProcessSceneScriptSwap()
+{
+    if (!m_sceneScriptPending) return;
+    m_sceneScriptPending = false;
+
+    // Exit the script that is currently active (SetActiveSceneScript is only
+    // called on a real scene change, so the old one always exits here).
+    FireSceneExitIfEntered();
+
+    m_sceneScriptPath      = m_pendingSceneScriptPath;
+    m_sceneScriptName      = m_pendingSceneScriptName;
+    m_sceneScriptEntered   = false;
+    m_sceneScriptHasUpdate = false;
+    m_sceneScriptHasExit   = false;
+    (*m_lua)["__scene_script"] = sol::lua_nil;
+
+    if (m_sceneScriptPath.empty()) return;   // the new scene has no scene script
+
+    // A scene script is re-run from source on every scene entry, so the table
+    // it returns IS a fresh single instance (no template/metatable needed —
+    // unlike per-entity Logic which shares one template across many entities).
+    auto result = RunScriptAsset(*m_lua, m_sceneScriptPath);
+    if (!result.valid())
+    {
+        sol::error err = result;
+        LOG_ERROR("ScriptSystem: scene script load error [%s]: %s",
+                  m_sceneScriptPath.c_str(), err.what());
+        m_sceneScriptPath.clear();
+        return;
+    }
+    sol::object ret = result;
+    if (ret.get_type() != sol::type::table)
+    {
+        LOG_ERROR("ScriptSystem: scene script [%s] did not return a table",
+                  m_sceneScriptPath.c_str());
+        m_sceneScriptPath.clear();
+        return;
+    }
+
+    sol::table inst = ret.as<sol::table>();
+    (*m_lua)["__scene_script"] = inst;
+    m_sceneScriptHasUpdate = inst["OnSceneUpdate"].valid();
+    m_sceneScriptHasExit   = inst["OnSceneExit"].valid();
+
+    sol::protected_function enter = inst["OnSceneEnter"];
+    if (enter.valid())
+    {
+        auto res = enter(inst, m_sceneScriptName);
+        if (!res.valid())
+        {
+            sol::error err = res;
+            LOG_ERROR("Lua OnSceneEnter error [%s]: %s",
+                      m_sceneScriptName.c_str(), err.what());
+        }
+    }
+    m_sceneScriptEntered = true;
+    LOG_INFO("ScriptSystem: scene script '%s' entered (scene='%s', OnSceneUpdate=%d OnSceneExit=%d)",
+             m_sceneScriptPath.c_str(), m_sceneScriptName.c_str(),
+             m_sceneScriptHasUpdate, m_sceneScriptHasExit);
+}
+
+void ScriptSystem::TickSceneScript(float dt)
+{
+    if (!m_sceneScriptEntered || !m_sceneScriptHasUpdate) return;
+    sol::table inst = (*m_lua)["__scene_script"];
+    if (!inst.valid()) return;
+    sol::protected_function upd = inst["OnSceneUpdate"];
+    if (!upd.valid()) { m_sceneScriptHasUpdate = false; return; }
+    auto res = upd(inst, dt);
+    if (!res.valid())
+    {
+        sol::error err = res;
+        LOG_ERROR("Lua OnSceneUpdate error [%s]: %s", m_sceneScriptName.c_str(), err.what());
+        m_sceneScriptHasUpdate = false; // stop calling broken update
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +383,36 @@ void ScriptSystem::TickTimers(float realDt)
 {
     if (!m_timers || m_timers->entries.empty()) return;
 
+    // Timer callbacks (Engine.AfterDelay) routinely call world-dependent bindings
+    // — Engine.IsAlive / DestroyEntity / GetLocalTransform / etc. Those guard on
+    // m_world, which Update sets ONLY for its own duration; TickTimers runs as a
+    // separate scheduler phase with m_world == nullptr, so without this the
+    // bindings silently fail (IsAlive→false, DestroyEntity→no-op) and e.g. a
+    // script that schedules its own destruction never actually dies. Borrow the
+    // persistently-bound world for the callback dispatch, then restore.
+    World* const savedWorld = m_world;
+    if (!m_world) m_world = m_boundWorld;
+
     const std::size_t count = m_timers->entries.size();
     for (std::size_t i = 0; i < count; ++i)
     {
-        auto& e = m_timers->entries[i];
-        if (!e.active) continue;
-        e.remaining -= realDt;
-        if (e.remaining > 0.f) continue;
+        {
+            auto& e = m_timers->entries[i];
+            if (!e.active) continue;
+            e.remaining -= realDt;
+            if (e.remaining > 0.f) continue;
+            e.active = false;
+        }
 
-        e.active = false;
-        auto res = e.fn();
+        // Copy the callback OUT of the vector before invoking it. The callback
+        // may call Engine.AfterDelay (e.g. a chained/one-shot effect), which
+        // push_backs to `entries` and can REALLOCATE the vector — relocating
+        // and moving-out the very protected_function we are mid-call on, leaving
+        // its lua_State dangling (crash in lua_gettop). A local copy lives on
+        // the stack and is immune to the realloc. (The index-based loop above
+        // already guards the iteration itself; this guards the in-flight call.)
+        sol::protected_function fn = m_timers->entries[i].fn;
+        auto res = fn();
         if (!res.valid())
         {
             sol::error err = res;
@@ -269,6 +429,8 @@ void ScriptSystem::TickTimers(float realDt)
         for (auto& e : m_timers->entries) if (e.active) live.push_back(std::move(e));
         m_timers->entries = std::move(live);
     }
+
+    m_world = savedWorld;
 }
 
 // ===========================================================================
@@ -1582,6 +1744,15 @@ void ScriptSystem::RegisterCppEventBridges()
         const auto sub = bus.Subscribe<ContactBeganEvent>(
             [this](const ContactBeganEvent& e)
             {
+                // OnEnter callbacks may use world-dependent bindings; this fires
+                // from the physics phase where m_world is null (Update sets it
+                // only for its own span). Borrow the bound world so
+                // Engine.IsAlive/DestroyEntity/GetLocalTransform work here too.
+                // (Restored at the end — Lua errors surface as invalid results,
+                // not C++ exceptions, so a plain restore is sufficient.)
+                World* const savedWorld = m_world;
+                if (!m_world) m_world = m_boundWorld;
+
                 sol::table point  = m_lua->create_table();
                 point["x"] = e.point.x; point["y"] = e.point.y; point["z"] = e.point.z;
                 sol::table normal = m_lua->create_table();
@@ -1621,6 +1792,8 @@ void ScriptSystem::RegisterCppEventBridges()
                 };
                 fire(e.bodyA.entity, e.bodyB.entity);
                 fire(e.bodyB.entity, e.bodyA.entity);
+
+                m_world = savedWorld;
             });
         m_cppBridgeUnsubscribers.push_back(
             [sub] { EventBus::Get().Unsubscribe<ContactBeganEvent>(sub); });
@@ -1638,6 +1811,12 @@ void ScriptSystem::Update(World& world, float dt)
 
     SweepDestroyed(world);
     DispatchLuaEvents();
+
+    // ---- Scene script: deferred OnSceneEnter/OnSceneExit swap, then the
+    //      active scene's OnSceneUpdate. Runs here (m_world valid) so a scene
+    //      load requested last frame enters before this frame's systems/logic.
+    ProcessSceneScriptSwap();
+    TickSceneScript(dt);
 
     // ---- Systems: OnInit once, OnUpdate every frame -----------------------
     for (auto& sys : m_systems)

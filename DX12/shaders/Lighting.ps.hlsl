@@ -133,6 +133,52 @@ float SampleSpotShadow(float3 worldPos, uint sliceIdx)
              float3(uv, (float)sliceIdx), sc.z);
 }
 
+// Per-point-light omnidirectional (cubemap) shadow (opt-in via
+// LightData::castsShadow). One cube (6 faces) per active caster, addressed by
+// light.shadowSliceIdx (the SAME field spot lights use for their atlas slice —
+// a light is point XOR spot, so the union is unambiguous). Reversed-Z depth.
+//
+// Faces are rendered by PointShadowPass with a 90° perspective per face,
+// NearZ = radius, FarZ = POINT_SHADOW_NEAR (mirrors the SpotShadowPass reversed-Z
+// convention). The hardware cube sampler picks the face + texel from the
+// world-space direction; we reconstruct the matching reversed-Z reference depth
+// analytically from the fragment's distance — no per-light VP matrix needed.
+TextureCubeArray<float> PointShadowAtlas : register(t41, space0);
+
+// Must match PointShadowPass.h (kShadowMapSize, kNearPlane).
+#define POINT_SHADOW_SIZE 1024.0
+#define POINT_SHADOW_NEAR 0.05
+
+float SamplePointShadow(float3 worldPos, float3 N, float3 lightPos, float radius, uint cubeIdx)
+{
+    float3 v    = worldPos - lightPos;
+    float  dist = length(v);
+    if (dist >= radius) return 1.0;   // outside range → lit (attenuation already culls)
+
+    // Normal-offset bias (world space, scales with the face's texel size at this
+    // distance) to fight self-shadow acne. All depth bias is on the caster side
+    // (rasterizer slope-scale), matching SpotShadow — this is the only receiver
+    // nudge, and it pushes ALONG the normal so it never leaks past occluders.
+    // Scale by (1 - NdotL) like SampleCascadeShadow (shadow.hlsli): head-on
+    // surfaces get zero offset (tight contact), grazing get the full push.
+    float  texelW  = 2.0 * dist / POINT_SHADOW_SIZE;
+    float3 Ldir    = -v / dist;                          // toward the light
+    float  noScale = saturate(1.0 - dot(N, Ldir));
+    float3 sp      = worldPos + N * texelW * 2.0 * noScale;
+    float3 vv      = sp - lightPos;
+
+    // View-space depth on the selected cube face == dominant axis magnitude.
+    // Reversed-Z NDC for PerspectiveFovLH(NearZ = radius, FarZ = POINT_SHADOW_NEAR):
+    //   ndc(Vz) = fRange * (1 - radius / Vz),  fRange = near / (near - radius)
+    float  Vz       = max(abs(vv.x), max(abs(vv.y), abs(vv.z)));
+    Vz = max(Vz, 1e-3);
+    float  fRange   = POINT_SHADOW_NEAR / (POINT_SHADOW_NEAR - radius);
+    float  refDepth = saturate(fRange * (1.0 - radius / Vz));
+
+    return PointShadowAtlas.SampleCmpLevelZero(gShadowSampler,
+             float4(vv, (float)cubeIdx), refDepth);
+}
+
 #include "shadow.hlsli"
 #if NPR_PASS
 #include "npr_ramp.hlsli"
@@ -285,6 +331,10 @@ float4 main(PSIn i) : SV_TARGET
             // radiance by the comparison-sampled visibility term.
             if (light.type == 2 && light.shadowSliceIdx != 0xFFFFFFFFu)
                 radiance *= SampleSpotShadow(worldPos, light.shadowSliceIdx);
+            // Opt-in point shadow: omnidirectional cube sampled by direction.
+            else if (light.type == 1 && light.shadowSliceIdx != 0xFFFFFFFFu)
+                radiance *= SamplePointShadow(worldPos, N, light.position, light.radius,
+                                              light.shadowSliceIdx);
 
             float3 specL, kDL;
             EvalCookTorrance(N, V, Ll, F0, roughness, metalness, albedo, specL, kDL);
@@ -402,14 +452,24 @@ float4 main(PSIn i) : SV_TARGET
                                                      probe.boxMin, probe.boxMax);
                 float4 sample4 = gReflectionProbeArray.SampleLevel(gIBLSampler,
                                      float4(Rcorr, (float)probe.cubemapSlice), mip);
-                probeAccum  += sample4.rgb * w;
+                // Per-probe intensity scales the radiance but NOT the coverage
+                // weight (probeWeight stays the sky-fallback blend factor).
+                probeAccum  += sample4.rgb * w * probe.intensity;
                 probeWeight += w;
             }
         }
 
         // Sky fallback for any pixel not fully covered by probes.
-        float3 skySpecular = gRadiance.SampleLevel(gIBLSampler, R, mip).rgb;
-        float3 iblSpecular = probeAccum + skySpecular * (1.0 - probeWeight);
+        // Knob split (2026-06-09): probe specular (probeAccum, already × per-probe
+        // intensity) is INDEPENDENT of iblStrength so local reflection probes
+        // light surfaces even when the sky/atmosphere master gate is 0. Only the
+        // sky-cube specular fallback carries iblStrength.
+        float3 skySpecular  = gRadiance.SampleLevel(gIBLSampler, R, mip).rgb;
+        // Square the sky-fill so a probe-covered surface suppresses the bright
+        // sky reflection more aggressively (interiors shouldn't pick up sky at
+        // the probe box-fade edge). At full coverage probeWeight→1 → no sky.
+        float  skyFill      = saturate(1.0 - probeWeight);
+        float3 specRadiance = probeAccum + skySpecular * (skyFill * skyFill) * iblStrength;
 
         // Dampen by SSR confidence — the composite step adds ssrRefl*F*conf
         // back in, so the final specular = iblSpec*(1-conf) + ssrRefl*F*conf.
@@ -417,19 +477,19 @@ float4 main(PSIn i) : SV_TARGET
         // we read the PREVIOUS frame's result) — the stale data is hidden by
         // the fact that SSR output moves slowly at screen-space velocity.
         const float ssrConf = gSSRResult.Load(int3(int2(i.pos.xy), 0)).a;
-        iblSpecular *= (1.0 - saturate(ssrConf));
+        specRadiance *= (1.0 - saturate(ssrConf));
 
         float3 Fibl    = FresnelSchlickRoughness(NdotV, F0, roughness);
         float2 envBRDF = gBRDFLUT.Sample(gIBLSampler, float2(NdotV, roughness));
-        float3 specIBL = iblSpecular * (Fibl * envBRDF.x + envBRDF.y);
+        float3 specIBL = specRadiance * (Fibl * envBRDF.x + envBRDF.y);
 
         float3 kDibl     = (1.0 - Fibl) * (1.0 - metalness);
         // Diffuse IBL: AO + per-source scale + iblStrength on sky portion are
         // all already baked into iblDiffuse (split DDGI/Sky paths above).
-        // Specular IBL: applies iblStrength here (reflection-probe + sky
-        // specular are both sky-derived, no DDGI specular today).
+        // Specular IBL: iblStrength is already applied per-source (sky portion
+        // only) above; probes are independent. AO occludes all indirect specular.
         float3 diffIBL   = kDibl * albedo * iblDiffuse;
-        float3 specIBLAO = specIBL * ao * iblStrength;
+        float3 specIBLAO = specIBL * ao;
 
         iblContrib = diffIBL + specIBLAO;
 
@@ -479,26 +539,6 @@ float4 main(PSIn i) : SV_TARGET
         // modulated by per-pixel thickness so thin areas stay lit normally.
         float3 scatter = albedo * sssColor * lightColor * NdotLWrap * shadowFactor;
         color += scatter * scatterAmt * thickness;
-    }
-
-    // ---- Aerial Perspective composite ---------------------------------------
-    // Apply atmospheric scattering + transmittance based on view distance.
-    // Distance → 3D LUT slice uses the same quadratic mapping the baking
-    // shader uses:  slice_t = sqrt(distKm / maxDistKm).  Capped so very far
-    // points clamp to the last slice instead of mapping to uninitialised data.
-    if (aerialMaxDistKm > 0.0)
-    {
-        float distKm = length(worldPos - cameraPos) * 0.00001; // engine units ≈ metres
-        distKm = min(distKm, aerialMaxDistKm);               // clamp far range
-        float sliceT = saturate(sqrt(distKm / aerialMaxDistKm));
-        float4 ap = gAerialPerspective.SampleLevel(gSampler, float3(i.uv, sliceT), 0.0);
-
-        // Defensive guard: if the AP LUT hasn't been written yet (all-zero
-        // sample) the shader would multiply the scene by ap.a = 0 and paint
-        // everything black. Treat that sample as a no-op — `color` passes
-        // through unchanged until the LUT dispatch produces valid data.
-        if (ap.a > 1e-4 || any(ap.rgb > 1e-4))
-            color = color * ap.a + ap.rgb;
     }
 
 #if NPR_PASS
@@ -629,6 +669,30 @@ float4 main(PSIn i) : SV_TARGET
         }
     }
 #endif
+
+    // ---- Aerial Perspective composite ---------------------------------------
+    // Apply atmospheric scattering + transmittance based on view distance.
+    // LAST (after the NPR post-ramp): distance fog is a view-medium effect —
+    // it applies regardless of shading model, and the NPR brightness clamps
+    // must not crush it (the old placement before NPR_PASS was overwritten by
+    // `color = nprDiffuse + ...` on NPR pixels).
+    // Distance → 3D LUT slice uses the same quadratic mapping the baking
+    // shader uses:  slice_t = sqrt(distKm / maxDistKm).  Capped so very far
+    // points clamp to the last slice instead of mapping to uninitialised data.
+    if (aerialMaxDistKm > 0.0)
+    {
+        float distKm = length(worldPos - cameraPos) * 0.001; // metres → km
+        distKm = min(distKm, aerialMaxDistKm);               // clamp far range
+        float sliceT = saturate(sqrt(distKm / aerialMaxDistKm));
+        float4 ap = gAerialPerspective.SampleLevel(gSampler, float3(i.uv, sliceT), 0.0);
+
+        // Defensive guard: if the AP LUT hasn't been written yet (all-zero
+        // sample) the shader would multiply the scene by ap.a = 0 and paint
+        // everything black. Treat that sample as a no-op — `color` passes
+        // through unchanged until the LUT dispatch produces valid data.
+        if (ap.a > 1e-4 || any(ap.rgb > 1e-4))
+            color = color * ap.a + ap.rgb;
+    }
 
     return float4(color, 1.0);
 #endif // UNLIT

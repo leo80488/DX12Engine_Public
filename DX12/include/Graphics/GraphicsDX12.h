@@ -10,6 +10,8 @@
 //   [10..13] DESC_TABLE   1 SRV t2-t5 space0 → BindResource(slot 0-3)
 //   [14]   DESC_TABLE     16384 SRV t0 space1 → bindless g_Buffers[] (kMaxBindlessBuffers)
 //   [15..18] DESC_TABLE   1 sampler s0-s3     → BindSampler(slot 0-3)
+//   [19..45] DESC_TABLE   LightingPass SRVs   → IBL/shadow/cluster/probe/SSR/DDGI (see LightingPass.cpp)
+//   [46]   DESC_TABLE     1 SRV t41 space0    → PointShadowPass cube atlas (TextureCubeArray<float>)
 //
 // Compute root signature layout (space2):
 //   [0]  ROOT_CBV       b0 space2  → SetComputeRootCBV(0, ...)
@@ -29,7 +31,8 @@
 //   [14] DESC_TABLE     1 UAV u2 space2 ─┐  — XeGTAO prefilter mip 2
 //   [15] DESC_TABLE     1 UAV u3 space2  ├─ XeGTAO prefilter mip 3
 //   [16] DESC_TABLE     1 UAV u4 space2 ─┘  — XeGTAO prefilter mip 4
-//   static samplers: s0 space2 (linear clamp), s1 space2 (comparison PCF)
+//   static samplers: s0 space2 (linear clamp), s1 space2 (comparison PCF),
+//                    s2 space2 (linear wrap — tileable cloud noise/weather)
 //
 // Multi-threaded recording:
 //   BeginFrame() returns CommandList{0} (primary).
@@ -135,6 +138,13 @@ struct CommandList_DX12
     const ID3D12RootSignature* active_rootsig_compute  = nullptr;
     uint32_t                   prev_stencilref         = 0;
     bool                       dirty_pso               = false;
+
+    // ---- Debug-marker (PIX/RenderDoc) nesting depth ------------------------
+    // BeginEventMarker increments, EndEventMarker decrements (and suppresses an
+    // unmatched End at depth 0). EndFrame drains any leftover open markers
+    // before Close() so per-CL — and therefore queue-level — begin/end counts
+    // stay balanced even across the multi-CL worker passes (GBuffer/Terrain).
+    int                        markerDepth             = 0;
 
     // ---- Pending resource barriers (batched before draw) -------------------
     std::vector<D3D12_RESOURCE_BARRIER> frame_barriers;
@@ -249,9 +259,10 @@ public:
     // Returns a UNORM alias SRV for SRGB textures (raw sRGB data, no linearization).
     // For editor texture previews rendered to a UNORM RTV.
     uint64_t GetTexturePreviewSrvGpuHandle(const RHI::Texture& texture) const override;
-    // Stencil-plane SRV for D24_UNORM_S8_UINT depth textures. Created lazily in
-    // CreateTexture alongside the depth-plane SRV. Returns 0 if the texture is
-    // not stencil-bearing. Sampled as Texture2D<uint2>; read .y for stencil.
+    // Stencil-plane SRV for stencil-bearing depth textures (D32_FLOAT_S8X24 /
+    // D24_UNORM_S8). Created lazily in CreateTexture alongside the depth-plane
+    // SRV. Returns 0 if the texture is not stencil-bearing. Sampled as
+    // Texture2D<uint2>; read .y for stencil.
     uint64_t GetTextureStencilSRVGpuHandle(const RHI::Texture& texture) const override;
     uint64_t GetTextureUVPlaneSRVGpuHandle(const RHI::Texture& texture) const override;
     uint64_t CreateDepthTextureSRVTable(const RHI::Texture* textures,
@@ -486,6 +497,8 @@ public:
 
     uint32_t BeginGPUTimestamp(RHI::CommandList cmd, const char* name) override;
     void     EndGPUTimestamp  (RHI::CommandList cmd, uint32_t regionIndex) override;
+    void     BeginEventMarker (RHI::CommandList cmd, const char* name) override;
+    void     EndEventMarker   (RHI::CommandList cmd) override;
     bool     IsGPUProfilerEnabled() const override { return m_gpuProfiler.enabled; }
 
     void BindDescriptorHeaps(RHI::CommandList cmd) override;
@@ -865,8 +878,18 @@ private:
     // ---- GPU Profiler (timestamp queries) -----------------------------------
 public:
     GPUProfiler& GetGPUProfiler() { return m_gpuProfiler; }
+
+    // ---- Debug-marker (PIX/RenderDoc) opt-in --------------------------------
+    // OFF by default: the per-pass region markers trip a D3D12 debug-layer
+    // "PixEndEvent exceeds PixBeginEvent" warning because the multi-command-list
+    // worker passes (GBuffer/Terrain) split a pass's recording across several
+    // lists. Naming is still useful for a RenderDoc/PIX capture, so enable it
+    // on demand (e.g. just before capturing) rather than every frame.
+    void SetDebugMarkersEnabled(bool e) { m_debugMarkers = e; }
+    bool IsDebugMarkersEnabled() const  { return m_debugMarkers; }
 private:
     GPUProfiler  m_gpuProfiler;
+    bool         m_debugMarkers = false;
 
     // PSO library (optional — null until InitPSOLibrary is called or on unsupported HW)
     Microsoft::WRL::ComPtr<ID3D12PipelineLibrary> m_psoLibrary;

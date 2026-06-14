@@ -641,7 +641,15 @@ void CSMain(uint2 id : SV_DispatchThreadID)
     // sampling at full rate would be camera motion — and camera motion
     // gives velPx > 0.5 which gates this off (nearStatic falls to 0).
     float isMirror     = 1.0 - smoothstep(0.0, 0.2, roughness);
-    float mirrorDamp   = isMirror * (1.0 - smoothstep(0.5, 3.0, velPx));
+    // clipMag release: when the variance clip had to move history
+    // substantially, this pixel's content CHANGED (occluder swept past,
+    // background revealed) — the damp's premise (integrating per-frame
+    // specular shimmer on stable content) is void, and holding α at 0.02
+    // smears the stale history into a long ghost trail on mirror-like
+    // surfaces (water). Shimmer integration is untouched: jitter-phase
+    // sparkle moves history by far less than the 0.05–0.2 clip band.
+    float mirrorDamp   = isMirror * (1.0 - smoothstep(0.5, 3.0, velPx))
+                       * (1.0 - smoothstep(0.05, 0.2, clipMag));
     alpha = lerp(alpha, min(alpha, 0.02), mirrorDamp);
 
     // Disocclusion α-boost via depth + clipMag (max), gated by (1 - isHDRBright).
@@ -673,6 +681,19 @@ void CSMain(uint2 id : SV_DispatchThreadID)
         float disocclusion = max(disoccDepth, disoccClip);
 
         alpha = lerp(alpha, max(alpha, 0.5), disocclusion);
+
+        // HDR-bright pixels keep a TIGHTER, weaker depth-only rescue instead
+        // of none at all. The full HDR gate existed to stop sub-pixel jitter
+        // at HDR specular EDGES from α-boosting every frame (edge flicker),
+        // but it also killed the rescue across whole bright regions — on
+        // water (specular α≈0.025 + mirror damp 0.02 + γ≈3 specular box) a
+        // revealed background pixel kept its occluder's history for 40+
+        // frames: the "ghosting against water" artifact. A 15–35% relative
+        // depth gate still fires on real fg↔bg disocclusion (the gap is
+        // near-100%) while jitter noise along a continuous surface stays
+        // under it; boost target 0.4 keeps residual edge flicker mild.
+        float disoccDepthHDR = smoothstep(0.15, 0.35, depthMM) * isHDRBright;
+        alpha = lerp(alpha, max(alpha, 0.4), disoccDepthHDR);
     }
 
     // ---- Outline-aware history weakening -----------------------------------

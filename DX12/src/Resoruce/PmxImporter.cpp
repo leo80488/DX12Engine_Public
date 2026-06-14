@@ -205,6 +205,8 @@ namespace Resource
         result.normals.resize(static_cast<size_t>(vertexCount));
         result.uvs.resize(static_cast<size_t>(vertexCount));
         result.blendData.resize(static_cast<size_t>(vertexCount));
+        if (cfg.additionalUVCount > 0)
+            result.uv1.resize(static_cast<size_t>(vertexCount));
 
         for (int32_t vi = 0; vi < vertexCount; ++vi)
         {
@@ -222,8 +224,19 @@ namespace Resource
             result.normals[vi]   = ConvertPos3(nx, ny, nz);
             result.uvs[vi]       = { u, v };
 
-            // Additional UVs (skip)
-            Skip(p, end, static_cast<size_t>(cfg.additionalUVCount) * 16);
+            // Additional UVs: preserve the FIRST set's .xy as uv1 (the common
+            // case — lightmap / detail / toon offset); skip any beyond it. Each
+            // additional UV is a float4 (16 bytes) in PMX.
+            if (cfg.additionalUVCount > 0)
+            {
+                float au0x, au0y, au0z, au0w;
+                Read(p, end, au0x); Read(p, end, au0y);
+                Read(p, end, au0z); Read(p, end, au0w);
+                if (!result.uv1.empty())
+                    result.uv1[vi] = { au0x, au0y };
+                if (cfg.additionalUVCount > 1)
+                    Skip(p, end, static_cast<size_t>(cfg.additionalUVCount - 1) * 16);
+            }
 
             // Weight type
             uint8_t weightType = 0;
@@ -779,10 +792,36 @@ namespace Resource
         const std::string meshLibName = stem + ".meshlib";   // single file
         uint32_t meshEntryCount = 0;                          // final Entry[] size
 
-        std::vector<PackedVertex>     libVerts;       // shared VB
+        // PMX gains a 2nd UV set (uv1) when the model declares additional UVs;
+        // it never carries tangents or per-vertex color. Derive the interleaved
+        // layout from that single fact via the shared helper so the .meshlib
+        // round-trips through MeshLibrary::Load and MeshManager unchanged.
+        const bool pmxHasUV1 = !pmx.uv1.empty();
+        const uint32_t libFlags = pmxHasUV1 ? MESHLIB_FLAG_HAS_UV1 : 0u;
+        const MeshLibVertexLayout L = ComputeMeshLibVertexLayout(libFlags);
+
+        std::vector<uint8_t>          libVertBytes;   // shared interleaved VB
         std::vector<uint32_t>         libIndices;     // shared IB
         std::vector<MeshLibraryEntry> libEntries;     // one per non-empty PMX material
         libEntries.reserve(pmx.materials.size());
+
+        // Append one interleaved vertex (pos/normal/uv0 [+uv1]) to the shared VB.
+        auto appendVert = [&](const XMFLOAT3& pos, const XMFLOAT3& nrm,
+                              const XMFLOAT2& uv0, const XMFLOAT2* uv1ptr)
+        {
+            const size_t base = libVertBytes.size();
+            libVertBytes.resize(base + L.stride, 0u);
+            uint8_t* vp = libVertBytes.data() + base;
+            auto wF = [](uint8_t* p, float f) { std::memcpy(p, &f, sizeof(float)); };
+            wF(vp + L.posOffset + 0, pos.x); wF(vp + L.posOffset + 4, pos.y); wF(vp + L.posOffset + 8, pos.z);
+            wF(vp + L.normalOffset + 0, nrm.x); wF(vp + L.normalOffset + 4, nrm.y); wF(vp + L.normalOffset + 8, nrm.z);
+            wF(vp + L.uv0Offset + 0, uv0.x); wF(vp + L.uv0Offset + 4, uv0.y);
+            if (L.uv1Offset != 0xFFFFFFFFu)
+            {
+                const XMFLOAT2 u1 = uv1ptr ? *uv1ptr : uv0;
+                wF(vp + L.uv1Offset + 0, u1.x); wF(vp + L.uv1Offset + 4, u1.y);
+            }
+        };
 
         struct MeshBlendEntry { uint32_t meshIdx; std::vector<BlendVertex> data; };
         std::vector<MeshBlendEntry> meshBlends;
@@ -834,7 +873,8 @@ namespace Resource
                 const auto& pos = pmx.positions[gi];
                 const auto& nrm = pmx.normals[gi];
                 const auto& uv  = pmx.uvs[gi];
-                libVerts.push_back({ pos.x, pos.y, pos.z, nrm.x, nrm.y, nrm.z, uv.x, uv.y });
+                const XMFLOAT2* uv1p = pmxHasUV1 ? &pmx.uv1[gi] : nullptr;
+                appendVert(pos, nrm, uv, uv1p);
                 blends[li] = pmx.blendData[gi];
 
                 if (pos.x < bmin[0]) bmin[0] = pos.x;
@@ -874,16 +914,16 @@ namespace Resource
         if (!libEntries.empty())
         {
             const uint32_t entryBytes = static_cast<uint32_t>(libEntries.size() * sizeof(MeshLibraryEntry));
-            const uint32_t vbBytes    = static_cast<uint32_t>(libVerts.size()   * sizeof(PackedVertex));
+            const uint32_t vbBytes    = static_cast<uint32_t>(libVertBytes.size());
             const uint32_t ibBytes    = static_cast<uint32_t>(libIndices.size() * sizeof(uint32_t));
 
             MeshLibraryMetadata libMeta{};
             libMeta.meshCount    = static_cast<uint32_t>(libEntries.size());
-            libMeta.vertexCount  = static_cast<uint32_t>(libVerts.size());
+            libMeta.vertexCount  = static_cast<uint32_t>(libVertBytes.size() / L.stride);
             libMeta.indexCount   = static_cast<uint32_t>(libIndices.size());
-            libMeta.vertexStride = sizeof(PackedVertex);
+            libMeta.vertexStride = static_cast<uint16_t>(L.stride);
             libMeta.indexStride  = 4;
-            libMeta.flags        = 0;
+            libMeta.flags        = libFlags;
             libMeta.reserved     = 0;
 
             AssetHeader libHdr{};
@@ -899,9 +939,9 @@ namespace Resource
             uint8_t* dst = blob.data();
             std::memcpy(dst, &libHdr,          sizeof(AssetHeader));         dst += sizeof(AssetHeader);
             std::memcpy(dst, &libMeta,         sizeof(MeshLibraryMetadata)); dst += sizeof(MeshLibraryMetadata);
-            std::memcpy(dst, libEntries.data(), entryBytes);                  dst += entryBytes;
-            std::memcpy(dst, libVerts.data(),   vbBytes);                     dst += vbBytes;
-            std::memcpy(dst, libIndices.data(), ibBytes);
+            std::memcpy(dst, libEntries.data(),  entryBytes);                 dst += entryBytes;
+            std::memcpy(dst, libVertBytes.data(), vbBytes);                   dst += vbBytes;
+            std::memcpy(dst, libIndices.data(),  ibBytes);
 
             files.push_back({ stem + "/" + meshLibName, std::move(blob) });
         }

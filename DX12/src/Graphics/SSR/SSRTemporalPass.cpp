@@ -135,6 +135,15 @@ void SSRTemporalPass::Execute(RHI::CommandList cl,
     if (!colorCurrentSrv) return;
 
     auto& dx12 = static_cast<GraphicsDX12&>(*m_gfx);
+    // Advance the ping-pong BEFORE binding. The upsample pass (and the SSR
+    // debug window) call Get*Srv() right after Execute and must receive the
+    // buffer written THIS frame. With the flip at the END of Execute, those
+    // getters returned the buffer that served as history — the composite
+    // blended a reflection accumulated under the PREVIOUS camera pose onto
+    // the current frame with no reprojection, detaching reflections from
+    // their contact line by one frame of screen motion whenever the camera
+    // moved (pixel-perfect when stationary, so it hid for months).
+    m_writeIdx = 1u - m_writeIdx;
     const uint32_t readIdx = 1u - m_writeIdx;
 
     SSRTemporalPass::SSRTemporalCB cb{};
@@ -201,6 +210,5 @@ void SSRTemporalPass::Execute(RHI::CommandList cl,
         &m_depthHistory[m_writeIdx], RHI::ResourceState::UNORDERED_ACCESS,
         RHI::ResourceState::SHADER_RESOURCE), cl);
 
-    m_writeIdx     = readIdx;
     m_resetHistory = false;
 }

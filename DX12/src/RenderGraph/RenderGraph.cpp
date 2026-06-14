@@ -268,7 +268,11 @@ namespace RG
 
             RHI::BindFlag flags = RHI::BindFlag::NONE;
             if (vt.hasRTV) flags |= RHI::BindFlag::RENDER_TARGET;
-            if (vt.hasDSV) flags |= RHI::BindFlag::DEPTH_STENCIL;
+            // isDepth textures need the DS flag even when no pass declares a
+            // depth WRITE (e.g. SSRTraceDepth is only ever copy-dst + SRV):
+            // they are created in DEPTHSTENCIL layout below, which D3D12
+            // rejects without ALLOW_DEPTH_STENCIL on the resource.
+            if (vt.hasDSV || vt.desc.isDepth) flags |= RHI::BindFlag::DEPTH_STENCIL;
             if (vt.hasSRV) flags |= RHI::BindFlag::SHADER_RESOURCE;
             if (vt.hasUAV) flags |= RHI::BindFlag::UNORDERED_ACCESS;
             tdesc.bind_flags = flags;
@@ -382,6 +386,11 @@ namespace RG
             r.profilerRegion = gfx.BeginGPUTimestamp(
                 r.cl, m_passes[i].pass->GetName());
 
+            // Name the pass for GPU-capture tools (RenderDoc/PIX). Emitted
+            // unconditionally (unlike the timestamp, which is gated on the
+            // profiler) so every pass is identifiable in a capture.
+            gfx.BeginEventMarker(r.cl, m_passes[i].pass->GetName());
+
             prevCL = r.cl;
         }
 
@@ -406,6 +415,11 @@ namespace RG
             for (size_t i = 0; i < passCount; ++i)
                 gfx.EndGPUTimestamp(recs[i].cl, recs[i].profilerRegion);
         }
+
+        // Close the per-pass debug-marker regions (always — profiler-independent;
+        // balances the BeginEventMarker emitted for every pass in Phase A).
+        for (size_t i = 0; i < passCount; ++i)
+            gfx.EndEventMarker(recs[i].cl);
 
         // External waits are per-frame; clear so a stale dep from a previous
         // frame doesn't leak into the next graph run.

@@ -27,18 +27,19 @@ C++20 / Direct3D 12（Shader Model 6.6、DXC 経由の DXIL）で記述された
 
 **Rendering**
 - バインドレスな per-vertex-format（PVF）ジオメトリと ExecuteIndirect による GPU カリングを備えたディファード G-Buffer
-- クラスタード Forward+ / ディファードライティング（16×9×24 フロクセル）、4 カスケード CSM（近距離 3 + 超遠距離地形 1）+ スポットシャドウアトラス
+- クラスタード Forward+ / ディファードライティング（16×9×24 フロクセル）、4 カスケード CSM（近距離 3 + 超遠距離地形 1）+ スポットシャドウアトラス + 全方位ポイントライトシャドウキューブ
 - DDGI（インライン RayQuery、プローブごとの SH イラディアンス、最大 4 ボリューム）、ランタイムベイクのリフレクションプローブ、Hi-Z 確率的 SSR サブシステム
-- Hillaire 2020 大気、sky-SH IBL、IBL キューブ + BRDF LUT、ボリュメトリッククラウド
-- フロクセルボリュメトリックフォグ + ボリュメトリックレイマーチによる god-ray
-- TAA + FXAA、XeGTAO、Bloom（Sledgehammer）、CAS、Auto-Exposure、Lens Flare、Tonemap、Color Grading
-- メッシュシェーダー地形パイプライン、デカール、アウトライン（3 パス）、glass-shatter、GPU パーティクル / トレイル / トレーサー / ビーム / アフターイメージ
+- Hillaire 2020 大気、sky-SH IBL、IBL キューブ + BRDF LUT、気象マップ駆動のボリュメトリッククラウド（Nubis/Frostbite 密度 + Worley ディテール侵食）
+- フロクセルボリュメトリックフォグ + ボリュメトリックレイマーチによる god-ray + 解析的な指数ハイトフォグ
+- TAA + FXAA、XeGTAO、被写界深度（Depth of Field）、Bloom（Sledgehammer）、CAS、Auto-Exposure、Lens Flare、NPR スタイライズ（Kuwahara / Posterize / Halftone / Dither / Crosshatch / Pixelate）、Tonemap、Color Grading
+- メッシュシェーダー地形パイプライン、プロシージャル草原（地形アンカーの Bezier ブレード、風、距離 LOD）、平面水面（Fresnel 反射、フローノーマル、深度吸収）+ 水中歪みポスト
+- デカール、アウトライン（3 パス）、glass-shatter、GPU パーティクル / トレイル / トレーサー / ビーム / アフターイメージ / スプライトシートビルボード
 - GPU スキニング + モーフターゲット + CCD IK（地形対応のフット IK を含む）+ ソケット + チェーン / スプリングボーン物理
 - ハードウェアビデオデコード（FFmpeg D3D12VA → NV12 YUV→RGB コンポジット、スクリーン空間およびワールド空間）
 
 **Engine**
 - コンポーネントごとのプール（sparse-set）ECS、16 フェーズの依存関係を考慮した並列スケジューラ、シーングラフ階層
-- ポストプロセスボリュームシステム、AnimNotify / Timeline ランタイム、time-of-day、GUID 安定なエンティティ参照
+- ポストプロセスボリューム + プロファイルシステム（アセットベースの `.ppprofile`、プロパティごとのレイヤーブレンド、一時的なゲームプレイオーバーライド）、AnimNotify / Timeline ランタイム、time-of-day、GUID 安定なエンティティ参照
 - リソースクッカー（Mesh / `.meshlib` / Material / Texture / Animation / Skeleton / PMX / VMD / VRM / Audio）+ `.ipak` 仮想ファイルシステム
 - 非同期ロード、GPU BC 圧縮、ディスクリプタヒープアロケータ、PSO + DXIL シェーダーブロブキャッシュ、ホットリロード
 - Jolt Physics + キネマティックキャラクターコントローラ、Recast/Detour ナビゲーション、ビヘイビアツリー AI（Intent / Tactical / LOD レイヤ）
@@ -47,7 +48,7 @@ C++20 / Direct3D 12（Shader Model 6.6、DXC 経由の DXIL）で記述された
 **Tooling**
 - ImGui ドッキングエディタ（Hierarchy / Viewport / Inspector / Asset Browser / Timeline + SSR / Font / Camera / Profiler デバッグウィンドウ）
 - ShaderLab サブ秒のシェーダーイテレーションサンドボックス
-- Lua 5.4 + sol2 スクリプティング（ゲームプレイ、UI、AI ビヘイビアツリー）、GameModeStack シーンフロー
+- Lua 5.4 + sol2 スクリプティング（ゲームプレイ、UI、AI ビヘイビアツリー）、データ駆動シーン（`game.json` レジストリ + シーンごとの `OnSceneEnter/Update/Exit` Lua フック）
 - Jolt Physics、XAudio2 + X3DAudio
 
 ## Build

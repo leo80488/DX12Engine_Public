@@ -59,6 +59,14 @@ struct RigidBodyComponent : ComponentBase
         if (v) lockedAxes |= a; else lockedAxes = static_cast<std::uint8_t>(lockedAxes & ~a);
     }
 
+    // One-shot launch velocity (world-space). Applied by PhysicsSystem exactly
+    // once when the Jolt body is first created, then cleared. Lets a script
+    // (Physics.SpawnBall) launch a freshly-spawned dynamic body across the
+    // lazy-body-creation gap. Runtime-only — never serialized.
+    DirectX::XMFLOAT3 initialVelocity        = { 0.f, 0.f, 0.f };
+    DirectX::XMFLOAT3 initialAngularVelocity = { 0.f, 0.f, 0.f };
+    bool              hasInitialVelocity     = false;
+
     // Runtime — populated by PhysicsSystem on creation. Do not edit.
     std::uint32_t bodyId = kInvalidPhysicsBodyId;
     // Generation of the ColliderComponent the active body was built from.

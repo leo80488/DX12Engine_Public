@@ -28,6 +28,7 @@ static constexpr uint32_t kDDGIVolumeBufSlot         = 42;  // t28 space0  Struc
 static constexpr uint32_t kDDGIProbeSHSlot           = 43;  // t29..t32 space0  StructuredBuffer<DDGIProbeSH>[4]
 static constexpr uint32_t kDDGIDepthSlot             = 44;  // t33..t36 space0  Texture2D<float2>[4]
 static constexpr uint32_t kDDGIProbeDataSlot         = 45;  // t37..t40 space0  StructuredBuffer<DDGIProbeData>[4]
+static constexpr uint32_t kPointShadowAtlasSlot      = 46;  // t41 space0  TextureCubeArray<float>
 
 // Stencil refs — must match GBufferPass writes.
 static constexpr uint8_t kStencilPBR   = 1;
@@ -87,7 +88,7 @@ PSODesc LightingPass::BuildPSODesc(Variant variant) const
     desc.bs.render_target[0].render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
     desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
     desc.rtvCount      = 1;
-    desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
     // Fullscreen triangle: depth off; stencil EQUAL gates by material type.
     desc.dss.depth_enable       = false;
@@ -220,6 +221,22 @@ void LightingPass::Init(IGraphicsDevice& gfx)
         if (gfx.CreateBuffer(bd, m_spotShadowVPFallbackBuf, identity))
             m_spotShadowVPFallback = gfx.GetBufferSRVGpuHandle(m_spotShadowVPFallbackBuf);
     }
+    // Point-shadow cube atlas fallback: 1×1 TextureCubeArray (2 cubes → the SRV
+    // resolves to TEXTURECUBEARRAY, matching the shader's t41 declaration).
+    // Content is moot — Lighting.ps only samples it when a point light owns a
+    // cube (shadowSliceIdx != 0xFFFFFFFF), which never happens with no casters.
+    {
+        RHI::TextureDesc td;
+        td.format     = RHI::Format::R32_FLOAT;
+        td.width      = 1; td.height = 1;
+        td.array_size = 12;  // 2 cubes — CreateTexture needs array_size > 6 && %6==0
+        td.misc_flags = RHI::ResourceMiscFlag::TEXTURECUBE;
+        td.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
+        if (gfx.CreateTexture(td, m_pointShadowAtlasFallbackTex))
+            m_pointShadowAtlasFallback = gfx.GetTextureSRVGpuHandle(m_pointShadowAtlasFallbackTex);
+        else
+            LOG_ERROR("LightingPass: point-shadow cube fallback creation failed");
+    }
     // NPR ramp 1×1 white — NPR_COLOR materials need a valid Texture2D<float4> at t16.
     {
         RHI::TextureDesc td;
@@ -296,6 +313,10 @@ RHI::CommandList LightingPass::Execute(RHI::CommandList cl)
             m_spotShadowAtlasHandle ? m_spotShadowAtlasHandle : m_spotShadowAtlasFallback);
         cl.BindDescriptorTableHandle(kSpotShadowVPSlot,
             m_spotShadowVPHandle    ? m_spotShadowVPHandle    : m_spotShadowVPFallback);
+
+        // ---- Point-shadow cube atlas (TextureCubeArray<float> @ t41) ----
+        cl.BindDescriptorTableHandle(kPointShadowAtlasSlot,
+            m_pointShadowAtlasHandle ? m_pointShadowAtlasHandle : m_pointShadowAtlasFallback);
 
         // ---- Reflection probes (probeArray doubles as fallback for the other 3) ----
         cl.BindDescriptorTableHandle(kReflectionProbeArraySlot,  m_reflectionProbeArrayHandle);

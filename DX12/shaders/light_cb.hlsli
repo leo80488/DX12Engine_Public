@@ -55,7 +55,7 @@ cbuffer LightCB : register(LIGHT_CB_REGISTER, space0)
     float4x4 shadowMatrix[4];          // per-cascade light VP (row-major, transposed)
     float4   cascadeSplits;            // view-Z far boundary of each cascade
     float4   cascadeTexelWorldSize;    // world m/texel per cascade (receiver bias)
-    float    shadowBias;               // legacy uniform receiver bias
+    float    shadowBias;               // constant receiver compare bias (NDC, shadow.hlsli)
     float    shadowStrength;           // 0 = disabled, 1 = full shadows
     float    shadowMapTexelSize;       // 1.0 / kShadowMapSize, precomputed
     float    shadowBlendRange;         // cascade blend zone width in view-Z (world units)

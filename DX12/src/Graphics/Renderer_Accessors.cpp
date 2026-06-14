@@ -18,8 +18,8 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
 
 // Renderer_Accessors.cpp — split out of Renderer.cpp (one TU per Renderer subsystem).
 // All members belong to class Renderer (declared in Graphics/Renderer.h).

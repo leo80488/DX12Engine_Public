@@ -20,6 +20,7 @@ enum class DebugCategory : uint32_t
     ReflectionProbes = 1u << 4,  // reflection-probe influence volumes
     DDGIVolumes      = 1u << 5,  // DDGI volume bounds + probe crosses
     NavMesh          = 1u << 6,  // recast/detour navmesh polygons
+    PostProcessVolumes = 1u << 9, // post-process volume bounds + blend-distance shell
     // ---- Billboard-icon categories (standalone gizmos, not under the
     //      wireframe master switch). Add new icon kinds here + in
     //      DebugDrawSystem.cpp's kIconKinds[]. ----

@@ -16,12 +16,11 @@
 #include "Graphics/GraphicsStruct.h"  // RHI::CommandList
 
 class IGraphicsDevice;
-class World;
 
 namespace PostProcess
 {
 
-class ParameterStore;
+struct ResolvedPostProcessSettings;
 
 // Fixed execution slots. Order = execution order.
 //
@@ -39,6 +38,8 @@ enum class Stage : uint8_t
     LensFlare,             // current: procedural directional-light lens flare
     ChromaticAberration,   // reserved
     LensDistortion,        // reserved
+    Underwater,            // current: underwater screen distortion + tint (HDR)
+    Stylize,               // current: NPR (Kuwahara/Posterize/Halftone/Dither/Crosshatch)
 
     // ---- HDR → LDR crossing ----
     Tonemapping,           // current: ACES + baked 3D LUT color grading
@@ -67,17 +68,15 @@ struct Context
     uint32_t viewportHeight = 0;
     float    deltaTime      = 0.0f;
 
-    // World-space camera position. Fed to VolumeSystem for per-frame
-    // weight computation (distance-to-boundary falloff).
-    DirectX::XMFLOAT3 cameraPos = { 0.0f, 0.0f, 0.0f };
-
-    // ECS world — read by EntityVolumeSource to iterate VolumeComponent.
-    // Null when called outside a scene context. Non-owning.
-    class World* world = nullptr;
-
     // Running HDR scene SRV. Mutated by HDR-space producer effects (CAS, TAA
     // upstream). Readers: AutoExposure, Bloom, Tonemapping.
     uint64_t hdrSrv = 0;
+
+    // Hardware scene depth SRV (reverse-Z, full-res) + camera planes — set by
+    // the Renderer. Read by depth-aware effects (Depth of Field).
+    uint64_t depthSrv   = 0;
+    float    cameraNear = 0.1f;
+    float    cameraFar  = 1000.0f;
 
     // Written by AutoExposure effect, read by Tonemapping effect.
     uint64_t exposureSrv = 0;
@@ -86,11 +85,10 @@ struct Context
     // Written by LensFlare effect, read by Tonemapping effect.
     uint64_t lensFlareSrv = 0;
 
-    // Authoritative parameters for every Stage. Adapters read their block
-    // here; EditorLayer / config / future Volume blender write to it.
-    // Non-owning — lifetime is the PostProcess::Stack that produced the
-    // context.
-    ParameterStore* params = nullptr;
+    // The frame's fully-resolved post-process settings — the contract produced
+    // by the volume/profile resolve (PostProcessResolveSystem) and consumed by
+    // the adapters. Non-owning; valid for the duration of Stack::Execute().
+    const ResolvedPostProcessSettings* resolved = nullptr;
 };
 
 class IEffect

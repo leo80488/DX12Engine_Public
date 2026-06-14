@@ -150,7 +150,7 @@ bool DDGIProbeDebugPass::Init(IGraphicsDevice& gfx)
     pd.DepthStencilState.DepthEnable     = TRUE;
     pd.DepthStencilState.DepthWriteMask  = D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc       = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-    pd.DSVFormat                         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.DSVFormat                         = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.NumRenderTargets                  = 1;
     pd.RTVFormats[0]                     = DXGI_FORMAT_R16G16B16A16_FLOAT;
 
@@ -195,7 +195,7 @@ bool DDGIProbeDebugPass::ReloadShaders(IGraphicsDevice& gfx)
     pd.DepthStencilState.DepthEnable     = TRUE;
     pd.DepthStencilState.DepthWriteMask  = D3D12_DEPTH_WRITE_MASK_ZERO;
     pd.DepthStencilState.DepthFunc       = D3D12_COMPARISON_FUNC_GREATER_EQUAL;
-    pd.DSVFormat                         = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    pd.DSVFormat                         = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
     pd.NumRenderTargets                  = 1;
     pd.RTVFormats[0]                     = DXGI_FORMAT_R16G16B16A16_FLOAT;
     return SUCCEEDED(dx12.GetDevice()->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&m_pso)));

@@ -23,15 +23,19 @@
 #include <array>
 #include <memory>
 #include <string>
+#include <vector>
 #include <DirectXMath.h>
 
 // One PBR layer in a terrain splat blend. Phase 3 ships full PBR:
 //   albedoPath  — diffuse / albedo (RGB)
 //   normalPath  — tangent-space normal (DX convention: Y-up)
 //   armPath     — packed AO / Roughness / Metalness (R / G / B)
-//   dispPath    — single-channel height for height-correlated blending
-// Engine-side ordering must match the splatmap channel mapping:
-//   layer0 = R, 1 = G, 2 = B, 3 = A.
+//   dispPath    — single-channel height; biases the splat blend so layer
+//                 transitions follow the micro-relief (height-correlated
+//                 blend). Only consulted when TerrainComponent.heightBlend
+//                 is enabled; missing → that layer contributes 0 bias.
+// When a splatmap is set, the first 4 layers map to its RGBA channels
+// (layer0 = R, 1 = G, 2 = B, 3 = A); the auto-blend path supports any count.
 struct TerrainLayer
 {
     std::string albedoPath;
@@ -107,13 +111,21 @@ struct TerrainComponent
     // World-space tile placement.
     //   X ∈ [worldCenter.x - worldSize*0.5, worldCenter.x + worldSize*0.5]
     //   Z ∈ [worldCenter.z - worldSize*0.5, worldCenter.z + worldSize*0.5]
-    // worldCenter.y is the BASE / floor of the terrain — the heightmap
-    // raises the surface by [0, heightScale] world units above it:
+    // worldCenter.y is the BASE / floor of the terrain and heightScale is
+    // the TOTAL RELIEF (valley floor → highest peak):
     //   Y ∈ [worldCenter.y, worldCenter.y + heightScale]
-    // So bumping heightScale only grows the peaks upward; the base stays
-    // pinned to worldCenter.y. Equivalently, bumping worldSize keeps the
-    // tile centred on (worldCenter.x, worldCenter.z) — the pivot is stable
-    // while you tune the macro shape.
+    // The Renderer re-anchors the heightmap's ACTUAL data range onto that
+    // span (see Renderer_Terrain.cpp "height-range re-anchoring"): the
+    // lowest sampled value maps to worldCenter.y, the highest to
+    // worldCenter.y + heightScale. So bumping heightScale only grows the
+    // peaks upward — the valley floor stays pinned at worldCenter.y even
+    // when the heightmap doesn't use the full [0,1] encodable range (most
+    // don't; raw mapping would translate the whole tile by
+    // dataMin × heightScale on every scale edit). Until the CPU HeightField
+    // is decoded (R16_UNORM only) the raw mapping is used as a fallback.
+    // Equivalently, bumping worldSize keeps the tile centred on
+    // (worldCenter.x, worldCenter.z) — the pivot is stable while you tune
+    // the macro shape.
     DirectX::XMFLOAT3 worldCenter   { 0.0f, 0.0f, 0.0f };
     float             worldSize     = 1024.0f;
     float             heightScale   = 100.0f;
@@ -147,14 +159,41 @@ struct TerrainComponent
     // so terrain stays visible even before splatmap authoring is done.
     std::string splatmapPath;
 
-    // 4 layers blended by splatmap RGBA.
-    std::array<TerrainLayer, 4> layers;
+    // PBR layers blended by splatmap RGBA (first 4 channels) or by the
+    // per-layer height/slope auto-blend (any count). Count is data-driven —
+    // the GPU loops over layers.size() via a StructuredBuffer, so adding /
+    // removing a layer is a pure data edit (no shader/CB/struct changes).
+    // Defaults to 4 entries to match the historical fixed-4 authoring.
+    std::vector<TerrainLayer> layers = std::vector<TerrainLayer>(4);
+
+    // ---- Height-correlated blend (per-layer displacement) -------------------
+    // When enabled, each layer's blend weight is biased by its disp map so
+    // transitions follow the underlying micro-relief instead of a flat lerp
+    // ("grass pokes through where the gravel dips"). Off by default → identical
+    // to the plain linear splat/auto blend, so existing scenes are unchanged.
+    //   strength — how strongly disp biases the base weight. Small (0.1–0.2)
+    //              keeps splat/gate dominant; large lets disp override.
+    //   range    — soft cutoff width: a layer keeps weight while its biased
+    //              value is within `range` of the local maximum. Wider =
+    //              smoother multi-layer blends; narrower = sharper interlock.
+    bool  heightBlendEnabled  = false;
+    float heightBlendStrength = 0.15f;
+    float heightBlendRange    = 0.10f;
 
     // Renderer-internal — populated by SyncTerrain each frame.
     mutable Resource::TextureHandle heightmapHandle = Resource::kInvalidTextureHandle;
     mutable uint64_t                heightmapSRV    = 0;
     mutable Resource::TextureHandle splatmapHandle  = Resource::kInvalidTextureHandle;
     mutable uint64_t                splatmapSRV     = 0;
+
+    // Renderer-internal — the RE-ANCHORED world-Y mapping actually fed to
+    // the GPU (TerrainParamsCB) and CPU (HeightField) this frame:
+    //   worldY = effBaseY + rawSample01 * effHeightScale
+    // Equal to (worldCenter.y, heightScale) until the heightmap's data range
+    // is known, then adjusted so the data minimum lands on worldCenter.y.
+    // Grass/Water sync read these so every height consumer agrees.
+    mutable float effBaseY        = 0.0f;
+    mutable float effHeightScale  = 0.0f;
 
     // CPU-side height grid for collision / queries. Renderer decodes this
     // out of the loaded R16_UNORM heightmap the first frame the texture

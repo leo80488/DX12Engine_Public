@@ -55,6 +55,52 @@ StructuredBuffer<float4> gSkySH : register(t19, space0);
 
 SamplerState g_LinearWrap : register(s0, space0);
 
+// Frame-global shadow + ambient controls (filled by ReflectionProbeCapturePass).
+// cascadeVP mirrors LightCB.shadowMatrix (transposed) so the same row-vector
+// mul + cascade-select used by the deferred pass works here unchanged.
+cbuffer ProbeShadowCB : register(b2, space0)
+{
+    float4x4 c_cascadeVP[4];
+    float4   c_cascadeSplits;
+    float3   c_camPos;        float c_shadowStrength;
+    float3   c_camFwd;        float c_iblStrength;
+    float    c_ambientScale;  float3 c_shadowPad;
+};
+
+// CSM sun shadow map + comparison sampler (reversed-Z, GREATER_EQUAL). Bound by
+// the capture pass; only sampled when c_shadowStrength > 0 (a directional light
+// is casting), so an unshadowed bake never touches these.
+Texture2DArray<float>  gShadowCascades : register(t9, space0);
+SamplerComparisonState gShadowSampler  : register(s2, space0);
+
+// Lightweight CSM sample for the bake — cascade-select like shadow.hlsli, but a
+// cheap 4-tap PCF (the captured cube is only 128² so heavy filtering is wasted).
+// Cascades are built around the MAIN camera, so a probe outside the camera's
+// cascade range bakes unshadowed (viewZ past the far split → returns 1.0).
+float SampleSunShadow(float3 worldPos)
+{
+    if (c_shadowStrength <= 0.0) return 1.0;
+    float viewZ = dot(worldPos - c_camPos, c_camFwd);
+    if (viewZ > c_cascadeSplits.w) return 1.0;
+    int c = 0;
+    if      (viewZ > c_cascadeSplits.z) c = 3;
+    else if (viewZ > c_cascadeSplits.y) c = 2;
+    else if (viewZ > c_cascadeSplits.x) c = 1;
+
+    float4 sp = mul(float4(worldPos, 1.0), c_cascadeVP[c]);
+    sp.xyz /= sp.w;
+    float2 uv = sp.xy * float2(0.5, -0.5) + 0.5;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || sp.z < 0.0 || sp.z > 1.0)
+        return 1.0;
+
+    const float t = 1.0 / 2048.0;  // ShadowPass::kShadowMapSize
+    float s = gShadowCascades.SampleCmpLevelZero(gShadowSampler, float3(uv, (float)c), sp.z)
+            + gShadowCascades.SampleCmpLevelZero(gShadowSampler, float3(uv + float2( t,  t), (float)c), sp.z)
+            + gShadowCascades.SampleCmpLevelZero(gShadowSampler, float3(uv + float2(-t,  t), (float)c), sp.z)
+            + gShadowCascades.SampleCmpLevelZero(gShadowSampler, float3(uv + float2( t, -t), (float)c), sp.z);
+    return lerp(1.0, s * 0.25, c_shadowStrength);
+}
+
 // Mirror of Lighting.ps's EvalSH2 — kept inline so this shader is
 // self-contained (the lighting shader's helper sits behind a mountain of
 // includes we don't want to drag into the capture pipeline).
@@ -131,16 +177,27 @@ float4 main(PSIn i) : SV_TARGET
     float3x3 TBN = float3x3(T, BT, N);
     N = normalize(mul(ts, TBN));
 
-    // Direct sun — Lambert. Sun direction in capture CB is the world-space
-    // direction the light TRAVELS in, so the surface-toward-sun vector flips.
-    float3 L    = normalize(-c_sunDir);
-    float  NdL  = saturate(dot(N, L));
-    float3 sun  = baseColor.rgb * c_sunColor * NdL;
+    // Baked ambient occlusion — surface map's R channel (R=AO, matches
+    // GBuffer.ps input convention). Occludes the ambient term so crevices /
+    // interiors aren't baked as bright as open surfaces. 1.0 when no map.
+    float ao = 1.0;
+    int   texSurface = mat.textureHandleIds[2]; // SURFACEMAP
+    if (texSurface >= 0)
+        ao = g_AllTextures[texSurface].Sample(g_LinearWrap, i.uv).r;
 
-    // Ambient — SkySH gives a low-frequency environment irradiance that
-    // matches what the lighting pass uses for the diffuse IBL term, so
-    // baked probes inherit the same colour palette as the final shading.
-    float3 amb  = baseColor.rgb * EvalSH2(N);
+    // Direct sun — Lambert, now SHADOWED by the main camera's CSM so roofed
+    // interiors don't bake full sunlight. Sun direction is the world-space
+    // direction the light TRAVELS in, so the surface-toward-sun vector flips.
+    float3 L      = normalize(-c_sunDir);
+    float  NdL    = saturate(dot(N, L));
+    float  shadow = SampleSunShadow(i.worldPos);
+    float3 sun    = baseColor.rgb * c_sunColor * NdL * shadow;
+
+    // Ambient — SkySH environment irradiance, scaled by the live iblStrength
+    // (so the capture matches the indirect level the main pass uses) × the
+    // artist bake-ambient knob × baked AO. Without this the bake slapped full,
+    // unoccluded sky ambient on every surface → over-bright sky-tinted interiors.
+    float3 amb  = baseColor.rgb * EvalSH2(N) * (c_iblStrength * c_ambientScale * ao);
 
     // Output HDR linear. No tonemap, no exposure — the prefilter compute
     // shader needs raw radiance to generate physically-meaningful mip levels.

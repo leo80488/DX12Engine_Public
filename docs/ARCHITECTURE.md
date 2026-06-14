@@ -6,7 +6,7 @@
 | ---------------- | ------------------------------------------------------------------------------- |
 | **ECS World**    | All entity / component data — pure game-side state.                             |
 | **Scheduler**    | 16-phase, dependency-aware parallel system tick over the ECS World.             |
-| **Renderer**     | Translates ECS data into GPU-ready `DrawPacket`s (no DX12 types). Split across `Renderer.cpp` + `Renderer_Scene/_DDGI/_IBL/_Terrain/_Accessors.cpp`. |
+| **Renderer**     | Translates ECS data into GPU-ready `DrawPacket`s (no DX12 types). Split across `Renderer.cpp` + `Renderer_Scene/_DDGI/_IBL/_Terrain/_GrassWater/_Accessors.cpp`. |
 | **RenderGraph**  | Lambda- and class-based pass DAG, transient resources, automatic barrier injection. |
 | **RenderPass**   | Individual passes; consume RHI types only.                                      |
 | **RHI**          | Abstract command list & resource handles (`RHICommandList`, `RGTextureHandle`). |

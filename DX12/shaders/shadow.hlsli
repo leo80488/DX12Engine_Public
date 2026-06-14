@@ -117,7 +117,16 @@ float SampleCascadeShadow(int idx, float3 worldPos, float3 N, float2 screenPos)
         // RPDB: predicted surface depth at this tap. Reversed-Z safe because
         // dot(grad, off) tracks the SAME plane the centre sample lies on,
         // so the comparison reference moves with the surface.
-        float  depthAtTap = depthCenter + dot(rpdb, off);
+        //
+        // + shadowBias: constant receiver-side comparison bias (LightCB,
+        // 0.0003 NDC). Reversed-Z: RAISING the reference makes the
+        // GREATER_EQUAL compare pass more easily → biases toward lit. This
+        // was uploaded but never read after the shadow.hlsli rewrite —
+        // normal-offset scales by (1 − NdotL) and RPDB only tracks the
+        // receiving plane, so neither covers plain rasterization/
+        // quantization mismatch between the caster grid and the receiver;
+        // that residual is exactly the BACK-cull acne speckle.
+        float  depthAtTap = depthCenter + dot(rpdb, off) + shadowBias;
         shadow += gShadowCascades.SampleCmpLevelZero(
             gShadowSampler, float3(uv + off, float(idx)), depthAtTap);
     }

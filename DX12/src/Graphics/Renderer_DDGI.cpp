@@ -3,6 +3,8 @@
 // engine graphics / backend
 #include "Graphics/GraphicsDX12.h"
 #include "Graphics/ReflectionProbeTypes.h"
+#include "Graphics/ShadowSystem.h"
+#include "RenderGraph/RenderPass/ShadowPass.h"
 
 // render passes
 #include "RenderGraph/RenderPass/DDGIPass.h"
@@ -31,8 +33,8 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
 
 // Renderer_DDGI.cpp — split out of Renderer.cpp (one TU per Renderer subsystem).
 // All members belong to class Renderer (declared in Graphics/Renderer.h).
@@ -125,6 +127,7 @@ void Renderer::BuildScene_UploadProbes(World& world)
             std::min(inner.x, outer.x),
             std::min(inner.y, outer.y),
             std::min(inner.z, outer.z) };
+        gpu.intensity = std::max(0.0f, comp.intensity);
 
         if (!comp.IsBaked() || comp.NeedsRebake())
             m_probeMgr.EnqueueBake(slice);
@@ -458,9 +461,28 @@ void Renderer::ProcessProbeBakeQueue(RHI::CommandList colorLastCL)
     ctx.probePos         = { gt->matrix._41, gt->matrix._42, gt->matrix._43 };
     if (m_skyIBLPass)
     {
-        ctx.sunDir   = m_skyIBLPass->GetSunDir();
-        ctx.sunColor = m_skyIBLPass->GetSunColor();
-        ctx.skySHSrv = m_skyIBLPass->GetSHSrvHandle();
+        ctx.sunDir      = m_skyIBLPass->GetSunDir();
+        ctx.sunColor    = m_skyIBLPass->GetSunColor();
+        ctx.skySHSrv    = m_skyIBLPass->GetSHSrvHandle();
+        ctx.iblStrength = m_skyIBLPass->GetIBLStrength();
+    }
+    ctx.ambientScale = m_ddgiSettings.reflectionProbeBakeAmbient;
+
+    // CSM sun shadowing for the bake — frame-global cascades from ShadowSystem.
+    // The shadow array is always allocated (even with no light); shadowStrength
+    // gates whether the capture PS samples it. Cascades are built for the main
+    // camera, so probes within the camera's cascade range bake shadowed.
+    if (m_shadowPass && m_shadowSystem && m_shadowSystem->HasValidLight())
+    {
+        ctx.shadowArraySrv = m_shadowPass->GetShadowArrayGpuHandle();
+        const DirectX::XMFLOAT4X4* casc = m_shadowSystem->CascadeMatricesTransposed();
+        const float*               spl  = m_shadowSystem->CascadeSplits();
+        for (int c = 0; c < ShadowSystem::kCascadeCount && c < 4; ++c)
+            ctx.cascadeVP[c] = casc[c];
+        ctx.cascadeSplits  = { spl[0], spl[1], spl[2], spl[3] };
+        ctx.camPos         = m_camera.position;
+        ctx.camFwd         = m_view.cameraForward;
+        ctx.shadowStrength = ShadowSystem::ShadowStrength();
     }
     ctx.materialBufSrv   = m_gfx.GetBufferSRVGpuHandle(m_materialBuffer[frameSlot]);
     ctx.bindlessTexTable = m_gfx.GetBindlessTextureTableGpuHandle();

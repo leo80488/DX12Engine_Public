@@ -140,7 +140,7 @@ void VolumetricFogPass::Init(IGraphicsDevice& gfx)
         bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
         desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
         desc.rtvCount      = 1;
-        desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+        desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
         if (!m_psoCache.GetOrCreate(desc))
             LOG_ERROR("VolumetricFogPass: apply PSO failed");
@@ -170,7 +170,7 @@ void VolumetricFogPass::Init(IGraphicsDevice& gfx)
         bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
         desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
         desc.rtvCount      = 1;
-        desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+        desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
         if (!m_psoCache.GetOrCreate(desc))
             LOG_ERROR("VolumetricFogPass: raymarch apply PSO failed");
@@ -599,7 +599,7 @@ void VolumetricFogPass::DrawRaymarchApply(RHI::CommandList cl)
     bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
     desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
     desc.rtvCount      = 1;
-    desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
     const RHI::PipelineState* pso = m_psoCache.GetOrCreate(desc);
     if (!pso || !pso->IsValid()) return;
@@ -644,7 +644,7 @@ void VolumetricFogPass::DrawApply(RHI::CommandList cl)
     bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
     desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
     desc.rtvCount      = 1;
-    desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+    desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
     const RHI::PipelineState* pso = m_psoCache.GetOrCreate(desc);
     if (!pso || !pso->IsValid()) return;

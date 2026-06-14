@@ -24,6 +24,8 @@
 //             transitions follow the underlying micro-displacement
 //             instead of being a flat lerp ("height-correlated splat").
 
+// Geometry-only CB (shared with Terrain.ms/as.hlsl). Per-layer material data
+// lives in the StructuredBuffer below, NOT here — adding a layer is a data edit.
 cbuffer TerrainCB : register(b2, space0)
 {
     float2 g_worldOrigin;
@@ -38,36 +40,42 @@ cbuffer TerrainCB : register(b2, space0)
     uint   g_hasSplatmap;
     float  g_worldCenterY;
 
-    int4   g_layerBindlessIdx;
-    float4 g_layerTilingScale;
-
-    int4   g_layerNormalIdx;
-    int4   g_layerARMIdx;
-    int4   g_layerDispIdx;
-
     uint   g_tilesPerSide;
-    uint   _g_enableFrustumCull;   // AS-only — kept for layout parity
-    float  _g_pad8a;
-    float  _g_pad8b;
-
-    // Per-layer auto-blend (no splatmap path). World-meter heights, degrees
-    // for slopes. Layer i is fully visible when worldY ∈ [min,max] AND the
-    // surface slope (0=flat, 90°=cliff) ∈ [minSlope,maxSlope]; weights
-    // smoothstep down to 0 within the fade widths on both sides.
-    float4 g_layerMinHeight;
-    float4 g_layerMaxHeight;
-    float4 g_layerFadeHeight;
-    float4 g_layerMinSlopeDeg;
-    float4 g_layerMaxSlopeDeg;
-    float4 g_layerFadeSlopeDeg;
-
-    float4 _g_frustumPlanes[6];    // AS-only — kept for layout parity
+    uint   _g_enableFrustumCull;   // AS-only — read here for layout parity
+    uint   g_layerCount;           // # valid entries in g_TerrainLayers
+    uint   g_heightBlendEnable;    // 0 = plain linear blend
+    float  g_heightBlendStrength;  // disp bias on the base weight
+    float  g_heightBlendRange;     // soft cutoff width around the local max
+    float  _g_pad1;
+    float  _g_pad2;
 };
+
+// One element per terrain layer. The PS loops [0, g_layerCount). Layout MUST
+// match RendererDetail::TerrainLayerGPU (48 bytes). When a splatmap is set the
+// first 4 layers map to its RGBA channels; otherwise each layer is gated by its
+// world-meter height range AND degree slope range (both smoothstep-faded).
+struct TerrainLayerGPU
+{
+    int   albedoIdx;
+    int   normalIdx;
+    int   armIdx;
+    float tilingScale;
+    float minHeight;
+    float maxHeight;
+    float fadeHeight;
+    float minSlopeDeg;
+    float maxSlopeDeg;
+    float fadeSlopeDeg;
+    int   dispIdx;        // displacement map for height-correlated blend (-1 = none)
+    float _pad1;
+};
+#define MAX_TERRAIN_LAYERS 8
 
 // Heightmap is bound at t2 space0 (descriptor-table SRV with ALL stage
 // visibility), so the PS can re-sample it for per-pixel analytic normal.
 Texture2D<float>  g_HeightMap    : register(t2, space0);
 Texture2D<float4> g_Splatmap     : register(t3, space0);
+StructuredBuffer<TerrainLayerGPU> g_TerrainLayers : register(t4, space0);
 Texture2D         g_AllTextures[]: register(t0, space2);
 SamplerState      g_LinearClamp  : register(s0, space0);
 SamplerState      g_LinearWrap   : register(s1, space0);
@@ -212,32 +220,37 @@ float3 SampleARM(int idx, float2 uv)
     return g_AllTextures[idx].Sample(g_LinearWrap, uv).rgb;
 }
 
+// Single-channel displacement (height) for height-correlated blending.
+// 1-tap (low-frequency); missing map → 0 (no bias for that layer).
 float SampleDisp(int idx, float2 uv)
 {
-    if (idx < 0) return 0.5;            // neutral height when missing
+    if (idx < 0) return 0.0;
     return g_AllTextures[idx].Sample(g_LinearWrap, uv).r;
 }
 
-// ---- Height-correlated splat blend ----------------------------------------
-// Input: 4 splat weights + 4 displacement samples.
-// The disp samples bias the blend so layer transitions follow the underlying
-// micro-relief instead of being a flat lerp ("grass tufts poke through where
-// the gravel dips"). Two parameters control how much they matter:
+// ---- Per-layer auto-blend weight -------------------------------------------
+// Layer i is fully visible where worldY ∈ [minHeight, maxHeight] AND the
+// surface slope (0=flat, 90°=cliff) ∈ [minSlope, maxSlope]; the two gates
+// multiply and each end smoothstep-fades over its fade width.
 //
-//   heightStrength — multiplier on disp before adding to splat. Small
-//                    (0.10–0.20) keeps splat as the dominant signal.
-//                    Large (0.5+) lets disp override splat → only the
-//                    layer with highest disp wins, which is the bug we
-//                    just fixed.
-//   blendRange     — soft cutoff width. A layer keeps non-zero weight
-//                    while v_i ≥ v_max − blendRange. Wider = smoother
-//                    multi-layer blends; narrower = sharper transitions.
-float4 HeightBlend(float4 splat, float4 heights, float heightStrength, float blendRange)
+//   minHeight     maxHeight
+//        ▼            ▼
+//   ┌────┬────────────┬────┐
+//   │fade│   weight=1 │fade│
+//   └────┴────────────┴────┘
+float AutoBlendWeight(TerrainLayerGPU L, float worldY, float slopeDeg)
 {
-    float4 v = splat + heights * heightStrength;
-    float  m = max(max(v.x, v.y), max(v.z, v.w));
-    float4 w = max(0.0, v - m + blendRange);
-    return w;
+    const float hFade = max(L.fadeHeight, 1e-3);
+    const float hLo = smoothstep(L.minHeight - hFade, L.minHeight, worldY);
+    const float hHi = 1.0 - smoothstep(L.maxHeight, L.maxHeight + hFade, worldY);
+    const float wH  = saturate(hLo * hHi);
+
+    const float sFade = max(L.fadeSlopeDeg, 1e-3);
+    const float sLo = smoothstep(L.minSlopeDeg - sFade, L.minSlopeDeg, slopeDeg);
+    const float sHi = 1.0 - smoothstep(L.maxSlopeDeg, L.maxSlopeDeg + sFade, slopeDeg);
+    const float wS  = saturate(sLo * sHi);
+
+    return wH * wS;
 }
 
 GOut main(PSIn i)
@@ -246,61 +259,18 @@ GOut main(PSIn i)
     float3 N_geom, T_geom, B_geom;
     ComputeTerrainTBN(i.worldPos, N_geom, T_geom, B_geom);
 
-    // ---- Splat weights (authored splatmap OR auto-blend by altitude+slope)
-    bool anyLayer =
-        (g_layerBindlessIdx.x >= 0) ||
-        (g_layerBindlessIdx.y >= 0) ||
-        (g_layerBindlessIdx.z >= 0) ||
-        (g_layerBindlessIdx.w >= 0);
+    // ---- Determine which layers exist + the blend source -------------------
+    const uint n = min(g_layerCount, (uint)MAX_TERRAIN_LAYERS);
 
-    float4 splat = 0;
+    bool anyLayer = false;
+    for (uint a = 0; a < n; ++a)
+        if (g_TerrainLayers[a].albedoIdx >= 0) { anyLayer = true; break; }
+
+    // Splatmap (authored weights) — only meaningful for the first 4 layers
+    // (RGBA). When unset, each layer's weight comes from its height/slope gate.
+    float4 splat4 = 0;
     if (g_hasSplatmap != 0)
-    {
-        splat = g_Splatmap.Sample(g_LinearClamp, i.uv);
-    }
-    else if (anyLayer)
-    {
-        // Per-layer auto-blend: each layer is gated by an INTUITIVE pair of
-        // ranges authored in the inspector — world-meter height range and
-        // degree slope range. The two gates multiply, so a layer only shows
-        // where BOTH conditions hold. Soft falloffs on each end use
-        // smoothstep so transitions are C1-smooth.
-        //
-        //   minHeight     maxHeight
-        //        ▼            ▼
-        //   ┌────┬────────────┬────┐
-        //   │fade│   weight=1 │fade│
-        //   └────┴────────────┴────┘
-        //
-        // Same shape applies for slope. Both ranges are per-layer, so one
-        // layer can be "tight band, sharp edges" while another is "broad
-        // band, soft edges" without any global tuning knob.
-        const float worldY = i.worldPos.y;
-        // Slope from per-pixel geometric normal — 0 (flat) to 90 (cliff).
-        // acos clamped via saturate to keep numerical noise from going past 1.
-        const float slopeDeg = degrees(acos(saturate(N_geom.y)));
-
-        [unroll] for (int li = 0; li < 4; ++li)
-        {
-            const float hMin  = g_layerMinHeight   [li];
-            const float hMax  = g_layerMaxHeight   [li];
-            const float hFade = max(g_layerFadeHeight[li], 1e-3);
-            // Height weight — 1 inside [hMin, hMax], smoothstep falloff
-            // [hMin-hFade, hMin] up and [hMax, hMax+hFade] down.
-            const float hLo = smoothstep(hMin - hFade, hMin, worldY);
-            const float hHi = 1.0 - smoothstep(hMax, hMax + hFade, worldY);
-            const float wH  = saturate(hLo * hHi);
-
-            const float sMin  = g_layerMinSlopeDeg   [li];
-            const float sMax  = g_layerMaxSlopeDeg   [li];
-            const float sFade = max(g_layerFadeSlopeDeg[li], 1e-3);
-            const float sLo = smoothstep(sMin - sFade, sMin, slopeDeg);
-            const float sHi = 1.0 - smoothstep(sMax, sMax + sFade, slopeDeg);
-            const float wS  = saturate(sLo * sHi);
-
-            splat[li] = wH * wS;
-        }
-    }
+        splat4 = g_Splatmap.Sample(g_LinearClamp, i.uv);
 
     if (!(g_hasSplatmap != 0 || anyLayer))
     {
@@ -316,84 +286,114 @@ GOut main(PSIn i)
         // SSAO-exclusion sign bit since matIdx 0 ≥ 0).
         o.normal  = float4(N_geom * 0.5 + 0.5, 0.0);
         o.surface = float4(0.85, 0.0, 1.0, 0.5);
+        // Raw NDC delta — matches GBuffer.ps; decoders apply (0.5,-0.5).
         float2 cur  = i.curClip.xy  / i.curClip.w;
         float2 prev = i.prevClip.xy / i.prevClip.w;
-        o.velocity = (cur - prev) * float2(0.5, -0.5);
+        o.velocity = cur - prev;
         o.extra    = float4(0, 0, 0, 0);
         o.sceneCol = float4(0, 0, 0, 1);   // terrain has no emissive
         return o;
     }
 
-    // Mask out disabled layers so blend stays normalised.
-    splat.x *= (g_layerBindlessIdx.x >= 0) ? 1.0 : 0.0;
-    splat.y *= (g_layerBindlessIdx.y >= 0) ? 1.0 : 0.0;
-    splat.z *= (g_layerBindlessIdx.z >= 0) ? 1.0 : 0.0;
-    splat.w *= (g_layerBindlessIdx.w >= 0) ? 1.0 : 0.0;
+    // ---- Per-layer blend (count-driven, optional height-correlation) -------
+    // Pass 1 builds each layer's base weight (splatmap RGBA or height/slope
+    // gate). When g_heightBlendEnable is on, the disp map biases that weight
+    // (v = w + disp·strength) and only layers within g_heightBlendRange of the
+    // local maximum survive — so transitions follow the micro-relief instead of
+    // a flat lerp. Pass 2 samples + accumulates with the final weights.
+    // Linear blend = Σ(sample·w) / Σw, so we accumulate unnormalised and divide
+    // once at the end (the normal sum is normalised directly).
+    const float  worldY   = i.worldPos.y;
+    // Slope from per-pixel geometric normal — 0 (flat) to 90 (cliff).
+    const float  slopeDeg = degrees(acos(saturate(N_geom.y)));
+    const float2 worldXZ  = i.worldPos.xz;
 
-    // ---- Per-layer UVs (worldXZ × per-layer tilingScale) ------------------
-    float2 worldXZ = i.worldPos.xz;
-    float2 uv0 = worldXZ * g_layerTilingScale.x;
-    float2 uv1 = worldXZ * g_layerTilingScale.y;
-    float2 uv2 = worldXZ * g_layerTilingScale.z;
-    float2 uv3 = worldXZ * g_layerTilingScale.w;
+    float baseW[MAX_TERRAIN_LAYERS];
+    float vBias[MAX_TERRAIN_LAYERS];
+    float vMax = -1e9;
 
-    // ---- Linear splat blend (no height-blend) -----------------------------
-    // The previous height-correlated blend ended up zeroing layers that the
-    // splat had already weighted ≥ 0 — it's much easier to debug a pure
-    // splat blend first, then layer height-blending back on top once we
-    // know the splat itself reaches all four layers.
-    float4 w = splat;
+    [loop] for (uint li = 0; li < n; ++li)
+    {
+        TerrainLayerGPU L = g_TerrainLayers[li];
 
-    float wSum = w.x + w.y + w.z + w.w;
-    if (wSum > 1e-4) w *= rcp(wSum);
+        float w = (g_hasSplatmap != 0) ? ((li < 4) ? splat4[li] : 0.0)
+                                       : AutoBlendWeight(L, worldY, slopeDeg);
+        // Mask disabled layers (no albedo bound) so the blend stays normalised.
+        w *= (L.albedoIdx >= 0) ? 1.0 : 0.0;
+        baseW[li] = w;
 
+        // Displacement bias (only for active layers — disp must never lift a
+        // layer the splat/gate already zeroed). Disabled layers are pushed far
+        // below the max so they never survive the height-blend cutoff.
+        float v = -1e9;
+        if (w > 0.0)
+        {
+            v = w;
+            if (g_heightBlendEnable != 0)
+            {
+                float disp = SampleDisp(L.dispIdx, worldXZ * L.tilingScale);
+                v = w + disp * g_heightBlendStrength;
+            }
+            vMax = max(vMax, v);
+        }
+        vBias[li] = v;
+    }
+
+    float3 albedoAccum = 0;
+    float3 nTSAccum    = 0;
+    float3 armAccum    = 0;
+    float  wSum        = 0;
+
+    [loop] for (uint li = 0; li < n; ++li)
+    {
+        if (baseW[li] <= 0.0) continue;
+
+        // Height-correlated cutoff vs plain linear weight.
+        float w = (g_heightBlendEnable != 0)
+                ? max(0.0, vBias[li] - vMax + g_heightBlendRange)
+                : baseW[li];
+        if (w <= 0.0) continue;
+
+        TerrainLayerGPU L = g_TerrainLayers[li];
+        float2 uv = worldXZ * L.tilingScale;
+        wSum += w;
 #if TERRAIN_DEBUG_SPLAT
-    // Debug: splat weights → primary colours.
-    //   layer 0 (grass)   → RED
-    //   layer 1 (rocks)   → GREEN
-    //   layer 2 (pebbles) → BLUE
-    //   layer 3 (stone)   → YELLOW (R+G)
-    float3 albedoColor = w.x * float3(1, 0, 0)
-                       + w.y * float3(0, 1, 0)
-                       + w.z * float3(0, 0, 1)
-                       + w.w * float3(1, 1, 0);
+        // Debug: weight → primary colour (0=R, 1=G, 2=B, 3=Y, ≥4=white).
+        float3 dbg = (li == 0) ? float3(1, 0, 0)
+                   : (li == 1) ? float3(0, 1, 0)
+                   : (li == 2) ? float3(0, 0, 1)
+                   : (li == 3) ? float3(1, 1, 0)
+                               : float3(1, 1, 1);
+        albedoAccum += dbg * w;
 #else
-    // ---- Albedo blend -----------------------------------------------------
-    float3 albedoColor = SampleAlbedo(g_layerBindlessIdx.x, uv0) * w.x
-                      + SampleAlbedo(g_layerBindlessIdx.y, uv1) * w.y
-                      + SampleAlbedo(g_layerBindlessIdx.z, uv2) * w.z
-                      + SampleAlbedo(g_layerBindlessIdx.w, uv3) * w.w;
+        albedoAccum += SampleAlbedo(L.albedoIdx, uv) * w;
 #endif
+        nTSAccum += SampleNormalTS(L.normalIdx, uv) * w;
+        armAccum += SampleARM(L.armIdx, uv) * w;
+    }
 
-    // ---- Normal blend (tangent-space sum, then TBN-transform) -------------
-    float3 nTS = SampleNormalTS(g_layerNormalIdx.x, uv0) * w.x
-              + SampleNormalTS(g_layerNormalIdx.y, uv1) * w.y
-              + SampleNormalTS(g_layerNormalIdx.z, uv2) * w.z
-              + SampleNormalTS(g_layerNormalIdx.w, uv3) * w.w;
-    nTS = normalize(nTS);
-
-    // Per-pixel TBN built from heightmap derivatives — see ComputeTerrainTBN.
-    float3 N_world = normalize(nTS.x * T_geom + nTS.y * B_geom + nTS.z * N_geom);
-
-    // ---- ARM blend (AO / Roughness / Metalness) ---------------------------
-    float3 arm = SampleARM(g_layerARMIdx.x, uv0) * w.x
-              +  SampleARM(g_layerARMIdx.y, uv1) * w.y
-              +  SampleARM(g_layerARMIdx.z, uv2) * w.z
-              +  SampleARM(g_layerARMIdx.w, uv3) * w.w;
+    const float invW = (wSum > 1e-4) ? rcp(wSum) : 0.0;
 
     // ---- GBuffer output ---------------------------------------------------
     GOut o;
-    o.albedo  = float4(albedoColor, 1.0);
+    o.albedo = float4(albedoAccum * invW, 1.0);
+
+    // Per-pixel TBN built from heightmap derivatives — see ComputeTerrainTBN.
+    float3 nTS     = (wSum > 1e-4) ? normalize(nTSAccum) : float3(0, 0, 1);
+    float3 N_world = normalize(nTS.x * T_geom + nTS.y * B_geom + nTS.z * N_geom);
     // Engine convention (GBuffer.ps.hlsl line 215): world normal packed as
     // n * 0.5 + 0.5 in RGB; .a = matIdx with sign bit reserved for the
     // SSAO-exclusion flag. Terrain uses matIdx = 0 (no per-material data).
-    o.normal  = float4(N_world * 0.5 + 0.5, 0.0);
+    o.normal = float4(N_world * 0.5 + 0.5, 0.0);
+
     // Surface RT layout: R=Roughness, G=Metalness, B=AO, A=Reflectance.
+    float3 arm = armAccum * invW;
     o.surface = float4(arm.g, arm.b, arm.r, 0.5);
 
+    // Raw NDC delta — matches GBuffer.ps; decoders apply (0.5,-0.5).
     float2 cur  = i.curClip.xy  / i.curClip.w;
     float2 prev = i.prevClip.xy / i.prevClip.w;
-    o.velocity = (cur - prev) * float2(0.5, -0.5);
+    o.velocity = cur - prev;
 
     o.extra    = float4(0, 0, 0, 0);
     o.sceneCol = float4(0, 0, 0, 1);   // terrain has no emissive

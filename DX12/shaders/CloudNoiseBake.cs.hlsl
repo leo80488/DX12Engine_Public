@@ -1,21 +1,27 @@
 // CloudNoiseBake.cs.hlsl
 // -----------------------------------------------------------------------------
-// One-shot bake of a 128^3 tileable cloud noise volume.
-// Combines multi-octave Worley (FBM-style) with low-frequency Perlin so the
-// shape has both billowy puffs (Worley) and large-scale variation (Perlin).
-// Output is single-channel R8 in [0,1].
+// One-shot bake of the 128^3 tileable BASE-SHAPE volume, Schneider/Nubis layout
+// (SIGGRAPH 2015 "Real-Time Volumetric Cloudscapes of Horizon Zero Dawn"):
 //
-// Dispatched once in CloudPass::Execute on first frame, then sampled every
-// frame by CloudRaymarch.cs.hlsl.
+//   R = Perlin-Worley  -- tileable gradient-Perlin FBM remapped over a Worley
+//                        FBM so Worley billows fill Perlin's low-density holes.
+//   G = Worley FBM, cell counts  4 /  8 / 16   (weights .625/.25/.125)
+//   B = Worley FBM, cell counts  8 / 16 / 32
+//   A = Worley FBM, cell counts 16 / 32        (weights .75/.25)
+//
+// The raymarch dilates R by the GBA FBM:  Remap(R, fbm-1, 1, 0, 1) -- erosion
+// by remap, NOT multiplication, so cloud cores stay opaque (Nubis 2017).
+//
+// Dispatched once in CloudPass::Execute on first frame.
 // -----------------------------------------------------------------------------
 
-RWTexture3D<float> NoiseOut : register(u0, space2);
+RWTexture3D<float4> NoiseOut : register(u0, space2);
+
+static const float kDim = 128.0;
 
 // ---------------------------------------------------------------------------
-// Tileable hash — returns a deterministic feature-point offset in [0,1]^3 for
-// each integer cell. Tiling is achieved by wrapping the cell index mod gridDim.
-static const float kGridDim = 4.0;  // 4 cells across the texture for base Worley
-
+// Tileable hashes -- wrap the integer cell index mod gridDim so the noise
+// tiles exactly across the texture.
 float3 Hash3(int3 c, int3 gridDim)
 {
     c = ((c % gridDim) + gridDim) % gridDim;
@@ -27,6 +33,13 @@ float3 Hash3(int3 c, int3 gridDim)
                        (p.z + p.x) * p.y));
 }
 
+// Gradient direction for tileable Perlin: hash -> unit-ish vector in [-1,1]^3.
+float3 GradDir(int3 c, int3 gridDim)
+{
+    return normalize(Hash3(c, gridDim) * 2.0 - 1.0 + 1e-4);
+}
+
+// ---------------------------------------------------------------------------
 // Worley distance in [0,1]: 0 = at a feature point, 1 = far away.
 float Worley(float3 p, int gridDim)
 {
@@ -47,50 +60,48 @@ float Worley(float3 p, int gridDim)
     return saturate(sqrt(minDist));
 }
 
-// 3-octave Worley FBM (inverted so high values = inside a puff).
-float WorleyFBM(float3 p)
-{
-    float w  = (1.0 - Worley(p,  4)) * 0.625;
-    w       += (1.0 - Worley(p,  8)) * 0.250;
-    w       += (1.0 - Worley(p, 16)) * 0.125;
-    return saturate(w);
-}
+// Inverted Worley -- 1 at the cell core so cells read as billows.
+float WorleyBillow(float3 p, int gridDim) { return 1.0 - Worley(p, gridDim); }
 
-// Low-frequency Perlin-ish (smooth value noise) for shape variation.
-float Hash1(int3 c, int gridDim)
-{
-    c = ((c % gridDim) + gridDim) % gridDim;
-    float3 p = float3(c);
-    p = frac(p * float3(127.1, 311.7, 74.7));
-    return frac(sin(dot(p, float3(12.9898, 78.233, 39.425))) * 43758.5453);
-}
-
-float ValueNoise(float3 p, int gridDim)
+// ---------------------------------------------------------------------------
+// Tileable 3D gradient (Perlin) noise, output in [-1,1].
+float Perlin(float3 p, int gridDim)
 {
     p *= float(gridDim);
     int3 ip = (int3)floor(p);
     float3 fp = frac(p);
-    fp = fp * fp * (3.0 - 2.0 * fp);   // smoothstep
+    // Quintic fade -- C2-continuous derivative (classic improved Perlin).
+    float3 u = fp * fp * fp * (fp * (fp * 6.0 - 15.0) + 10.0);
 
-    float v000 = Hash1(ip + int3(0,0,0), gridDim);
-    float v100 = Hash1(ip + int3(1,0,0), gridDim);
-    float v010 = Hash1(ip + int3(0,1,0), gridDim);
-    float v110 = Hash1(ip + int3(1,1,0), gridDim);
-    float v001 = Hash1(ip + int3(0,0,1), gridDim);
-    float v101 = Hash1(ip + int3(1,0,1), gridDim);
-    float v011 = Hash1(ip + int3(0,1,1), gridDim);
-    float v111 = Hash1(ip + int3(1,1,1), gridDim);
+    int3 gd = int3(gridDim, gridDim, gridDim);
+    float v000 = dot(GradDir(ip + int3(0,0,0), gd), fp - float3(0,0,0));
+    float v100 = dot(GradDir(ip + int3(1,0,0), gd), fp - float3(1,0,0));
+    float v010 = dot(GradDir(ip + int3(0,1,0), gd), fp - float3(0,1,0));
+    float v110 = dot(GradDir(ip + int3(1,1,0), gd), fp - float3(1,1,0));
+    float v001 = dot(GradDir(ip + int3(0,0,1), gd), fp - float3(0,0,1));
+    float v101 = dot(GradDir(ip + int3(1,0,1), gd), fp - float3(1,0,1));
+    float v011 = dot(GradDir(ip + int3(0,1,1), gd), fp - float3(0,1,1));
+    float v111 = dot(GradDir(ip + int3(1,1,1), gd), fp - float3(1,1,1));
 
-    float v00 = lerp(v000, v100, fp.x);
-    float v10 = lerp(v010, v110, fp.x);
-    float v01 = lerp(v001, v101, fp.x);
-    float v11 = lerp(v011, v111, fp.x);
-    float v0  = lerp(v00,  v10,  fp.y);
-    float v1  = lerp(v01,  v11,  fp.y);
-    return lerp(v0, v1, fp.z);
+    float v00 = lerp(v000, v100, u.x);
+    float v10 = lerp(v010, v110, u.x);
+    float v01 = lerp(v001, v101, u.x);
+    float v11 = lerp(v011, v111, u.x);
+    float v0  = lerp(v00,  v10,  u.y);
+    float v1  = lerp(v01,  v11,  u.y);
+    return lerp(v0, v1, u.z);
 }
 
-// Remap helper — Schneider style.
+// 3-octave Perlin FBM -> [0,1].
+float PerlinFBM(float3 p, int baseFreq)
+{
+    float n = Perlin(p, baseFreq)      * 0.625
+            + Perlin(p, baseFreq * 2)  * 0.25
+            + Perlin(p, baseFreq * 4)  * 0.125;
+    return saturate(n * 0.5 + 0.5);
+}
+
+// Remap helper -- Schneider style.
 float Remap(float v, float lo, float hi, float newLo, float newHi)
 {
     return newLo + (v - lo) * (newHi - newLo) / max(1e-5, hi - lo);
@@ -99,19 +110,25 @@ float Remap(float v, float lo, float hi, float newLo, float newHi)
 [numthreads(8, 8, 8)]
 void main(uint3 dt : SV_DispatchThreadID)
 {
-    // 0..1 normalised position inside the texture (tileable).
-    const float3 uvw = (float3(dt) + 0.5) / 128.0;
+    const float3 uvw = (float3(dt) + 0.5) / kDim;
 
-    // Base Worley puffs.
-    float worley = WorleyFBM(uvw);
+    // ---- R: Perlin-Worley ---------------------------------------------------
+    float perlin = PerlinFBM(uvw, 4);
+    float wfbmR  = WorleyBillow(uvw,  8) * 0.625
+                 + WorleyBillow(uvw, 16) * 0.25
+                 + WorleyBillow(uvw, 32) * 0.125;
+    // Worley billows fill the low-density regions of Perlin (Nubis 2017 p34).
+    float pw = saturate(Remap(perlin, 0.0, 1.0, wfbmR, 1.0));
 
-    // Low-freq Perlin to add cumulus shape variation.
-    float perlin = ValueNoise(uvw, 4);
+    // ---- GBA: Worley FBM octaves at rising frequency ------------------------
+    float g = WorleyBillow(uvw,  4) * 0.625
+            + WorleyBillow(uvw,  8) * 0.25
+            + WorleyBillow(uvw, 16) * 0.125;
+    float b = WorleyBillow(uvw,  8) * 0.625
+            + WorleyBillow(uvw, 16) * 0.25
+            + WorleyBillow(uvw, 32) * 0.125;
+    float a = WorleyBillow(uvw, 16) * 0.75
+            + WorleyBillow(uvw, 32) * 0.25;
 
-    // Schneider-style Perlin-Worley combine: remap worley to fall off
-    // outside the Perlin pocket. The result has clear puff cores with
-    // gradual edges.
-    float density = Remap(worley, 1.0 - perlin, 1.0, 0.0, 1.0);
-
-    NoiseOut[dt] = saturate(density);
+    NoiseOut[dt] = float4(pw, saturate(g), saturate(b), saturate(a));
 }

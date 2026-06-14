@@ -12,6 +12,7 @@
 #include "RenderGraph/RenderPass/TransparentPass.h"
 #include "RenderGraph/RenderPass/ShadowPass.h"
 #include "RenderGraph/RenderPass/SpotShadowPass.h"
+#include "RenderGraph/RenderPass/PointShadowPass.h"
 #include "RenderGraph/RenderPass/DebugWirePass.h"
 #include "RenderGraph/RenderPass/VolumetricFogPass.h"
 #include "RenderGraph/RenderPass/ClusterPass.h"
@@ -55,8 +56,8 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
 
 // Renderer_Scene.cpp - split out of Renderer.cpp (one TU per Renderer subsystem).
 // Owns the ECS->DrawPacket pipeline: BuildRenderScene orchestrator + its
@@ -170,6 +171,8 @@ namespace
                 dst.materialFlags |= (1u << 0);   // MAT_FLAG_EXCLUDE_FROM_SSAO
             if (mc->_flags & MaterialComponent::DISABLE_RECEIVE_SHADOW)
                 dst.materialFlags |= (1u << 1);   // MAT_FLAG_DISABLE_RECEIVE_SHADOW
+            if (mc->_flags & MaterialComponent::USE_VERTEXCOLORS)
+                dst.materialFlags |= (1u << 2);   // MAT_FLAG_USE_VERTEXCOLOR
 
             // Custom-shader params/textures — reflection-order, skipping reserved cbuffers/structs/arrays.
             std::memset(dst.customParams,     0, sizeof(dst.customParams));
@@ -1348,7 +1351,12 @@ void Renderer::BuildScene_GatherMeshLibRefs(World& world,
 
             for (uint32_t t = 0; t < numChunks; ++t)
             {
-                const uint32_t lo = t * chunkSize;
+                // Clamp lo to N. With ceil-division chunkSize, a trailing chunk can
+                // have t*chunkSize > N; then hi=min(N,..) < lo, and the unsigned
+                // (hi - lo) below would underflow to ~4e9 → reserve() requests ~1 TB
+                // → std::bad_alloc. (CollisionMeshBaker guards the same idiom with
+                // `if (lo >= hi) continue;`.) Clamping keeps hi >= lo everywhere.
+                const uint32_t lo = (std::min)(N, t * chunkSize);
                 const uint32_t hi = (std::min)(N, lo + chunkSize);
                 TaskSystem::Get().Push(
                     [&, t, lo, hi]()
@@ -2065,6 +2073,11 @@ void Renderer::BuildRenderScene(World& world)
 
     // Phase 6: terrain heightmap sync + CB upload + arm TerrainPass.
     BuildScene_SyncTerrain(world);
+
+    // Phase 6b: grass + water — both read TerrainComponent's mutable
+    // heightmap fields that SyncTerrain just refreshed; keep ordered after it.
+    BuildScene_SyncGrass(world);
+    BuildScene_SyncWater(world);
 }
 
 // ---------------------------------------------------------------------------
@@ -2130,6 +2143,53 @@ void Renderer::BuildScene_UploadLights(World& world)
         }
 
         m_spotShadowPass->SetActiveCasterCount(activeCasters);
+    }
+
+    // ---- Point-shadow cube assignment: first kMaxCasters shadow-casting points.
+    // Mirrors the spot path but each caster owns a full cube (6 per-face VPs).
+    // shadowSliceIdx is reused as the cube index (a light is point XOR spot, so
+    // the field is unambiguous); Lighting.ps branches on light.type.
+    if (m_pointShadowPass)
+    {
+        const uint32_t kMaxCubes = PointShadowPass::kMaxCasters;
+        uint32_t activeCubes = 0;
+
+        // Canonical D3D cube face basis (+X,-X,+Y,-Y,+Z,-Z): forward + up per
+        // face. Must match the hardware cube-sampler convention so the SRV
+        // samples the same face the rasterizer wrote.
+        static const XMFLOAT3 kFaceDir[6] = {
+            { 1, 0, 0}, {-1, 0, 0}, { 0, 1, 0}, { 0,-1, 0}, { 0, 0, 1}, { 0, 0,-1} };
+        static const XMFLOAT3 kFaceUp[6] = {
+            { 0, 1, 0}, { 0, 1, 0}, { 0, 0,-1}, { 0, 0, 1}, { 0, 1, 0}, { 0, 1, 0} };
+
+        for (auto& L : m_frameLights)
+        {
+            if (activeCubes >= kMaxCubes) break;
+            if (L.type != LightType::Point || !L.castsShadow) continue;
+            if (L.radius <= 0.0f)                             continue;
+
+            XMVECTOR eye = XMLoadFloat3(&L.position);
+            // Reversed-Z 90° perspective (NearZ = radius, FarZ = kNearPlane) —
+            // matches PointShadowPass + Lighting.ps::SamplePointShadow.
+            XMMATRIX proj = XMMatrixPerspectiveFovLH(XM_PIDIV2, 1.0f,
+                                L.radius, PointShadowPass::kNearPlane);
+            for (uint32_t f = 0; f < 6; ++f)
+            {
+                XMVECTOR dir  = XMLoadFloat3(&kFaceDir[f]);
+                XMVECTOR up   = XMLoadFloat3(&kFaceUp[f]);
+                XMMATRIX view = XMMatrixLookToLH(eye, dir, up);
+                XMMATRIX vp   = view * proj;
+                // PointShadowPass transposes internally; pass un-transposed.
+                XMFLOAT4X4 vpUntransposed;
+                XMStoreFloat4x4(&vpUntransposed, vp);
+                m_pointShadowPass->SetFaceMatrix(activeCubes, f, vpUntransposed);
+            }
+
+            L.shadowSliceIdx = activeCubes;
+            ++activeCubes;
+        }
+
+        m_pointShadowPass->SetActiveCasterCount(activeCubes);
     }
 
     {

@@ -168,9 +168,10 @@ public:
     virtual uint64_t GetTextureUVPlaneSRVGpuHandle(const RHI::Texture& tex) const { return 0; }
 
     /** GPU handle of the stencil-plane SRV for a depth/stencil texture
-     *  (X24_TYPELESS_G8_UINT view of D24_UNORM_S8_UINT). Returns 0 when the
-     *  texture is not a stencil-bearing format or has no SRV. Sample as
-     *  Texture2D<uint2> and read .y for the stencil byte. */
+     *  (X32_TYPELESS_G8X24_UINT view of D32_FLOAT_S8X24, or X24_TYPELESS_G8
+     *  view of D24_UNORM_S8). Returns 0 when the texture is not a
+     *  stencil-bearing format or has no SRV. Sample as Texture2D<uint2> and
+     *  read .y for the stencil byte. */
     virtual uint64_t GetTextureStencilSRVGpuHandle(const RHI::Texture& texture) const { return 0; }
 
     // =========================================================================
@@ -536,6 +537,13 @@ public:
     virtual void     EndGPUTimestamp  (RHI::CommandList /*cmd*/,
                                        uint32_t /*regionIndex*/) {}
     virtual bool     IsGPUProfilerEnabled() const { return false; }
+
+    // Debug event markers for GPU-capture tools (RenderDoc / PIX / Nsight).
+    // Unlike BeginGPUTimestamp these are emitted unconditionally (they don't
+    // depend on the profiler being enabled) so passes are always named in
+    // captures. No-op by default for headless back-ends.
+    virtual void     BeginEventMarker(RHI::CommandList /*cmd*/, const char* /*name*/) {}
+    virtual void     EndEventMarker  (RHI::CommandList /*cmd*/) {}
 
     // =========================================================================
     // Command recording — descriptor heap management

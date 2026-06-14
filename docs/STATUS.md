@@ -8,6 +8,12 @@
   per-frame TLAS. A full RTPSO + SBT path exists in `Raytracing.cpp` but is currently unused.
 - **Hot-reload** is wired for a subset of passes (eager for the core G-Buffer / Lighting / Shadow group,
   lazy for several others). Compute-only passes with hand-built PSOs need an explicit opt-in to participate.
+- **Point-light shadows** — up to 4 concurrent shadow-casting point lights (cube atlas); excess casters silently skip,
+  and the froxel volumetric-fog pass does not yet sample the point-shadow cubes (surface shadowing only).
+- **Post-process** — Depth of Field, NPR Stylize, and Underwater ship; motion blur, chromatic aberration, and lens
+  distortion are reserved profile/stage slots that are not yet implemented.
+- **Grass / water** are singleton-by-convention (one active field / water body); grass requires mesh-shader
+  hardware (SM 6.6) and self-disables on older GPUs.
 - **Animation** — linear-blend skinning only (no dual-quaternion). Morph targets, CCD IK + ground-aware foot
   IK, MMD rotation-grant bones, and a per-state cross-fade FSM are layered on top; there is no generic
   blend-tree / state-graph authoring tool.

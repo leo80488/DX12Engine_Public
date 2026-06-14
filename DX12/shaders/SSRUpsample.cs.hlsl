@@ -123,8 +123,20 @@ void CSMain(uint3 DTid : SV_DispatchThreadID)
                 float  nErr    = pow(saturate(dot(sN, N)), 4.0);
                 float  bNormal = saturate(1.0 - (1.0 - nErr) * kNormalThreshold);
 
+                // Material-similarity term: depth+normal alone can't separate
+                // mirror water from the flat shoreline terrain touching it
+                // (both planes coincide at the contact, both normals point
+                // up). Terrain above the trace's roughness cutoff was never
+                // traced — its temporal texels are zeros, and a radius-5
+                // blur (variance pins ~1 for dozens of frames after any
+                // contact-line disocclusion) drags water confidence down a
+                // multi-pixel band that gets back-filled with bright sky.
+                // Don't blur across roughness discontinuities.
+                float  sRough  = max(gSurface.Load(int3(np, 0)).r, 0.045);
+                float  bRough  = exp(-abs(sRough - roughness) * 16.0);
+
                 float  g = exp(-(float)(r * r) / max(sigma * sigma, 1e-5));
-                float  w = (r == 0) ? 1.0 : g * bDepth * bNormal;
+                float  w = (r == 0) ? 1.0 : g * bDepth * bNormal * bRough;
 
                 result += gTemporal.SampleLevel(gLinClamp, sUV, 0) * w;
                 wSum   += w;

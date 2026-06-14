@@ -23,7 +23,12 @@ static const float3 kRayleighScat = float3(5.802, 13.558, 33.1) * 1e-3;
 static const float  kRayleighH    = 8.0;
 
 static const float  kMieScat      = 3.996e-3;
-static const float  kMieAbsorb    = 4.4e-3;
+// Bruneton/Hillaire reference: Mie EXTINCTION = 4.440e-3 /km, so absorption =
+// extinction - scattering = 0.444e-3. (The old 4.4e-3 here was the extinction
+// value mistakenly used as absorption — 10x too absorptive across the whole
+// LUT pipeline.)
+static const float  kMieExt       = 4.440e-3;
+static const float  kMieAbsorb    = kMieExt - kMieScat;
 static const float  kMieH         = 1.2;
 static const float  kMiePhaseG    = 0.92;
 
@@ -65,12 +70,15 @@ float RayleighPhase(float cosT)
 {
     return 3.0 / (16.0 * ATMO_PI) * (1.0 + cosT * cosT);
 }
+// Cornette-Shanks phase (despite the legacy HG name). Normalisation is
+// 3/(8π) — the previous 1/(4π) made the phase integrate to 2/3 over the
+// sphere, dimming Mie single-scatter by a third.
 float MiePhaseHG(float cosT, float g)
 {
     float g2   = g * g;
     float num  = (1.0 - g2) * (1.0 + cosT * cosT);
     float den  = (2.0 + g2) * pow(max(1.0 + g2 - 2.0 * g * cosT, 1e-3), 1.5);
-    return num / (4.0 * ATMO_PI * den);
+    return 3.0 * num / (8.0 * ATMO_PI * den);
 }
 
 // ---- Sphere intersection ----------------------------------------------------

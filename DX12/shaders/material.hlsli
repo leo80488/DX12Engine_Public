@@ -87,6 +87,8 @@ struct MaterialGPUData
 // from MaterialComponent::FLAGS in Components.h. Keep in sync with that enum.
 #define MAT_FLAG_EXCLUDE_FROM_SSAO       (1u << 0)   // pixel is skipped by XeGTAO
 #define MAT_FLAG_DISABLE_RECEIVE_SHADOW  (1u << 1)   // pixel ignores CSM (always lit)
+#define MAT_FLAG_USE_VERTEXCOLOR         (1u << 2)   // multiply baseColor by per-vertex color
+                                                     // (MaterialComponent::USE_VERTEXCOLORS)
 
 // Phase E shading-model constants — must match C++ enum ShadingModel.
 #define SHADING_MODEL_STANDARD     0u

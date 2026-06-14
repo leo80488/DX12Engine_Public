@@ -271,7 +271,9 @@ bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
     D3D12_HEAP_PROPERTIES hp{ ToD3D12HeapType(desc.usage) };
 
     // Depth texture that also needs to be sampled as SRV requires a typeless resource format.
-    const bool isDepthFmt = (dxgiFmt == DXGI_FORMAT_D32_FLOAT || dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT);
+    const bool isDepthFmt = (dxgiFmt == DXGI_FORMAT_D32_FLOAT
+                          || dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT
+                          || dxgiFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
     const bool needsDepthSRV = isDepthFmt
         && RHI::HasFlag(desc.bind_flags, RHI::BindFlag::DEPTH_STENCIL)
         && RHI::HasFlag(desc.bind_flags, RHI::BindFlag::SHADER_RESOURCE);
@@ -293,6 +295,7 @@ bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
     {
         if (dxgiFmt == DXGI_FORMAT_D32_FLOAT)          resourceFmt = DXGI_FORMAT_R32_TYPELESS;
         else if (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT) resourceFmt = DXGI_FORMAT_R24G8_TYPELESS;
+        else if (dxgiFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) resourceFmt = DXGI_FORMAT_R32G8X24_TYPELESS;
     }
     rd.Format             = resourceFmt;
     rd.SampleDesc.Count   = desc.sample_count;
@@ -413,12 +416,15 @@ bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
     {
         entry.srv = m_cbvSrvUavAllocator.Allocate(1);
         D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
-        // SRV format for depth textures: R32_FLOAT for D32, R24_UNORM_X8 for D24_S8.
+        // SRV format for depth textures: R32_FLOAT for D32, R24_UNORM_X8 for
+        // D24_S8, R32_FLOAT_X8X24 for D32_S8X24 (shaders read .r as float in
+        // every case — Texture2D<float> is unchanged across the formats).
         DXGI_FORMAT srvFmt = dxgiFmt;
         if (needsDepthSRV)
         {
             if (dxgiFmt == DXGI_FORMAT_D32_FLOAT)              srvFmt = DXGI_FORMAT_R32_FLOAT;
             else if (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT) srvFmt = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            else if (dxgiFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) srvFmt = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         }
         srvd.Format                  = srvFmt;
         srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -471,24 +477,29 @@ bool GraphicsDX12::CreateTexture(const RHI::TextureDesc& desc,
         m_device->CreateShaderResourceView(entry.resource.Get(), &srvd, entry.srv.GetCpuHandle());
         entry.srv.CopyToGpu();
 
-        // Stencil-plane SRV for D24_UNORM_S8_UINT depth — extra descriptor
-        // viewing the same resource as DXGI_FORMAT_X24_TYPELESS_G8_UINT so
-        // compute shaders (e.g. TAA) can read stencil values alongside depth.
+        // Stencil-plane SRV for stencil-bearing depth formats — extra
+        // descriptor viewing the same resource's stencil plane so compute
+        // shaders (e.g. TAA) can read stencil values alongside depth.
         // Created here, never destroyed independently — freed with the texture.
-        if (needsDepthSRV && dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT
+        const bool hasStencilPlane = (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT
+                                   || dxgiFmt == DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+        if (needsDepthSRV && hasStencilPlane
             && rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
             && desc.sample_count <= 1
             && desc.array_size <= 1)
         {
             entry.stencilSrv = m_cbvSrvUavAllocator.Allocate(1);
             D3D12_SHADER_RESOURCE_VIEW_DESC stencilSrvd{};
-            stencilSrvd.Format                  = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
-            // D24_S8 is a multi-plane resource: plane 0 = depth (24 bits),
-            // plane 1 = stencil (8 bits). Targeting the stencil view onto an
-            // R24G8_TYPELESS resource therefore requires PlaneSlice = 1 — the
+            stencilSrvd.Format = (dxgiFmt == DXGI_FORMAT_D24_UNORM_S8_UINT)
+                               ? DXGI_FORMAT_X24_TYPELESS_G8_UINT
+                               : DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+            // Both are multi-plane resources: plane 0 = depth, plane 1 =
+            // stencil (8 bits). Targeting the stencil view onto the typeless
+            // resource therefore requires PlaneSlice = 1 — the
             // default 0 triggers an InvalidCall (device removal) at view
-            // creation. The shader samples as Texture2D<uint2> and reads .y,
-            // so leave Shader4ComponentMapping at the identity default.
+            // creation. The shader samples as Texture2D<uint2> and reads .y
+            // (the G channel in both layouts), so leave
+            // Shader4ComponentMapping at the identity default.
             stencilSrvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             stencilSrvd.ViewDimension           = D3D12_SRV_DIMENSION_TEXTURE2D;
             stencilSrvd.Texture2D.MipLevels     = desc.mip_levels;

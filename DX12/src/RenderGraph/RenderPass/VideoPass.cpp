@@ -67,7 +67,7 @@ void VideoPass::Init(IGraphicsDevice& gfx)
         bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
         desc.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
         desc.rtvCount      = 1;
-        desc.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+        desc.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
 
         if (m_psoCache.GetOrCreate(desc))
             m_psoCreated = true;
@@ -150,7 +150,7 @@ RHI::CommandList VideoPass::Execute(RHI::CommandList cl)
         bs.render_target_write_mask = RHI::ColorWrite::ENABLE_ALL;
         d.rtvFormats[0] = RHI::Format::R16G16B16A16_FLOAT;
         d.rtvCount      = 1;
-        d.dsvFormat     = RHI::Format::D24_UNORM_S8_UINT;
+        d.dsvFormat     = RHI::Format::D32_FLOAT_S8X24_UINT;
         return d;
     }();
     const RHI::PipelineState* pso = m_psoCache.GetOrCreate(desc);

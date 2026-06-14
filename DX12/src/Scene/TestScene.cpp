@@ -2,6 +2,8 @@
 #include "ECS/Components.h"
 #include "ECS/SkyboxComponent.h"
 #include "ECS/TerrainComponent.h"
+#include "ECS/GrassComponent.h"
+#include "ECS/WaterComponent.h"
 #include "ECS/HierarchyComponents.h"
 #include "ECS/CameraSystem.h"
 #include "ECS/VideoComponent.h"
@@ -30,9 +32,16 @@ void TestScene::Init(GameModeContext* ctx)
     Entity cam = world.CreateEntity();
     world.SetName(cam, "Main Camera");
     CameraControllerComponent camCtrl{};
-    world.AddComponent<CameraComponent>(cam, CameraComponent{});
+    // Perch above the terrain demo looking across the valley lake (terrain
+    // median surface sits around y≈+3 with the tuning below).
+    camCtrl.yaw       = 3.1416f;   // facing -Z
+    camCtrl.pitch     = 0.42f;     // gentle look-down
+    camCtrl.moveSpeed = 25.0f;     // the tile is 1 km — fly faster
+    CameraComponent camLens{};
+    camLens.farZ = 1500.0f;        // see the whole 1 km tile + sky
+    world.AddComponent<CameraComponent>(cam, camLens);
     world.AddComponent<CameraControllerComponent>(cam, camCtrl);
-    world.AddComponent<LocalTransform>(cam, CameraSystem::MakeTransform(camCtrl, { 4.f, 3.f, 5.f }));
+    world.AddComponent<LocalTransform>(cam, CameraSystem::MakeTransform(camCtrl, { 0.f, 26.f, 55.f }));
     world.AddComponent<GlobalTransform>(cam, GlobalTransform{});
     m_spawnedEntities.push_back(cam);
 
@@ -59,86 +68,124 @@ void TestScene::Init(GameModeContext* ctx)
     world.AddComponent<SkyboxComponent>(skyboxEnt, sc);
     m_spawnedEntities.push_back(skyboxEnt);
 
-    // Mesh-shader terrain demo — heightmap-displaced tile with 4 PBR layers
-    // auto-blended by altitude + slope (no splatmap authored yet, the PS
-    // synthesises weights from world Y and surface normal).
+    // ---- Terrain + Grass + Water demo ---------------------------------------
+    // One 1 km heightmap tile with 4 auto-blended PBR layers, a GoT-style
+    // procedural grass field anchored to it, and a valley lake.
     //
-    // Sized so the default-camera position (eye=(4,3,5), look-at origin)
-    // lands inside the tile and the heightScale clears the camera height.
-  //  {
-  //      Entity terrainEnt = world.CreateEntity();
-  //      world.SetName(terrainEnt, "Terrain");
-		//float heightScale = 4096.0f; // dramatic relief so peaks/valleys are obvious
-  //      TerrainComponent tc;
-  //      tc.heightmapPath = "asset/EngineResource/Terrain/HeightMap.itex";
-  //      tc.worldCenter   = { 0.0f, -heightScale/2, 0.0f };  // pivot pinned at origin
-  //      tc.worldSize     = 4096.0f;
-  //      tc.heightScale   = heightScale;     // dramatic relief so peaks/valleys are obvious
+    // Height tuning: the Renderer re-anchors the heightmap's actual data
+    // range, so worldCenter.y IS the valley floor and heightScale IS the
+    // total relief (floor → peak), scale-invariant pivot:
+    //   surface Y ∈ [-12, +26], median ≈ +2
+    //   water level  -2.0  → floods the lowest ~20% (valley lake)
+    //   grass band   -1.4 .. +14, slopes < 38°
+    //   rock layer   takes over on cliffs; pebbles around the waterline.
+    constexpr float kTerrainSize  = 1024.0f;
+    constexpr float kHeightScale  = 38.0f;    // TOTAL relief: floor → peak
+    constexpr float kTerrainBaseY = -12.0f;   // valley floor (pinned)
+    constexpr float kWaterLevel   = -2.0f;
+    //{
+    //    Entity terrainEnt = world.CreateEntity();
+    //    world.SetName(terrainEnt, "Terrain");
+    //    TerrainComponent tc;
+    //    tc.heightmapPath = "asset/EngineResource/Terrain/HeightMap.itex";
+    //    tc.worldCenter   = { 0.0f, kTerrainBaseY, 0.0f };
+    //    tc.worldSize     = kTerrainSize;
+    //    tc.heightScale   = kHeightScale;
+    //    tc.tilesPerSide  = 128;            // 8 m sub-tiles, ~0.73 m quads
+    //    // Height-correlated blend: disp maps sharpen the layer transitions.
+    //    tc.heightBlendEnabled  = true;
+    //    tc.heightBlendStrength = 0.15f;
+    //    tc.heightBlendRange    = 0.10f;
 
-  //      const char* kTerrainDir = "asset/EngineResource/Terrain/";
+    //    const char* kTerrainDir = "asset/EngineResource/Terrain/";
 
-  //      // Tile spans world Y in [worldCenter.y, worldCenter.y + heightScale]
-  //      // = [-2048, 2048]. The heightmap data clusters above ~20% so the
-  //      // effective visible range starts around -1228 m. The four layers
-  //      // below carve that range up using world-meter heights + slopes —
-  //      // both directly intuitive in the inspector.
+    //    // Layer 0 — grass+rock ground cover (the broad mid band, gentle slope)
+    //    tc.layers[0].albedoPath    = std::string(kTerrainDir) + "aerial_grass_rock_diff_1k.itex";
+    //    tc.layers[0].normalPath    = std::string(kTerrainDir) + "aerial_grass_rock_nor_dx_1k.itex";
+    //    tc.layers[0].armPath       = std::string(kTerrainDir) + "aerial_grass_rock_arm_1k.itex";
+    //    tc.layers[0].dispPath      = std::string(kTerrainDir) + "aerial_grass_rock_disp_1k.itex";
+    //    tc.layers[0].tilingScale   = 0.50f;
+    //    tc.layers[0].minHeight     =  -3.0f;
+    //    tc.layers[0].maxHeight     =  16.0f;
+    //    tc.layers[0].fadeHeight    =   4.0f;
+    //    tc.layers[0].minSlopeDeg   =   0.0f;
+    //    tc.layers[0].maxSlopeDeg   =  40.0f;
+    //    tc.layers[0].fadeSlopeDeg  =   8.0f;
 
-  //      // Layer 0 — grass+rock (mid-high altitude, gentle slope)
-  //      tc.layers[0].albedoPath    = std::string(kTerrainDir) + "aerial_grass_rock_diff_1k.itex";
-  //      tc.layers[0].normalPath    = std::string(kTerrainDir) + "aerial_grass_rock_nor_dx_1k.itex";
-  //      tc.layers[0].armPath       = std::string(kTerrainDir) + "aerial_grass_rock_arm_1k.itex";
-  //      tc.layers[0].dispPath      = std::string(kTerrainDir) + "aerial_grass_rock_disp_1k.itex";
-  //      tc.layers[0].tilingScale   = 0.50f;
-  //      tc.layers[0].minHeight     =  -200.0f;
-  //      tc.layers[0].maxHeight     =  1500.0f;
-  //      tc.layers[0].fadeHeight    =   600.0f;
-  //      tc.layers[0].minSlopeDeg   =  0.0f;
-  //      tc.layers[0].maxSlopeDeg   = 40.0f;
-  //      tc.layers[0].fadeSlopeDeg  =  8.0f;
+    //    // Layer 1 — rocks on cliffs (any altitude, steep slope)
+    //    tc.layers[1].albedoPath    = std::string(kTerrainDir) + "aerial_rocks_02_diff_1k.itex";
+    //    tc.layers[1].normalPath    = std::string(kTerrainDir) + "aerial_rocks_02_nor_dx_1k.itex";
+    //    tc.layers[1].armPath       = std::string(kTerrainDir) + "aerial_rocks_02_arm_1k.itex";
+    //    tc.layers[1].dispPath      = std::string(kTerrainDir) + "aerial_rocks_02_disp_1k.itex";
+    //    tc.layers[1].tilingScale   = 0.50f;
+    //    tc.layers[1].minHeight     = -10000.0f;
+    //    tc.layers[1].maxHeight     =  10000.0f;
+    //    tc.layers[1].fadeHeight    =     10.0f;
+    //    tc.layers[1].minSlopeDeg   =  32.0f;
+    //    tc.layers[1].maxSlopeDeg   =  90.0f;
+    //    tc.layers[1].fadeSlopeDeg  =  10.0f;
 
-  //      // Layer 1 — pure rocks (cliffs / peaks). Anywhere with a steep slope
-  //      // OR very high altitude.
-  //      tc.layers[1].albedoPath    = std::string(kTerrainDir) + "aerial_rocks_02_diff_1k.itex";
-  //      tc.layers[1].normalPath    = std::string(kTerrainDir) + "aerial_rocks_02_nor_dx_1k.itex";
-  //      tc.layers[1].armPath       = std::string(kTerrainDir) + "aerial_rocks_02_arm_1k.itex";
-  //      tc.layers[1].dispPath      = std::string(kTerrainDir) + "aerial_rocks_02_disp_1k.itex";
-  //      tc.layers[1].tilingScale   = 0.50f;
-  //      tc.layers[1].minHeight     =   900.0f;
-  //      tc.layers[1].maxHeight     = 10000.0f;   // open top — let it run to the peaks
-  //      tc.layers[1].fadeHeight    =   600.0f;
-  //      tc.layers[1].minSlopeDeg   = 30.0f;
-  //      tc.layers[1].maxSlopeDeg   = 90.0f;
-  //      tc.layers[1].fadeSlopeDeg  = 12.0f;
+    //    // Layer 2 — river pebbles around / below the waterline
+    //    tc.layers[2].albedoPath    = std::string(kTerrainDir) + "ganges_river_pebbles_diff_1k.itex";
+    //    tc.layers[2].normalPath    = std::string(kTerrainDir) + "ganges_river_pebbles_nor_dx_1k.itex";
+    //    tc.layers[2].armPath       = std::string(kTerrainDir) + "ganges_river_pebbles_arm_1k.itex";
+    //    tc.layers[2].dispPath      = std::string(kTerrainDir) + "ganges_river_pebbles_disp_1k.itex";
+    //    tc.layers[2].tilingScale   = 0.50f;
+    //    tc.layers[2].minHeight     = -10000.0f;
+    //    tc.layers[2].maxHeight     = kWaterLevel + 1.0f;
+    //    tc.layers[2].fadeHeight    =     2.5f;
+    //    tc.layers[2].minSlopeDeg   =   0.0f;
+    //    tc.layers[2].maxSlopeDeg   =  30.0f;
+    //    tc.layers[2].fadeSlopeDeg  =   8.0f;
 
-  //      // Layer 2 — river pebbles (low altitude, very gentle slope)
-  //      tc.layers[2].albedoPath    = std::string(kTerrainDir) + "ganges_river_pebbles_diff_1k.itex";
-  //      tc.layers[2].normalPath    = std::string(kTerrainDir) + "ganges_river_pebbles_nor_dx_1k.itex";
-  //      tc.layers[2].armPath       = std::string(kTerrainDir) + "ganges_river_pebbles_arm_1k.itex";
-  //      tc.layers[2].dispPath      = std::string(kTerrainDir) + "ganges_river_pebbles_disp_1k.itex";
-  //      tc.layers[2].tilingScale   = 0.50f;
-  //      tc.layers[2].minHeight     = -10000.0f;  // open bottom — riverbeds, valleys
-  //      tc.layers[2].maxHeight     =  -300.0f;
-  //      tc.layers[2].fadeHeight    =   600.0f;
-  //      tc.layers[2].minSlopeDeg   =  0.0f;
-  //      tc.layers[2].maxSlopeDeg   = 25.0f;
-  //      tc.layers[2].fadeSlopeDeg  =  8.0f;
+    //    // Layer 3 — rocky ground on the high tops
+    //    tc.layers[3].albedoPath    = std::string(kTerrainDir) + "rocks_ground_06_diff_1k.itex";
+    //    tc.layers[3].normalPath    = std::string(kTerrainDir) + "rocks_ground_06_nor_dx_1k.itex";
+    //    tc.layers[3].armPath       = std::string(kTerrainDir) + "rocks_ground_06_arm_1k.itex";
+    //    tc.layers[3].dispPath      = std::string(kTerrainDir) + "rocks_ground_06_disp_1k.itex";
+    //    tc.layers[3].tilingScale   = 0.50f;
+    //    tc.layers[3].minHeight     =  14.0f;
+    //    tc.layers[3].maxHeight     = 10000.0f;
+    //    tc.layers[3].fadeHeight    =    5.0f;
+    //    tc.layers[3].minSlopeDeg   =   0.0f;
+    //    tc.layers[3].maxSlopeDeg   =  45.0f;
+    //    tc.layers[3].fadeSlopeDeg  =  10.0f;
 
-  //      // Layer 3 — stone pathway (mid altitude, gentle slope)
-  //      tc.layers[3].albedoPath    = std::string(kTerrainDir) + "stone_pathway_diff_1k.itex";
-  //      tc.layers[3].normalPath    = std::string(kTerrainDir) + "stone_pathway_nor_dx_1k.itex";
-  //      tc.layers[3].armPath       = std::string(kTerrainDir) + "stone_pathway_arm_1k.itex";
-  //      tc.layers[3].dispPath      = std::string(kTerrainDir) + "stone_pathway_disp_1k.itex";
-  //      tc.layers[3].tilingScale   = 0.50f;
-  //      tc.layers[3].minHeight     = -1300.0f;
-  //      tc.layers[3].maxHeight     =  1000.0f;
-  //      tc.layers[3].fadeHeight    =   500.0f;
-  //      tc.layers[3].minSlopeDeg   =  0.0f;
-  //      tc.layers[3].maxSlopeDeg   = 35.0f;
-  //      tc.layers[3].fadeSlopeDeg  =  8.0f;
+    //    world.AddComponent(terrainEnt, tc);
+    //    m_spawnedEntities.push_back(terrainEnt);
+    //}
 
-  //      world.AddComponent(terrainEnt, tc);
-  //      m_spawnedEntities.push_back(terrainEnt);
-  //  }
+    //// Grass chunks — procedural blades over the whole tile, gated to the
+    //// band above the waterline and below the rocky tops, never on cliffs.
+    //{
+    //    Entity grassEnt = world.CreateEntity();
+    //    world.SetName(grassEnt, "Grass Field");
+    //    GrassComponent gc;
+    //    gc.worldCenter    = { 0.0f, kTerrainBaseY, 0.0f };  // y only used w/o terrain
+    //    gc.worldSize      = kTerrainSize;
+    //    gc.patchesPerSide = 256;                  // 4 m patches
+    //    gc.density        = 8.0f;
+    //    gc.lod0Dist       = 24.0f;
+    //    gc.lod1Dist       = 64.0f;
+    //    gc.cullDist       = 140.0f;
+    //    gc.minWorldY      = kWaterLevel + 0.6f;   // stop just above the shoreline
+    //    gc.maxWorldY      = 14.0f;                // below the rocky tops
+    //    gc.maxSlopeDeg    = 38.0f;
+    //    world.AddComponent(grassEnt, gc);
+    //    m_spawnedEntities.push_back(grassEnt);
+    //}
+
+    //// Valley lake — Fresnel sky reflection + flow normals; depth/shore fade
+    //// computed analytically from the terrain heightmap.
+    //{
+    //    Entity waterEnt = world.CreateEntity();
+    //    world.SetName(waterEnt, "Water");
+    //    WaterComponent wc;
+    //    wc.worldCenter = { 0.0f, kWaterLevel, 0.0f };
+    //    wc.worldSize   = kTerrainSize;
+    //    world.AddComponent(waterEnt, wc);
+    //    m_spawnedEntities.push_back(waterEnt);
+    //}
 
 
     // Default cube at origin — MeshSpawner returns the new entity in the

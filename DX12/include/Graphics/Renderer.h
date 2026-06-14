@@ -58,7 +58,7 @@
 #include "Resource/ProceduralMesh.h"  // PrimitiveMeshType
 
 namespace Resource { class MaterialSystem; }
-namespace PostProcess { class Stack; class VolumeSystem; class EntityVolumeSource; }
+namespace PostProcess { class Stack; }
 namespace ShaderReflect { struct Reflection; }
 
 class World;
@@ -77,16 +77,23 @@ class TAAPass;
 class FXAAPass;
 class XeGTAOPass;
 class CASPass;
+class UnderwaterPass;
+class DepthOfFieldPass;
+class StylizePass;
 class GlassShatterPass;
 class SkinningPass;
 class ClusterPass;
 class DecalPass;
 class ReflectionProbeCapturePass;
 class SpotShadowPass;
+class PointShadowPass;
 class CloudPass;
+class HeightFogPass;
 class CullingPass;
 class GBufferPass;
 class TerrainPass;
+class GrassPass;
+class WaterPass;
 class DebugWirePass;
 class HiZPass;
 class SSRPass;
@@ -160,7 +167,13 @@ namespace RendererDetail
         float    _ddgiPad2;
     };
 
-    // Mirror of Terrain.{ms,ps,as}.hlsl cbuffer TerrainCB; each block is 16B aligned.
+    // Geometry-only mirror of the terrain cbuffer TerrainCB shared by
+    // Terrain.{ms,as,ps}.hlsl + Terrain.shadow.{ms,as}.hlsl. Per-layer material
+    // data NO LONGER lives here — it moved to a variable-count
+    // StructuredBuffer<TerrainLayerGPU> (see below) so the layer count is
+    // data-driven and the geometry/shadow stages stop carrying PS-only padding.
+    // Only the colour AS reads frustumPlanes; every other stage reads the
+    // 64-byte scalar prefix. 16B-aligned; keep in sync with the HLSL.
     struct alignas(16) TerrainParamsCB
     {
         float    worldOriginX, worldOriginY;
@@ -172,21 +185,35 @@ namespace RendererDetail
         uint32_t hasHeightmap;
         uint32_t hasSplatmap;
         float    worldCenterY;
-        int32_t  layerBindlessIdx[4];
-        float    layerTilingScale[4];
-        int32_t  layerNormalIdx[4];
-        int32_t  layerARMIdx[4];
-        int32_t  layerDispIdx[4];
         uint32_t tilesPerSide;
         uint32_t enableFrustumCull;
-        float    _pad8a, _pad8b;
-        float    layerMinHeight   [4];
-        float    layerMaxHeight   [4];
-        float    layerFadeHeight  [4];
-        float    layerMinSlopeDeg [4];
-        float    layerMaxSlopeDeg [4];
-        float    layerFadeSlopeDeg[4];
-        float    frustumPlanes[6][4];
+        uint32_t layerCount;          // # valid entries in the layer StructuredBuffer
+        uint32_t heightBlendEnable;   // 0 = plain linear blend (existing behaviour)
+        float    heightBlendStrength; // disp bias on the base weight
+        float    heightBlendRange;    // soft cutoff width around the local max
+        float    _pad1;
+        float    _pad2;
+        float    frustumPlanes[6][4]; // colour AS only
+    };
+
+    // One element of StructuredBuffer<TerrainLayerGPU> g_TerrainLayers, read by
+    // Terrain.ps.hlsl only. One per terrain layer; the PS loops [0, layerCount).
+    // NO SIMD-lane packing — extend by adding a field, never by widening an
+    // int4. Layout/stride MUST match the HLSL struct (48 bytes).
+    struct TerrainLayerGPU
+    {
+        int32_t albedoIdx;
+        int32_t normalIdx;
+        int32_t armIdx;
+        float   tilingScale;
+        float   minHeight;
+        float   maxHeight;
+        float   fadeHeight;
+        float   minSlopeDeg;
+        float   maxSlopeDeg;
+        float   fadeSlopeDeg;
+        int32_t dispIdx;              // displacement map for height-correlated blend (-1 = none)
+        float   _pad1;
     };
 }
 
@@ -262,6 +289,7 @@ public:
     SkyIBLPass*              GetSkyIBLPass()         { return m_skyIBLPass; }
     VolumetricFogPass*       GetVolumetricFogPass()  { return m_volFogPass; }
     CloudPass*               GetCloudPass()          { return m_cloudPass; }
+    HeightFogPass*           GetHeightFogPass()      { return m_heightFogPass; }
     DecalPass*               GetDecalPass()          { return m_decalPass; }
     class VideoPass*         GetVideoPass()          { return m_videoPass; }
     class VideoQuadPass*     GetVideoQuadPass()      { return m_videoQuadPass; }
@@ -336,11 +364,12 @@ public:
     // Capture tonemap output to PNG. Synchronous (flushes GPU). False on error.
     bool CaptureViewportToPNG(const char* path);
 
-    // ===== Post-process stack & volumes =====
+    // ===== Post-process stack =====
+    // The stack is a pure consumer of PostProcess::Runtime::resolved (filled by
+    // PostProcessResolveSystem each frame). Volumes/profiles/overrides live in
+    // the ECS + ProfileSystem + Runtime, not here.
     PostProcess::Stack*              GetPostProcessStack()         { return m_postProcessStack.get(); }
     const PostProcess::Stack*        GetPostProcessStack() const   { return m_postProcessStack.get(); }
-    PostProcess::VolumeSystem*       GetPostProcessVolumes()       { return m_postProcessVolumes.get(); }
-    const PostProcess::VolumeSystem* GetPostProcessVolumes() const { return m_postProcessVolumes.get(); }
 
     // ===== Reflection probes =====
     uint64_t GetReflectionProbeArraySrv()  const { return m_probeMgr.GetArraySrv(); }
@@ -384,6 +413,7 @@ public:
     MorphClipLibrary& GetMorphClipLibrary() { return m_skin.GetMorphClipLibrary(); }
     AnimationSystem*  GetAnimationSystem()  { return m_skin.GetAnimationSystem();  }
     IKSystem*         GetIKSystem()         { return m_skin.GetIKSystem();         }
+    ChainPhysicsSystem* GetChainPhysicsSystem() { return m_skin.GetChainPhysicsSystem(); }
     FootIKTargetSystem* GetFootIKSystem()   { return m_skin.GetFootIKSystem();     }
     CharacterStateSystem* GetCharacterStateSystem() { return m_skin.GetCharacterStateSystem(); }
     void              SetPhysicsSystem(DX12Physics::PhysicsSystem* p) { m_skin.SetPhysicsSystem(p); }
@@ -464,6 +494,11 @@ private:
     bool m_ssrEnabled         = true;
     bool m_useIndirectDraw    = false;
     bool m_gpuCullingEnabled  = true;
+    // Hi-Z mip chain is generated for *occlusion* culling, but no pass currently
+    // samples it (CullingPass is frustum-only; SSR uses its own depth hierarchy).
+    // Default OFF so we don't pay ~13 dispatches + the mip-chain texture for a
+    // consumer that doesn't exist yet. Flip back on when occlusion culling lands.
+    bool m_hiZEnabled         = false;
     // Default OFF: light icons are an editor debug gizmo driven by the editor's
     // DebugDrawSystem (Lights debug category), which sets this true each frame.
     // Game builds never touch it, so light icons are stripped from shipping.
@@ -504,6 +539,15 @@ private:
     void*          m_spotShadowVPMapped   [kFrameSlots] = {};
     uint64_t       m_spotShadowVPSrv     [kFrameSlots] = {};
 
+    // Terrain per-layer material table (StructuredBuffer<TerrainLayerGPU>).
+    // Triple-buffered UPLOAD heap, sized to kMaxTerrainLayers; BuildScene_SyncTerrain
+    // writes layers.size() entries each frame and the terrain PS loops over
+    // layerCount. Bound to the terrain pass's free per-draw SRV table (t4 space0).
+    static constexpr uint32_t kMaxTerrainLayers = 8;
+    RHI::GPUBuffer m_terrainLayerBuffer   [kFrameSlots];
+    void*          m_terrainLayerMapped   [kFrameSlots] = {};
+    uint64_t       m_terrainLayerSrv      [kFrameSlots] = {};
+
     // Material buffer — triple-buffered: BuildDrawListAndUploadInstances writes
     // it per frame from scratch (matIdx resets to 0 each frame, slots get fresh
     // data based on visible materials). The prev-batch (slot,hash) cache only
@@ -530,6 +574,9 @@ private:
     RG::RGTextureHandle m_depthHandle;
     RG::RGTextureHandle m_velocityHandle;
     RG::RGTextureHandle m_emissiveHandle;
+    // Pre-grass depth snapshot — the SSR trace marches its Hi-Z pyramid
+    // against this so thin grass blades don't occlude water reflections.
+    RG::RGTextureHandle m_ssrTraceDepthHandle;
 
     // ===== System refs (injected; not owned) =====
     Resource::MaterialSystem*  m_matSys  = nullptr;
@@ -592,6 +639,8 @@ private:
     // ===== Render passes — geometry & shadows =====
     GBufferPass*                  m_gbufferPass    = nullptr; // owned by m_graph
     TerrainPass*                  m_terrainPass    = nullptr; // owned by m_graph
+    GrassPass*                    m_grassPass      = nullptr; // owned by m_graph
+    WaterPass*                    m_waterPass      = nullptr; // owned by m_graph
     SkyboxPass*                   m_skyboxPass     = nullptr; // owned by m_graph
     TransparentPass*              m_transparentPass = nullptr; // owned by m_graph
     LightingPass*                 m_lightingPass   = nullptr; // owned by m_graph
@@ -599,10 +648,12 @@ private:
     SkyIBLPass*                   m_skyIBLPass     = nullptr; // owned by m_graph
     VolumetricFogPass*            m_volFogPass     = nullptr; // owned by m_graph
     CloudPass*                    m_cloudPass      = nullptr; // owned by m_graph
+    HeightFogPass*                m_heightFogPass  = nullptr; // owned by m_graph
     class VideoPass*              m_videoPass      = nullptr; // owned by m_graph
     class VideoQuadPass*          m_videoQuadPass  = nullptr; // owned by m_graph
     SceneVoxelPass*               m_sceneVoxelPass = nullptr; // owned by m_graph
     SpotShadowPass*               m_spotShadowPass = nullptr; // owned by m_graph
+    PointShadowPass*              m_pointShadowPass = nullptr; // owned by m_graph
     DecalPass*                    m_decalPass      = nullptr; // owned by m_graph
     std::unique_ptr<ShadowSystem> m_shadowSystem;             // CSM math + stabilization
     std::unique_ptr<ShadowPass>   m_shadowPass;               // standalone (not in graph)
@@ -626,6 +677,9 @@ private:
     std::unique_ptr<ToneMapPass>      m_toneMapPass;
     std::unique_ptr<XeGTAOPass>       m_xegtaoPass;
     std::unique_ptr<CASPass>          m_casPass;
+    std::unique_ptr<UnderwaterPass>   m_underwaterPass;
+    std::unique_ptr<DepthOfFieldPass> m_dofPass;
+    std::unique_ptr<StylizePass>      m_stylizePass;
     std::unique_ptr<GlassShatterPass> m_glassShatterPass;
     TAAJitterState                    m_taaJitter;
 
@@ -666,8 +720,6 @@ private:
 
     // ===== Post-process orchestration =====
     std::unique_ptr<PostProcess::Stack>              m_postProcessStack;
-    std::unique_ptr<PostProcess::VolumeSystem>       m_postProcessVolumes;
-    std::unique_ptr<PostProcess::EntityVolumeSource> m_postProcessEntityVolumes;
 
     // ===== VFX — particles / trails / tracers / beams =====
     std::unique_ptr<class ParticleSystem>     m_particleSystem;
@@ -679,6 +731,7 @@ private:
     std::unique_ptr<class TracerSystem>       m_tracerSystem;
     std::unique_ptr<class TracerSimPass>      m_tracerSimPass;
     class TracerRenderPass*                   m_tracerRenderPass = nullptr;   // m_graph
+    class BillboardFXPass*                    m_billboardFXPass = nullptr;    // m_graph
     std::unique_ptr<class BeamSystem>         m_beamSystem;
     std::unique_ptr<class BeamSimPass>        m_beamSimPass;
     std::unique_ptr<class AfterimageSystem>      m_afterimageSystem;
@@ -693,14 +746,21 @@ private:
         TerrainTexSlot albedo;
         TerrainTexSlot normal;
         TerrainTexSlot arm;       // R=AO, G=Roughness, B=Metalness
-        TerrainTexSlot disp;      // single-channel height for height-blend
+        TerrainTexSlot disp;      // single-channel height for height-correlated blend
     };
     struct TerrainTexCache {
         TerrainTexSlot                   heightmap;
         TerrainTexSlot                   splatmap;
-        std::array<TerrainLayerSlots, 4> layers;
+        std::vector<TerrainLayerSlots>   layers;   // sized to match TerrainComponent::layers
     };
     std::unordered_map<Entity, TerrainTexCache> m_terrainTexCache;
+
+    // ===== Water texture cache (singleton water — two flow-normal slots) =====
+    // Reuses TerrainTexSlot (path + TextureHandle). Synced by
+    // BuildScene_SyncWater; released via the deferred material-texture queue
+    // on OnWorldClear (Load-then-Release, doc §8.1).
+    TerrainTexSlot m_waterNormalA;
+    TerrainTexSlot m_waterNormalB;
 
     // ===== Scene BVH (rebuilt per frame for frustum culling) =====
     SceneBVH m_sceneBVH;
@@ -808,6 +868,8 @@ private:
     void BuildScene_SortAndEmit(const std::vector<DrawCandidate>& candidates);
     // -- post-gather phases --
     void BuildScene_SyncTerrain(World& world);     // Phase 0b
+    void BuildScene_SyncGrass  (World& world);     // Phase 0b.1 — after SyncTerrain
+    void BuildScene_SyncWater  (World& world);     // Phase 0b.2 — after SyncTerrain
     void BuildScene_UploadLights(World& world);    // Phase 4
     void BuildScene_UploadProbes(World& world);    // Phase 5
     void BuildScene_UpdateDDGI  (World& world);    // Phase 6

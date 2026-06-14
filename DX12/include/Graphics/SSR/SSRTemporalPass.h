@@ -37,6 +37,9 @@ public:
     void SetFrameIndex(uint32_t f)    { m_frameIndex = f; }
     void MarkReset()                  { m_resetHistory = true; }
 
+    // After Execute these refer to the buffer written THIS frame (the
+    // ping-pong advances at the top of Execute) — the upsample consumes
+    // them same-frame, so they must never hand back the history buffer.
     uint64_t GetColorSrv()    const;
     uint64_t GetVarianceSrv() const;
     const RHI::Texture* GetColorTexture()    const;

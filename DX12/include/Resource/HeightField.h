@@ -33,8 +33,21 @@ namespace Resource
         // ---- World-Y mapping (mirrors TerrainComponent placement) -------
         // Sample value 0      → worldY = baseY
         // Sample value 65535  → worldY = baseY + heightScale
+        // NOTE: the Renderer stores the RE-ANCHORED (effective) pair here —
+        // see Renderer_Terrain.cpp height-range re-anchoring — so collision
+        // queries match the rendered surface bit-for-bit.
         float baseY       = 0.0f;
         float heightScale = 1.0f;
+
+        // ---- Source-data range (normalized 0..1) ------------------------
+        // Min/max of the decoded samples, computed once at decode time.
+        // Heightmaps rarely span the full encodable [0,1] range; the
+        // Renderer uses this to re-anchor the surface so the lowest valley
+        // stays pinned to TerrainComponent::worldCenter.y no matter what
+        // heightScale is — without it, scaling translates the whole tile
+        // upward by dataMin01 × heightScale.
+        float dataMin01 = 0.0f;
+        float dataMax01 = 1.0f;
 
         bool IsValid() const
         {

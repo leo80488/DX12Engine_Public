@@ -12,6 +12,17 @@
 - **ExecuteIndirect** indirect-draw path with GPU-built draw count.
 - Scene **BVH** rebuilt per frame for CPU-side queries (frustum tests, picking).
 - Mesh-shader **terrain pipeline** (`Terrain.as / .ms / .ps`) with quadtree LOD and amplification-shader-driven CSM caster path.
+- **Procedural grass** (`Grass.as / .ms / .ps`) — fully GPU-generated quadratic-Bézier ribbon blades with **no** vertex /
+  instance buffers: the amplification shader frustum- and distance-culls patches (hash-dithered dissolve fade, 7/3/2-segment
+  LOD) and prefix-sum-assigns mesh-shader groups; the mesh shader hash-places blades on a bit-reversed stratified grid
+  (density-stable), anchors roots to the `TerrainComponent` heightmap (bicubic), applies Voronoi-lite clumping and
+  two-octave scrolling wind evaluated at **both** current and previous frame for TAA velocity, and writes the full deferred
+  G-Buffer (stencil ref 1, PBR). Driven by `GrassComponent`; self-disables gracefully without mesh-shader support.
+- **Planar water** (`Water.vs / .ps`) — procedural `SV_VertexID` grid (no buffers) drawn after the skybox into
+  G-Buffer + HDR with reverse-Z test/write, so depth-aware passes (cloud / fog / SSR) see it as real geometry.
+  Whiteout-blended dual counter-scrolling flow normals, Fresnel sky reflection (dampened by previous-frame SSR
+  confidence), CSM-shadowed Blinn sun glint, and analytic water depth from the terrain heightmap driving deep/shallow
+  absorption + a clip-discard shoreline alpha fade. Motion vectors keep it stable under TAA/SSR. Driven by `WaterComponent`.
 
 ## Lighting
 
@@ -26,6 +37,11 @@
 - Per-material `ShadowCullMode` (Back / Front / None + alpha-test bucket) with per-group depth bias and
   prefix-summed `ExecuteIndirect` caster groups.
 - **Spot shadow atlas** — 2048²×8-slice array for opt-in spot-light shadows; skipped entirely when no caster opts in.
+- **Point-light shadow cubes** (`PointShadowPass`) — up to 4 concurrent omnidirectional casters, each a 1024²×6-face
+  slice of a `TextureCubeArray` rendered depth-only (reuses `Shadow.vs/.ps`, ALPHA_TEST bucket for foliage) with 90°
+  per-face reverse-Z view-projections (NearZ = light radius). `Lighting.ps` samples by world-space direction with
+  hardware cube-face selection and reconstructs the reverse-Z reference depth analytically (no per-light VP), with
+  receiver-side normal-offset bias. Opt-in via `LightData.castsShadow`.
 - **Cook-Torrance microfacet BRDF** (GGX + Smith + Schlick) shared between opaque & transparent paths;
   deferred shading runs 3 stencil-gated PSO variants (PBR / NPR / Unlit).
 
@@ -60,8 +76,14 @@
 - Pre-baked stars (`StarsBake.cs`), analytic sun + moon disks, HDRI skybox visual override.
 - IBL pipeline — irradiance (9-coeff sky SH) + radiance cube (temporal 1-face-per-frame GGX prefilter) +
   pre-integrated BRDF LUT (`SpecularPrefilter.cs`, `GenerateLUT.cs`).
-- **Volumetric clouds** — once-baked 128³ noise volume, quarter-res depth-aware raymarch (`CloudRaymarch.cs`)
-  with alpha-over HDR composite, driven by an ECS `CloudComponent` (altitude band, coverage, density, wind).
+- **Volumetric clouds** — spherical-shell raymarch over a Nubis / Frostbite density model. Three once-baked lookups —
+  `CloudNoiseBake.cs` (128³ Perlin-Worley base shape), `CloudDetailNoiseBake.cs` (32³ Worley erosion), and
+  `CloudWeatherBake.cs` (512² coverage / secondary-fill / cloud-type weather map, scrolled at ¼ wind speed) — feed a
+  quarter-res adaptive coarse→fine raymarch (`CloudRaymarch.cs`): 5-tap cone optical depth toward the sun, 3-octave
+  energy-conserving multi-scatter, dual-lobe HG + silver-lining phase, per-cloud-type height gradients, IGN jitter, and
+  a horizon fade. A depth-aware bilateral 4-tap upsample (`CloudComposite.ps`) alpha-over-composites the RGBA16F result
+  into HDR after the skybox and before fog. Driven by `CloudComponent` (altitude band, coverage, density, detail
+  strength, weather scale, wind, multi-lobe lighting, up to 192 ray steps).
 
 ## Volumetrics
 
@@ -71,11 +93,19 @@
 - **Volumetric raymarch** half-res god-ray tier with its own temporal pass (`VolumetricRaymarch.cs`,
   `VolumetricRaymarchTemporal.cs`, `VolumetricRaymarchApply.ps`); composited additively, then the froxel
   transmittance composites over HDR (6 compute stages + 2 graphics apply passes total).
+- **Analytic height fog** (`HeightFogApply.ps`) — UE-style exponential height fog with closed-form optical-depth
+  integration along each view ray (with a `D.y→0` Taylor branch and a `t→∞` analytic limit for sky pixels), sun
+  inscattering through a Henyey-Greenstein phase, and start-distance / max-opacity clamps. Depth is point-loaded (not
+  filtered) to avoid silhouette halos. Composited fullscreen (ONE / INV_SRC_ALPHA) **after** the clouds and **before**
+  the froxel volumetric fog so the near-range froxel scattering layers over it. Driven by `HeightFogComponent`.
 
 ## Post-Process Stack
 
 - **Auto Exposure** — log-luminance histogram, eye adaptation.
 - **Bloom** — 13-tap "Sledgehammer" downsample with Karis-average, 3×3 tent upsample.
+- **Depth of Field** (`DepthOfField.cs`) — focus-distance circle-of-confusion blur: linearizes reverse-Z depth, ramps
+  CoC over a transition band, then gathers two concentric rings (8 + 16 taps) weighted by each tap's own CoC
+  (scatter-as-gather, so a sharp foreground can't bleed onto the blurred background).
 - **Lens Flare** — procedural directional-light flare composited pre-tonemap.
 - **TAA** — Karis 2014 / Salvi 2016 hybrid: nearest-depth velocity dilation, 9-tap Catmull-Rom history,
   variance clipping with luma gamma (separate specular sigma), soft-edge disocclusion, anti-flicker cross
@@ -86,12 +116,23 @@
   temporal accumulation (tightens the variance clip), with velocity + prev-linear-depth disocclusion rejection.
 - **Tonemap** — final HDR → LDR with exposure & color-grading.
 - **CAS** — AMD FidelityFX Contrast Adaptive Sharpening, LDS-tiled HDR-aware port.
+- **NPR Stylize** (`Stylize.cs`) — single-dispatch non-photoreal stack with independently-toggled modes: Kuwahara
+  (lowest-variance quadrant), Posterize, ordered 4×4 Bayer Dither, luminance-driven Halftone dots, multi-angle ink
+  Crosshatch, and Pixelate.
+- **Underwater** (`Underwater.cs`) — two-layer animated sine-wave screen distortion plus a water-colour tint, applied
+  pre-tonemap when the camera is submerged.
 - **Color Grading** parameter block.
-- **Post-Process Volumes** — Unreal-style blendable volume system: Global / Box / Sphere SDF shapes with
-  linear `blendDistance` falloff and per-stage `std::optional` overrides, priority-ordered weight-lerp
-  blending (`VolumeSystem` slot registry + ECS `EntityVolumeSource` + `ParameterBlender`), plus a transient
-  time-driven `ScriptedOverrideSystem` (damage-flash / flashbang fade curves). The staged effect chain
-  (CAS → AutoExposure → Bloom → LensFlare → Tonemap) runs with zero-cost `IsEnabled` gates.
+- **Post-Process Volumes & Profiles** — Unreal-style blendable look system rebuilt around per-property
+  `Overridable<T>` values. `PostProcessVolumeComponent` attaches a shared, asset-backed `.ppprofile` (Global / Box-OBB /
+  Sphere SDF bounds, linear `blendDistance` falloff, priority, 32-bit per-view `layerMask`); `PostProcessResolveSystem`
+  (PreRender, after the camera-stack blend so the view position doesn't jitter the falloff) flattens the engine default,
+  gathers spatial volumes + transient gameplay overrides, priority-sorts ascending, and sequential-lerps **only** the
+  overriding properties into a flat `ResolvedPostProcessSettings`. A single X-macro (`PostProcessProperties.inl`) is the
+  one source of truth wiring every property into the profile struct, resolved struct, serializer, editor widgets, and
+  Lua bindings (`PostProcess.spawnVolume / setOverride / pushTransient / getResolved`, with fade-in/hold/fade-out
+  override envelopes). `PostProcess::Stack` is a decoupled consumer that runs the staged chain
+  (DepthOfField → CAS → AutoExposure → Bloom → LensFlare → Underwater → Stylize → Tonemap) with zero-cost `IsEnabled`
+  gates against the resolved settings.
 
 ## Special Effects
 
@@ -107,6 +148,10 @@
   PVF vertex buffers + bindless mesh descriptors (no dedicated render pass). Inner-core + outer-glow shaders.
 - **Afterimage / ghost** — snapshots skinned-mesh vertices into a bindless pool (`AfterimageCopy.cs`) and
   renders them as additive Fresnel-rim ghosts (`Afterimage_Ghost.ps`) with lifetime fade.
+- **Sprite billboards** (`BillboardFX.vs/.ps`) — animated sprite-sheet billboards (explosions / impacts / glows):
+  CPU-expanded camera-facing quads (spherical or cylindrical), flipbook playback (Loop / Once / PingPong), additive or
+  alpha blend, vertex-pulled from a triple-buffered upload ring and drawn into HDR with read-only depth so they glow
+  through Bloom. Painter-sorted back-to-front, textures resolved to bindless slots on demand. Driven by `BillboardFXComponent`.
 - **Skinned animation** — GPU skinning compute (`Skin.cs`), pose ring buffer, morph targets, CCD IK
   (incl. ground-aware foot IK), socket attachments, follow-entity / follow-socket components.
 - **Video composite** — hardware-decoded NV12 → RGB (BT.709): fullscreen `VideoPass` and depth-tested
@@ -138,16 +183,16 @@ The SSR sub-passes live under `DX12/include/Graphics/SSR/`; the rest under `DX12
 
 | Category       | Passes                                                                                                |
 | -------------- | ----------------------------------------------------------------------------------------------------- |
-| **Geometry**   | GBuffer, Terrain, Skybox, Transparent, Picking, DebugWire                                             |
-| **Shadows**    | Shadow (4-cascade CSM), SpotShadow                                                                    |
+| **Geometry**   | GBuffer, Terrain, Grass, Skybox, Water, Transparent, Picking, DebugWire                              |
+| **Shadows**    | Shadow (4-cascade CSM), SpotShadow, PointShadow (cube)                                                |
 | **Lighting**   | Lighting, Decal, SkyIBL                                                                               |
 | **GI**         | DDGI, DDGIProbeDebug, ReflectionProbeCapture, SceneVoxel                                              |
 | **SSR**        | SSRTrace, SSRResolve, SSRTemporal, SSRUpsample, SSRComposite, SSRDepthHierarchy, SceneColorPyramid    |
-| **Volumetric** | VolumetricFog (froxel + half-res raymarch, 6 compute + 2 apply), Cloud                                |
+| **Volumetric** | VolumetricFog (froxel + half-res raymarch, 6 compute + 2 apply), Cloud (3 bake + raymarch + composite), HeightFog |
 | **Culling**    | Culling, Cluster, HiZ                                                                                 |
 | **Skinning**   | Skinning                                                                                              |
-| **VFX**        | Particles, Trails, Tracers (sim+render), BeamSim, AfterimageCapture, GlassShatter                     |
+| **VFX**        | Particles, Trails, Tracers (sim+render), BeamSim, AfterimageCapture, BillboardFX, GlassShatter        |
 | **Outline**    | Outline (3 sub-passes)                                                                                |
-| **Post**       | TAA, FXAA, AutoExposure, Bloom, LensFlare, XeGTAO, CAS, ToneMap, ColorGrading                         |
+| **Post**       | TAA, FXAA, AutoExposure, Bloom, DepthOfField, LensFlare, XeGTAO, CAS, Stylize, Underwater, ToneMap, ColorGrading |
 | **Video**      | Video (screen-space), VideoQuad (world-space)                                                         |
 | **UI**         | UI (screen), WorldUIBillboard                                                                         |

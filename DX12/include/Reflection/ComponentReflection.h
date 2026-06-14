@@ -34,9 +34,11 @@
 #include "ECS/HierarchyComponents.h"
 #include "ECS/CameraStackComponents.h"
 #include "ECS/BillboardComponent.h"
+#include "ECS/BillboardFXComponent.h"
 #include "ECS/SkyboxComponent.h"
 #include "ECS/AtmosphereComponent.h"
 #include "ECS/CloudComponent.h"
+#include "ECS/HeightFogComponent.h"
 #include "ECS/TODComponents.h"
 #include "ECS/ReflectionProbeComponent.h"
 #include "ECS/DDGIComponents.h"
@@ -52,9 +54,11 @@
 #include "ECS/FootIKComponent.h"
 #include "ECS/ParticleComponent.h"
 #include "ECS/TerrainComponent.h"
+#include "ECS/GrassComponent.h"
+#include "ECS/WaterComponent.h"
 #include "ECS/SocketSystem.h"
 #include "ECS/FollowComponents.h"
-#include "ECS/VolumeComponent.h"
+#include "ECS/PostProcessVolumeComponent.h"
 #include "ECS/VideoComponent.h"
 #include "AI/AIComponents.h"
 #include "Physics/ChainPhysicsSystem.h"
@@ -319,6 +323,44 @@ REFLECT_BEGIN(BillboardComponent)
 REFLECT_END()
 
 // ===========================================================================
+// BillboardFXComponent — animated sprite-sheet billboard ("billboard effect").
+// texturePath resolves to a bindless slot at runtime (shown via postDraw).
+// ===========================================================================
+
+constexpr Reflect::EnumOption kBillboardFXFaceOptions[] = {
+    { (int)BillboardFXFace::Spherical,   "Spherical (full)"      },
+    { (int)BillboardFXFace::Cylindrical, "Cylindrical (up-axis)" },
+};
+constexpr Reflect::EnumOption kBillboardFXBlendOptions[] = {
+    { (int)BillboardFXBlend::Alpha,    "Alpha"    },
+    { (int)BillboardFXBlend::Additive, "Additive" },
+};
+constexpr Reflect::EnumOption kBillboardFXPlaybackOptions[] = {
+    { (int)BillboardFXPlayback::Loop,     "Loop"      },
+    { (int)BillboardFXPlayback::Once,     "Once"      },
+    { (int)BillboardFXPlayback::PingPong, "Ping-Pong" },
+};
+
+REFLECT_BEGIN(BillboardFXComponent)
+    REFLECT_STRING_DROP(texturePath, "Sprite Sheet", "ITEX_PATH")
+    REFLECT_HEADER   ("Atlas")
+    REFLECT_INT      (columns,    "Columns",     1, 64)
+    REFLECT_INT      (rows,       "Rows",        1, 64)
+    REFLECT_INT      (frameCount, "Frame Count (0=all)", 0, 4096)
+    REFLECT_FLOAT    (fps,        "FPS",         0.f, 120.f)
+    REFLECT_ENUM     (playback,   "Playback",    kBillboardFXPlaybackOptions)
+    REFLECT_BOOL     (playing,    "Playing")
+    REFLECT_HEADER   ("Appearance")
+    REFLECT_FLOAT    (size,       "Size",        0.001f, 100.f)
+    REFLECT_COLOR4   (tint,       "Tint")
+    REFLECT_FLOAT    (emissive,   "Emissive",    0.f, 64.f)
+    REFLECT_SLIDER   (opacity,    "Opacity",     0.f, 1.f)
+    REFLECT_ENUM     (face,       "Face Mode",   kBillboardFXFaceOptions)
+    REFLECT_ENUM     (blend,      "Blend",       kBillboardFXBlendOptions)
+    REFLECT_BOOL     (depthTest,  "Depth Test (occluded by scene)")
+REFLECT_END()
+
+// ===========================================================================
 // SkyboxComponent — 3 paths + a few numeric knobs. GPU handles are runtime
 // state shown via postDraw in EditorLayer.
 // ===========================================================================
@@ -406,15 +448,45 @@ REFLECT_BEGIN(CloudComponent)
     REFLECT_HEADER("Shape")
     REFLECT_SLIDER(coverage,        "Coverage",   0.f,   1.f)
     REFLECT_SLIDER(density,         "Density",    0.f,   4.f)
-    REFLECT_FLOAT_FMT(noiseScale,   "Noise Scale", 0.0001f, 0.01f, "%.5f", 0.0001f)
+    REFLECT_FLOAT_FMT(noiseScale,   "Base Noise Scale", 0.0001f, 0.01f, "%.5f", 0.0001f)
+    REFLECT_FLOAT_FMT(detailNoiseScale, "Detail Noise Scale", 0.0002f, 0.02f, "%.5f", 0.0002f)
+    REFLECT_SLIDER(detailStrength,  "Detail Erosion", 0.f, 1.f)
+    REFLECT_FLOAT_FMT(weatherScale, "Weather Scale", 0.000002f, 0.0002f, "%.6f", 0.000002f)
+    REFLECT_SLIDER(cloudTypeBias,   "Type Bias (stratus<->cumulus)", -1.f, 1.f)
+    REFLECT_SLIDER(anvilBias,       "Anvil Bias", 0.f, 1.f)
     REFLECT_HEADER("Wind")
     REFLECT_FLOAT3(windDirection,   "Wind Direction", -1.f, 1.f)
     REFLECT_SLIDER(windSpeed,       "Wind Speed (m/s)", 0.f, 100.f)
     REFLECT_HEADER("Lighting")
-    REFLECT_SLIDER(anisotropy,      "Anisotropy (HG g)", -0.99f, 0.99f)
-    REFLECT_SLIDER(extinction,      "Extinction",     0.f, 0.5f)
+    REFLECT_SLIDER(anisotropy,      "Phase Forward G", 0.f, 0.99f)
+    REFLECT_SLIDER(phaseBackG,      "Phase Back G",   -0.99f, 0.f)
+    REFLECT_SLIDER(phaseBlend,      "Phase Blend",     0.f, 1.f)
+    REFLECT_SLIDER(silverIntensity, "Silver Intensity", 0.f, 2.f)
+    REFLECT_SLIDER(silverSpread,    "Silver Spread",   0.01f, 0.99f)
+    REFLECT_SLIDER(extinction,      "Extinction (1/m)", 0.f, 0.3f)
     REFLECT_SLIDER(ambientStrength, "Ambient Fill",   0.f, 2.f)
+    REFLECT_COLOR3(ambientTint,     "Ambient Tint")
     REFLECT_COLOR3(cloudColor,      "Cloud Albedo")
+    REFLECT_HEADER("Quality")
+    REFLECT_SLIDER(maxSteps,        "Max Ray Steps", 24.f, 192.f)
+REFLECT_END()
+
+// ===========================================================================
+// HeightFogComponent — UE-style exponential height fog (singleton, Sky
+// entity). Sun direction/colour come from LightCB at runtime.
+// ===========================================================================
+REFLECT_BEGIN(HeightFogComponent)
+    REFLECT_BOOL  (enabled,             "Enabled")
+    REFLECT_HEADER("Density")
+    REFLECT_FLOAT_FMT(fogDensity,       "Fog Density (1/m)",    0.f, 0.05f, "%.5f", 0.0001f)
+    REFLECT_FLOAT_FMT(fogHeightFalloff, "Height Falloff (1/m)", 0.f, 1.f,   "%.4f", 0.001f)
+    REFLECT_FLOAT (fogHeight,           "Fog Height (m)",   -1000.f, 5000.f)
+    REFLECT_FLOAT (startDistance,       "Start Distance (m)",   0.f, 5000.f)
+    REFLECT_SLIDER(maxOpacity,          "Max Opacity",          0.f, 1.f)
+    REFLECT_HEADER("Inscattering")
+    REFLECT_COLOR3(fogColor,            "Fog Color")
+    REFLECT_SLIDER(sunInscatterIntensity, "Sun Inscatter",      0.f, 4.f)
+    REFLECT_SLIDER(anisotropy,          "Sun Phase G",          0.f, 0.99f)
 REFLECT_END()
 
 // ===========================================================================
@@ -472,6 +544,9 @@ REFLECT_BEGIN(ReflectionProbeComponent)
     REFLECT_FLOAT3 (outerExtents,       "Outer Half-Extents", 0.01f, 1000.f)
     REFLECT_INFO   ("Inside inner box: full influence (weight 1).")
     REFLECT_INFO   ("Between inner and outer: linear fade.")
+    REFLECT_SLIDER (intensity,          "Intensity", 0.f, 8.f)
+    REFLECT_INFO   ("Probe reflection brightness. Independent of Atmosphere IBL")
+    REFLECT_INFO   ("Intensity — contributes even when sky IBL is 0.")
     REFLECT_HEADER ("Realtime")
     REFLECT_BOOL   (realtime,           "Realtime")
     REFLECT_SLIDER_INT(tickIntervalFrames, "Tick Interval (frames)", 1, 3600)
@@ -536,6 +611,10 @@ REFLECT_BEGIN(IndirectLightingSettingsComponent)
     REFLECT_BOOL  (ssrEnabled,            "SSR Enabled")
     REFLECT_FLOAT (ssrRoughnessCutoff,    "SSR Roughness Cutoff", 0.f, 1.f)
     REFLECT_FLOAT (ssrEdgeFadeRatio,      "SSR Edge Fade",        0.f, 0.5f)
+    REFLECT_HEADER("Reflection Probes")
+    REFLECT_FLOAT (reflectionProbeBakeAmbient, "Probe Bake Ambient", 0.f, 2.f)
+    REFLECT_INFO  ("Scales sky ambient baked into probe cubemaps (x iblStrength).")
+    REFLECT_INFO  ("Lower to darken over-bright interior probe captures. Re-bake to apply.")
     REFLECT_HEADER("Fallback Order")
     REFLECT_BOOL  (reflectionProbePriorityOverDDGI, "Reflection Probe > DDGI (specular)")
     REFLECT_BOOL  (useDDGIForRoughSpecularFallback, "Use DDGI for Rough Specular Fallback")
@@ -693,10 +772,11 @@ REFLECT_BEGIN(LightData)
     REFLECT_HEADER ("Shading")
     REFLECT_COLOR3 (color,     "Color")
     REFLECT_FLOAT  (intensity, "Intensity", 0.f, 1000.f)
-    // Cast shadow — Spot only (directional uses CSM unconditionally; point
-    // shadows aren't implemented).
+    // Cast shadow — Spot (spot atlas) + Point (omnidirectional cube atlas);
+    // both opt-in and capacity-limited. Directional uses CSM unconditionally.
     REFLECT_IF([](const void* o) {
-        return static_cast<const LightData*>(o)->type == LightType::Spot;
+        const auto t = static_cast<const LightData*>(o)->type;
+        return t == LightType::Spot || t == LightType::Point;
     })
         REFLECT_BOOL(castsShadow, "Cast Shadow")
     REFLECT_ENDIF()
@@ -971,7 +1051,7 @@ REFLECT_END()
 
 REFLECT_BEGIN(ChainPhysicsComponent)
     REFLECT_BOOL(enabled, "Enabled")
-    REFLECT_COLLAPSE("Hair")
+    REFLECT_COLLAPSE("Chain (global)")
         REFLECT_SLIDER   (damping,        "Damping",          0.f, 1.f)
         REFLECT_FLOAT_FMT(gravity,        "Gravity",       -100.f, 0.f, "%.1f", 0.5f)
         REFLECT_SLIDER   (stiffness,      "Stiffness",        0.1f, 5.f)
@@ -980,7 +1060,7 @@ REFLECT_BEGIN(ChainPhysicsComponent)
         REFLECT_SLIDER   (maxVelocity,    "Max Velocity",     0.f, 5.f)
         REFLECT_SLIDER   (localStiffness, "Local Stiffness",  0.f, 1.f)
     REFLECT_COLLAPSE_END()
-    REFLECT_COLLAPSE("Skirt")
+    REFLECT_COLLAPSE("Cloth (global)")
         REFLECT_SLIDER   (skirtDamping,        "Damping",         0.f, 1.f)
         REFLECT_FLOAT_FMT(skirtGravity,        "Gravity",      -100.f, 0.f, "%.1f", 0.5f)
         REFLECT_SLIDER   (skirtStiffness,      "Stiffness",       0.1f, 5.f)
@@ -1290,6 +1370,82 @@ REFLECT_END()
 REFLECT_BEGIN(TerrainComponent)
 REFLECT_END()
 
+// ===========================================================================
+// GrassComponent — GoT-style procedural grass field. Blades are generated on
+// the GPU each frame (Grass.as/ms/ps.hlsl); roots anchor to the scene's
+// (first) TerrainComponent heightmap.
+// ===========================================================================
+REFLECT_BEGIN(GrassComponent)
+    REFLECT_BOOL  (enabled,          "Enabled")
+    REFLECT_HEADER("Field Placement")
+    REFLECT_FLOAT3(worldCenter,      "World Center", -100000.f, 100000.f)
+    REFLECT_FLOAT (worldSize,        "World Size (m)",    1.f, 100000.f)
+    REFLECT_UINT  (patchesPerSide,   "Patches Per Side",  1u,  1024u)
+    REFLECT_HEADER("Density / LOD")
+    REFLECT_FLOAT (density,          "Density (blades/m2)", 0.f, 64.f)
+    REFLECT_FLOAT (lod0Dist,         "LOD0 Distance (m)",   1.f, 500.f)
+    REFLECT_FLOAT (lod1Dist,         "LOD1 Distance (m)",   1.f, 1000.f)
+    REFLECT_FLOAT (cullDist,         "Cull Distance (m)",   1.f, 2000.f)
+    REFLECT_HEADER("Blade Shape")
+    REFLECT_FLOAT (bladeHeight,      "Height (m)",       0.02f, 4.f)
+    REFLECT_SLIDER(bladeHeightVar,   "Height Variance",  0.f,   0.95f)
+    REFLECT_FLOAT (bladeWidth,       "Width (m)",        0.005f, 0.5f)
+    REFLECT_FLOAT (tiltMaxDeg,       "Max Tilt (deg)",   0.f,   85.f)
+    REFLECT_SLIDER(bendAmount,       "Bend",             0.f,   1.f)
+    REFLECT_HEADER("Wind")
+    REFLECT_FLOAT2(windDir,          "Wind Direction (XZ)", -1.f, 1.f)
+    REFLECT_FLOAT (windStrength,     "Wind Strength (m)",   0.f, 2.f)
+    REFLECT_FLOAT (windSpeed,        "Wind Speed",          0.f, 10.f)
+    REFLECT_FLOAT_FMT(windScale,     "Gust Scale (1/m)", 0.001f, 1.f, "%.3f", 0.001f)
+    REFLECT_HEADER("Clumping")
+    REFLECT_FLOAT (clumpCellSize,    "Clump Cell (m)",   0.1f, 10.f)
+    REFLECT_SLIDER(clumpBlend,       "Clump Blend",      0.f,  1.f)
+    REFLECT_HEADER("Placement Gates")
+    REFLECT_FLOAT (minWorldY,        "Min World Y (m)",  -100000.f, 100000.f)
+    REFLECT_FLOAT (maxWorldY,        "Max World Y (m)",  -100000.f, 100000.f)
+    REFLECT_FLOAT (maxSlopeDeg,      "Max Slope (deg)",  0.f, 89.f)
+    REFLECT_HEADER("Look")
+    REFLECT_COLOR3(baseColor,        "Root Color")
+    REFLECT_COLOR3(tipColor,         "Tip Color")
+    REFLECT_FLOAT_FMT(colorNoiseScale, "Color Noise Scale (1/m)", 0.001f, 1.f, "%.3f", 0.001f)
+    REFLECT_SLIDER(colorNoiseAmount, "Color Noise Amount", 0.f, 1.f)
+    REFLECT_SLIDER(rootAO,           "Root AO",          0.f, 1.f)
+    REFLECT_SLIDER(normalBlend,      "Normal Up-Blend",  0.f, 1.f)
+    REFLECT_SLIDER(viewThicken,      "View Thicken",     0.f, 2.f)
+    REFLECT_FLOAT (farWidthMul,      "Far Width Mul",    1.f, 4.f)
+    REFLECT_SLIDER(roughness,        "Roughness",        0.02f, 1.f)
+    REFLECT_UINT  (seed,             "Seed",             0u, 0xFFFFFFFFu)
+REFLECT_END()
+
+// ===========================================================================
+// WaterComponent — flat water tile: Fresnel sky reflection + flow normals.
+// worldCenter.y IS the water level. Depth/shore fade come from the terrain
+// heightmap (analytic), so no scene-depth readback is involved.
+// ===========================================================================
+REFLECT_BEGIN(WaterComponent)
+    REFLECT_BOOL  (enabled,        "Enabled")
+    REFLECT_HEADER("Placement")
+    REFLECT_FLOAT3(worldCenter,    "World Center (Y = level)", -100000.f, 100000.f)
+    REFLECT_FLOAT (worldSize,      "World Size (m)", 1.f, 100000.f)
+    REFLECT_UINT  (gridQuads,      "Grid Quads",     1u,  512u)
+    REFLECT_HEADER("Body Color")
+    REFLECT_COLOR3(deepColor,      "Deep Color")
+    REFLECT_COLOR3(shallowColor,   "Shallow Color")
+    REFLECT_FLOAT (absorbDist,     "Absorb Depth (m)", 0.05f, 100.f)
+    REFLECT_FLOAT (shoreFade,      "Shore Fade (m)",   0.05f, 20.f)
+    REFLECT_HEADER("Flow Normals")
+    REFLECT_STRING_DROP(normalMapAPath, "Normal Map A (swell)",  "ITEX_PATH")
+    REFLECT_STRING_DROP(normalMapBPath, "Normal Map B (detail)", "ITEX_PATH")
+    REFLECT_FLOAT2(flowDir,        "Flow Direction (XZ)", -1.f, 1.f)
+    REFLECT_FLOAT (flowSpeed,      "Flow Speed (m/s)", 0.f, 10.f)
+    REFLECT_FLOAT_FMT(normalTiling, "Normal Tiling (1/m)", 0.001f, 5.f, "%.3f", 0.001f)
+    REFLECT_SLIDER(normalStrength, "Normal Strength", 0.f, 2.f)
+    REFLECT_HEADER("Shading")
+    REFLECT_SLIDER(fresnelF0,      "Fresnel F0",      0.f, 0.2f)
+    REFLECT_SLIDER(reflStrength,   "Reflection",      0.f, 2.f)
+    REFLECT_FLOAT (specPower,      "Sun Glint Power", 8.f, 2048.f)
+REFLECT_END()
+
 REFLECT_BEGIN(BlackboardComponent)
 REFLECT_END()
 
@@ -1418,36 +1574,27 @@ REFLECT_BEGIN(AIComponent)
 REFLECT_END()
 
 // ===========================================================================
-// ECS::VolumeComponent — only the inner PostProcess::Volume field is
-// reflectable (PostProcess::Volume itself); overrides stay in postDraw.
+// ECS::PostProcessVolumeComponent — spatial knobs are reflected; the referenced
+// PostProcessProfile (per-property override inspector) is drawn in postDraw
+// (EditorLayer) because it needs ProfileSystem + the X-macro override widgets.
+// Bounds come from the entity Transform, so they are not reflected here.
 // ===========================================================================
 
-constexpr Reflect::EnumOption kVolumeShapeOptions[] = {
-    { (int)PostProcess::VolumeShape::Global, "Global" },
-    { (int)PostProcess::VolumeShape::Box,    "Box"    },
-    { (int)PostProcess::VolumeShape::Sphere, "Sphere" },
+constexpr Reflect::EnumOption kPPVolumeShapeOptions[] = {
+    { (int)ECS::PPVolumeShape::Box,    "Box"    },
+    { (int)ECS::PPVolumeShape::Sphere, "Sphere" },
 };
 
-REFLECT_BEGIN(PostProcess::Volume)
-    REFLECT_BOOL (enabled,  "Enabled")
-    REFLECT_ENUM (shape,    "Shape", kVolumeShapeOptions)
+REFLECT_BEGIN(ECS::PostProcessVolumeComponent)
+    REFLECT_BOOL (isGlobal, "Global (unbounded)")
     REFLECT_IF([](const void* o) {
-        return static_cast<const PostProcess::Volume*>(o)->shape
-            != PostProcess::VolumeShape::Global;
+        return !static_cast<const ECS::PostProcessVolumeComponent*>(o)->isGlobal;
     })
-        REFLECT_INFO ("Center follows entity GlobalTransform.")
-        REFLECT_FLOAT3(extents, "Half-Extents (Sphere uses .x as radius)", 0.f, 1000.f)
+        REFLECT_ENUM (shape, "Shape", kPPVolumeShapeOptions)
+        REFLECT_INFO ("Bounds follow Transform (Box = scale half-extents, Sphere = scale.x radius).")
         REFLECT_FLOAT (blendDistance, "Blend Distance", 0.f, 100.f)
     REFLECT_ENDIF()
-    REFLECT_INT  (priority, "Priority", -1000, 1000)
-REFLECT_END()
-
-REFLECT_BEGIN(ECS::VolumeComponent)
-    // Single nested PostProcess::Volume field — reuse its descriptor inline by
-    // routing through a custom widget that delegates to DrawObject. Cheaper
-    // than introducing a "nested struct" macro for one use site.
-    REFLECT_CUSTOM(volume, "Volume", [](void* fp, const Reflect::FieldDescriptor&) {
-        return Reflect::DrawObject(fp, Reflect::Describe<PostProcess::Volume>());
-    })
+    REFLECT_FLOAT (blendWeight, "Blend Weight", 0.f, 1.f)
+    REFLECT_FLOAT_FMT(priority, "Priority", -1000.f, 1000.f, "%.1f", 1.0f)
 REFLECT_END()
 

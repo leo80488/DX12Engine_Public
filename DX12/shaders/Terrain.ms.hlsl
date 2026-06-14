@@ -34,8 +34,10 @@ cbuffer PerViewCB : register(b1, space0)
     float4x4 g_curViewProjNoJitter;
 };
 
-// Layout MUST match Terrain.ps.hlsl and the TerrainParamsCB struct
-// in Renderer.cpp — every field offset is shared with the PS view.
+// Geometry-only prefix of the shared terrain CB. Per-layer material data lives
+// in a PS-only StructuredBuffer now, so the MS declares ONLY the geometry
+// fields it actually reads (a clean prefix of TerrainParamsCB in Renderer.h —
+// declaring fewer trailing fields than the bound buffer is legal in HLSL).
 cbuffer TerrainCB : register(b2, space0)
 {
     float2 g_worldOrigin;       // tile bottom-left in world XZ
@@ -47,28 +49,13 @@ cbuffer TerrainCB : register(b2, space0)
 
     float  g_heightmapTexel;    // 1.0 / heightmap resolution (in UV units of the FULL map)
     uint   g_hasHeightmap;      // 0 = render flat
-    uint   g_hasSplatmap;       // PS-only — read for layout parity
+    uint   _g_hasSplatmap;      // PS-only
     float  g_worldCenterY;      // tile pivot Y; displacement is centred here
 
-    int4   g_layerBindlessIdx;  // PS-only
-    float4 g_layerTilingScale;  // PS-only
-    int4   g_layerNormalIdx;    // PS-only
-    int4   g_layerARMIdx;       // PS-only
-    int4   g_layerDispIdx;      // PS-only
-
     uint   g_tilesPerSide;
-    uint   _g_enableFrustumCull;   // AS-only — laid out for parity
-    float  _g_pad8a;
-    float  _g_pad8b;
-
-    float4 _g_layerMinHeight;      // PS-only — laid out for parity
-    float4 _g_layerMaxHeight;      // PS-only
-    float4 _g_layerFadeHeight;     // PS-only
-    float4 _g_layerMinSlopeDeg;    // PS-only
-    float4 _g_layerMaxSlopeDeg;    // PS-only
-    float4 _g_layerFadeSlopeDeg;   // PS-only
-
-    float4 _g_frustumPlanes[6];    // AS-only — laid out for parity
+    uint   _g_enableFrustumCull;   // AS-only
+    uint   _g_layerCount;          // PS-only
+    uint   _g_pad0;
 };
 
 Texture2D<float>  g_HeightMap   : register(t2, space0);

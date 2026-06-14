@@ -7,6 +7,7 @@
 // Compute root signature slot assignments (shared across compute passes).
 static constexpr uint32_t kCBSlot = 0;
 static constexpr uint32_t kSRV0   = 1;  // t0 space2 — depth
+static constexpr uint32_t kSRV1   = 2;  // t1 space2 — cloud transmittance
 static constexpr uint32_t kUAV0   = 4;  // u0 space2 — output flare
 
 // ---------------------------------------------------------------------------
@@ -118,12 +119,17 @@ RHI::CommandList LensFlarePass::Execute(RHI::CommandList cl)
         cb.ghostCount      = (m_ghostCount > 8u) ? 8u : m_ghostCount;
         cb.streakWidth     = 0.014f;
         cb.occlusionRadius = 0.006f;
+        cb.cloudValid      = (m_cloudSrv != 0) ? 1u : 0u;
         *slot = cb;
     }
 
     gfx.BindComputePipelineState(m_pso, cl);
     gfx.SetComputeRootCBV(kCBSlot, m_cb.CurrentBuffer(gfx), cl);
     if (m_depthSrv) gfx.SetComputeDescriptorTable(kSRV0, m_depthSrv, cl);
+    // The shader branches on cloudValid; bind depth as a harmless dummy when
+    // clouds didn't render so the statically-declared t1 table is never unset.
+    if (m_cloudSrv || m_depthSrv)
+        gfx.SetComputeDescriptorTable(kSRV1, m_cloudSrv ? m_cloudSrv : m_depthSrv, cl);
     gfx.SetComputeDescriptorTable(kUAV0, gfx.GetTextureUAVGpuHandle(m_texture), cl);
 
     gfx.DispatchCompute((m_texW + 7) / 8, (m_texH + 7) / 8, 1, cl);

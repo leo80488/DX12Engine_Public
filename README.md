@@ -27,18 +27,19 @@ A real-time rendering engine and editor written in C++20 / Direct3D 12 (Shader M
 
 **Rendering**
 - Deferred G-Buffer with bindless per-vertex-format (PVF) geometry and ExecuteIndirect GPU culling
-- Clustered Forward+ / Deferred lighting (16×9×24 froxels), 4-cascade CSM (3 near + 1 ultra-far terrain) + spot shadow atlas
+- Clustered Forward+ / Deferred lighting (16×9×24 froxels), 4-cascade CSM (3 near + 1 ultra-far terrain) + spot shadow atlas + omnidirectional point-light shadow cubes
 - DDGI (inline RayQuery, per-probe SH irradiance, up to 4 volumes), runtime-baked reflection probes, Hi-Z stochastic SSR subsystem
-- Hillaire 2020 atmosphere, sky-SH IBL, IBL cube + BRDF LUT, volumetric clouds
-- Froxel volumetric fog + volumetric raymarch god-rays
-- TAA + FXAA, XeGTAO, Bloom (Sledgehammer), CAS, Auto-Exposure, Lens Flare, Tonemap, Color Grading
-- Mesh-shader terrain pipeline, decals, outline (3-pass), glass-shatter, GPU particles / trails / tracers / beams / afterimages
+- Hillaire 2020 atmosphere, sky-SH IBL, IBL cube + BRDF LUT, weather-map volumetric clouds (Nubis/Frostbite density + Worley detail erosion)
+- Froxel volumetric fog + volumetric raymarch god-rays + analytic exponential height fog
+- TAA + FXAA, XeGTAO, Depth of Field, Bloom (Sledgehammer), CAS, Auto-Exposure, Lens Flare, NPR Stylize (Kuwahara / Posterize / Halftone / Dither / Crosshatch / Pixelate), Tonemap, Color Grading
+- Mesh-shader terrain pipeline, procedural grass field (terrain-anchored Bezier blades, wind, distance-LOD), planar water (Fresnel reflection, flow normals, depth absorption) + underwater distortion post
+- Decals, outline (3-pass), glass-shatter, GPU particles / trails / tracers / beams / afterimages / sprite-sheet billboards
 - GPU skinning + morph targets + CCD IK (incl. ground-aware foot IK) + sockets + chain / spring-bone physics
 - Hardware video decode (FFmpeg D3D12VA → NV12 YUV→RGB composite, screen- and world-space)
 
 **Engine**
 - Pool-per-component (sparse-set) ECS, 16-phase dependency-aware parallel scheduler, scene-graph hierarchy
-- Post-process volume system, AnimNotify / Timeline runtime, time-of-day, GUID-stable entity references
+- Post-process volume + profile system (asset-backed `.ppprofile`, per-property layered blending, transient gameplay overrides), AnimNotify / Timeline runtime, time-of-day, GUID-stable entity references
 - Resource cooker (Mesh / `.meshlib` / Material / Texture / Animation / Skeleton / PMX / VMD / VRM / Audio) + `.ipak` virtual filesystem
 - Async loading, GPU BC compression, descriptor-heap allocators, PSO + DXIL shader-blob caches, hot-reload
 - Jolt Physics + kinematic character controller, Recast/Detour navigation, behavior-tree AI (Intent / Tactical / LOD layers)
@@ -47,7 +48,7 @@ A real-time rendering engine and editor written in C++20 / Direct3D 12 (Shader M
 **Tooling**
 - ImGui-docking editor (Hierarchy / Viewport / Inspector / Asset Browser / Timeline + SSR / Font / Camera / Profiler debug windows)
 - ShaderLab sub-second shader-iteration sandbox
-- Lua 5.4 + sol2 scripting (gameplay, UI, AI behavior trees), GameModeStack scene flow
+- Lua 5.4 + sol2 scripting (gameplay, UI, AI behavior trees), data-driven scenes (`game.json` registry + per-scene `OnSceneEnter/Update/Exit` Lua hooks)
 - Jolt Physics, XAudio2 + X3DAudio
 
 ## Build

@@ -8,15 +8,18 @@
 #include "RenderGraph/RenderPass/SkyIBLPass.h"
 #include "RenderGraph/RenderPass/SkyboxPass.h"
 #include "RenderGraph/RenderPass/CloudPass.h"
+#include "RenderGraph/RenderPass/HeightFogPass.h"
 #include "RenderGraph/RenderPass/LightingPass.h"
 #include "RenderGraph/RenderPass/TransparentPass.h"
 #include "RenderGraph/RenderPass/VideoPass.h"
 #include "RenderGraph/RenderPass/VideoQuadPass.h"
+#include "RenderGraph/RenderPass/WaterPass.h"
 
 // ECS components + systems
 #include "ECS/SkyboxComponent.h"
 #include "ECS/AtmosphereComponent.h"
 #include "ECS/CloudComponent.h"
+#include "ECS/HeightFogComponent.h"
 #include "ECS/TODComponents.h"
 #include "ECS/TODSystems.h"
 #include "ECS/VideoComponent.h"
@@ -33,8 +36,8 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
 
 // Renderer_IBL.cpp — split out of Renderer.cpp (one TU per Renderer subsystem).
 // All members belong to class Renderer (declared in Graphics/Renderer.h).
@@ -97,6 +100,11 @@ void Renderer::SyncSkyboxIBL(World& world)
             c.enabled = true;
             world.AddComponent<CloudComponent>(skyEntity, c);
         }
+
+        // Auto-attach HeightFogComponent DISABLED — discoverable in the
+        // inspector without retroactively fogging existing scenes.
+        if (skyEntity != NullEntity && !world.HasComponent<HeightFogComponent>(skyEntity))
+            world.AddComponent<HeightFogComponent>(skyEntity, HeightFogComponent{});
 
         // Separate Time-of-Day entity (singleton).
         auto* todCfgPool = world.GetPool<TODConfigComponent>();
@@ -219,14 +227,10 @@ void Renderer::SyncSkyboxIBL(World& world)
     {
         m_skyIBLPass->SetSourceCubemap(shSourceHandle);
 
-        // Feed camera state to AP LUT so it builds world-space view rays matching deferred lighting.
-        if (m_lightCB.Current(m_gfx))
-        {
-            auto* lb = m_lightCB.Current(m_gfx);
-            DirectX::XMFLOAT3 camPos{ lb->cameraPos[0], lb->cameraPos[1], lb->cameraPos[2] };
-            DirectX::XMFLOAT3 camFwd{ lb->cameraForward[0], lb->cameraForward[1], lb->cameraForward[2] };
-            m_skyIBLPass->SetCameraForAerial(camPos, camFwd, lb->invViewProj);
-        }
+        // NOTE: the AP camera push (SetCameraForAerial) moved to BeginFrame
+        // AFTER UploadFrameData — reading the LightCB ring slot here picked
+        // up the value from kFrameCount frames ago (and zeros on the first
+        // frames), because UploadFrameData writes this frame's slot later.
 
         // TOD: read computed sun/moon state from TODOutputComponent (written
         // by TODEvaluationSystem earlier this frame). When TOD disabled, the
@@ -321,6 +325,19 @@ void Renderer::SyncSkyboxIBL(World& world)
         {
             m_cloudPass->SetEnabled(false);
         }
+    }
+
+    // ---- Exponential height fog: push HeightFogComponent → HeightFogPass ---
+    // Sun dir/colour need no plumbing — the apply shader reads LightCB, which
+    // is already TOD-authoritative by this point.
+    if (m_heightFogPass)
+    {
+        HeightFogComponent* hf = nullptr;
+        if (auto* p = world.GetPool<HeightFogComponent>(); p && !p->Data().empty())
+            hf = &p->Data()[0];   // singleton-by-convention, first wins
+
+        if (hf) m_heightFogPass->SetParams(*hf);
+        m_heightFogPass->SetEnabled(hf && hf->enabled);
     }
 
     // ---- Video — split between screen-space VideoPass and world-space ----
@@ -459,6 +476,10 @@ void Renderer::SyncSkyboxIBL(World& world)
             ? m_skyIBLPass->ResolveSkyboxSrvHandle(staticFallback)
             : staticFallback;
         m_skyboxPass->SetEnvMap(resolved);
+
+        // Water reflects exactly the sky cube the SkyboxPass draws.
+        if (m_waterPass)
+            m_waterPass->SetSkyCube(resolved);
 
         // Analytic sun disk in PS for pixel-sharp result; uses whichever sun drives the atmosphere.
         if (m_skyIBLPass)

@@ -95,6 +95,15 @@ namespace DX12Physics
         void Init();
         void Shutdown();
 
+        // Destroy ALL Jolt bodies + per-entity physics state ahead of a scene
+        // reload (the engine reuses one PhysicsSystem across scenes). World::Clear
+        // recycles entity IDs without firing destroy listeners, so the per-entity
+        // reaper can't catch bodies on IDs reused-with-RigidBody in the next scene
+        // — they would otherwise leak (ghost colliders + body-pool exhaustion).
+        // Call BEFORE clearing/reloading the World, on the main thread outside a
+        // physics step. Shape caches are content-addressed and survive the clear.
+        void OnWorldClear();
+
         // Legacy single-call entry point: drives an INTERNAL 60Hz accumulator
         // and runs PreAllSteps → N × StepOnce → PostAllSteps inline. Useful
         // for scripts/tests that don't want to wire up the external loop.

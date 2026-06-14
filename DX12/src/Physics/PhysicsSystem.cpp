@@ -269,6 +269,14 @@ public:
         out.swap(m_pending);
     }
 
+    // Discard all queued contacts without dispatching — used on world clear so
+    // stale contacts referencing destroyed bodies don't fire into the new scene.
+    void Clear()
+    {
+        std::lock_guard<std::mutex> lk(m_mtx);
+        m_pending.clear();
+    }
+
 private:
     std::mutex            m_mtx;
     std::vector<Buffered> m_pending;
@@ -333,6 +341,13 @@ struct PhysicsSystem::Impl
     // layer without requiring callers to remember MarkDirty(). Cleared
     // alongside the body in DestroyEntityBody.
     std::unordered_map<Entity, ColliderComponent> colliderSnapshots;
+
+    // entity → live Jolt BodyID for every created RigidBody body (all motion
+    // types). Needed because World::DestroyEntity erases the RigidBodyComponent
+    // (and its bodyId) before PhysicsSystem next ticks, so the Phase 0.6/1 loops
+    // — which only walk the LIVE pool — never see a destroyed entity and cannot
+    // reap its body. The Phase 0.5 reaper iterates THIS map to find orphans.
+    std::unordered_map<Entity, std::uint32_t> bodyIds;
 
     // ---- Kinematic Character Controller (KCC) ----
     // One JPH::CharacterVirtual per entity that owns a
@@ -663,6 +678,54 @@ void PhysicsSystem::InvalidateMeshShapeCache(World& world)
                  nShapes, nBlobs, nBumped);
 }
 
+// OnWorldClear — tear down ALL Jolt bodies + per-entity physics state ahead of
+// a scene reload. The engine reuses ONE PhysicsSystem across scenes; World::Clear
+// recycles entity IDs and does NOT fire destroy listeners, so the Phase 0.5
+// reaper (keyed on IsAlive + HasComponent) cannot reap a body whose recycled ID
+// re-carries a RigidBodyComponent in the new scene — that body would leak (ghost
+// collider at the old pose + a body-pool slot, eventually "body pool full").
+// Called by SceneManager::ActivateScene + the editor load path BEFORE the World
+// is cleared, on the main thread outside any physics step (RemoveBody/DestroyBody
+// is safe there, same as the reaper). Shape caches (meshShapeCache/blobCache) are
+// content-addressed and reused across scenes, so they are NOT cleared here.
+void PhysicsSystem::OnWorldClear()
+{
+    if (!m_impl) return;
+
+    JPH::BodyInterface& bodyIface = m_impl->physics->GetBodyInterface();
+    for (auto& kv : m_impl->bodyIds)
+    {
+        const JPH::BodyID id(kv.second);
+        if (!id.IsInvalid())
+        {
+            bodyIface.RemoveBody(id);
+            bodyIface.DestroyBody(id);
+        }
+    }
+    const size_t nBodies = m_impl->bodyIds.size();
+    m_impl->bodyIds.clear();
+    m_impl->poseSnapshots.clear();
+    m_impl->colliderSnapshots.clear();
+
+    // KCC CharacterVirtuals — dropping the Ref destroys them. Safe while
+    // `physics` is alive (mirrors Shutdown's ordering).
+    const size_t nKcc = m_impl->kccTable.size();
+    m_impl->kccTable.clear();
+    m_impl->kccShapeSnaps.clear();
+
+    // Drop queued contacts that reference now-destroyed bodies so the new
+    // scene's first PostAllSteps doesn't dispatch them against recycled IDs.
+    if (m_impl->contactListener) m_impl->contactListener->Clear();
+    m_impl->contactScratch.clear();
+
+    // Zero the fixed-step accumulator so the new scene's first tick doesn't burn
+    // catch-up substeps after a long blocking load.
+    m_impl->accumulator = 0.0f;
+
+    LOG_INFO("PhysicsSystem: OnWorldClear — destroyed %zu body(ies) + %zu KCC(s)",
+             nBodies, nKcc);
+}
+
 void PhysicsSystem::Shutdown()
 {
     if (!m_impl) return;
@@ -934,19 +997,26 @@ static JPH::ShapeRefC MakeShape(MeshShapeCache& cache,
         case ColliderComponent::Shape::Mesh:
         {
             ShapeRefC mesh = GetOrBuildMeshShape(cache, blobs, c);
-            if (!mesh) { inner = new BoxShape(Vec3::sReplicate(0.5f)); break; }
-            // Wrap in ScaledShape only if the entity is actually scaled —
-            // ScaledShape rejects unit scale via JPH_ASSERT in some builds and
-            // adds an indirection we can skip for the common case.
-            const bool unitScale =
-                std::fabs(scale.x - 1.f) < 1e-4f &&
-                std::fabs(scale.y - 1.f) < 1e-4f &&
-                std::fabs(scale.z - 1.f) < 1e-4f;
-            inner = unitScale ? mesh : ShapeRefC(new ScaledShape(mesh, Vec3(scale.x, scale.y, scale.z)));
+            inner = mesh ? mesh : ShapeRefC(new BoxShape(Vec3::sReplicate(0.5f)));
             break;
         }
     }
     if (!inner) inner = new BoxShape(Vec3::sReplicate(0.5f));
+
+    // Apply the entity's world scale to ALL collider shapes (primitives + mesh),
+    // so the collider tracks the visual transform. Previously only the Mesh
+    // branch was scaled, so Box/Sphere/Capsule ignored scale entirely — a scaled
+    // floor (e.g. 20x1x20) with a default 0.5 box produced a 0.5 m physics box
+    // that dynamic bodies passed straight through. ScaledShape asserts on unit
+    // scale in checked Jolt builds, so wrap only when the entity is actually
+    // scaled. (Non-uniform scale on a Capsule is degenerate in Jolt — use
+    // uniform scale for capsule colliders.)
+    const bool unitScale =
+        std::fabs(scale.x - 1.f) < 1e-4f &&
+        std::fabs(scale.y - 1.f) < 1e-4f &&
+        std::fabs(scale.z - 1.f) < 1e-4f;
+    if (!unitScale)
+        inner = ShapeRefC(new ScaledShape(inner, Vec3(scale.x, scale.y, scale.z)));
 
     // Apply per-shape local-space offset + rotation. Jolt primitives are
     // centered at the shape origin; without this wrap a capsule on a
@@ -1152,6 +1222,32 @@ void PhysicsSystem::PreAllSteps(World& world)
     auto&       rbData     = rbPool->Data();
     const size_t n = rbData.size();
 
+    // Phase 0.5 — reap Jolt bodies whose owning entity was destroyed (or lost
+    // its RigidBodyComponent). World::DestroyEntity removes the component — and
+    // its bodyId — from the pool before we run, so the live-pool loops below
+    // never see these orphans and would leak the body + snapshot rows forever.
+    // We tracked entity→bodyId in m_impl->bodyIds at creation precisely so we
+    // can find + destroy them here. Mirrors the KCC teardown loop; runs on the
+    // main thread outside the physics step, so RemoveBody/DestroyBody is safe.
+    for (auto it = m_impl->bodyIds.begin(); it != m_impl->bodyIds.end(); )
+    {
+        const Entity e = it->first;
+        if (world.IsAlive(e) && world.HasComponent<RigidBodyComponent>(e))
+        {
+            ++it;
+            continue;
+        }
+        const JPH::BodyID deadId(it->second);
+        if (!deadId.IsInvalid())
+        {
+            bodyIface.RemoveBody(deadId);
+            bodyIface.DestroyBody(deadId);
+        }
+        m_impl->poseSnapshots.erase(e);
+        m_impl->colliderSnapshots.erase(e);
+        it = m_impl->bodyIds.erase(it);
+    }
+
     // Phase 0.6 — runtime collider swap. For every entity whose body exists,
     // tear the Jolt body down if its source ColliderComponent has changed in
     // any shape-affecting way. Two trigger paths:
@@ -1175,6 +1271,7 @@ void PhysicsSystem::PreAllSteps(World& world)
             bodyIface.DestroyBody(JPH::BodyID(rb.bodyId));
             rb.bodyId = kInvalidPhysicsBodyId;
             rb.lastBuiltGeneration = 0;
+            m_impl->bodyIds.erase(e);
             m_impl->colliderSnapshots.erase(e);
             m_impl->poseSnapshots.erase(e);
             continue;
@@ -1203,6 +1300,7 @@ void PhysicsSystem::PreAllSteps(World& world)
         bodyIface.RemoveBody(id);
         bodyIface.DestroyBody(id);
         rb.bodyId = kInvalidPhysicsBodyId;
+        m_impl->bodyIds.erase(e);   // Phase 1 re-adds it when the body is rebuilt
         m_impl->colliderSnapshots.erase(e);
         m_impl->poseSnapshots.erase(e);
         LOG_INFO("PhysicsSystem: collider changed on entity %u — rebuilding body", e);
@@ -1301,6 +1399,10 @@ void PhysicsSystem::PreAllSteps(World& world)
         rb.bodyId = id.GetIndexAndSequenceNumber();
         rb.lastBuiltGeneration = col->generation;
         rb.lastBuiltLockedAxes = rb.lockedAxes;
+        // Track entity→bodyId so the Phase 0.5 reaper can destroy this body if
+        // the entity is destroyed (the RigidBodyComponent — and its bodyId —
+        // would be gone from the pool by then).
+        m_impl->bodyIds[e] = rb.bodyId;
         // Snapshot the shape-defining fields so Phase 0.6 next frame can
         // detect direct Inspector edits without requiring MarkDirty().
         m_impl->colliderSnapshots[e] = *col;
@@ -1316,6 +1418,19 @@ void PhysicsSystem::PreAllSteps(World& world)
             snap.currRot = bodyIface.GetRotation(id);
             snap.prevPos = snap.currPos;
             snap.prevRot = snap.currRot;
+
+            // One-shot launch velocity (Physics.SpawnBall). Applied here so it
+            // survives the lazy body-creation gap: the script sets the field,
+            // the body picks it up the first time it's built. Cleared so a
+            // later collider-swap rebuild doesn't re-fire the impulse.
+            if (rb.hasInitialVelocity)
+            {
+                bodyIface.SetLinearAndAngularVelocity(
+                    id,
+                    JPH::Vec3(rb.initialVelocity.x, rb.initialVelocity.y, rb.initialVelocity.z),
+                    JPH::Vec3(rb.initialAngularVelocity.x, rb.initialAngularVelocity.y, rb.initialAngularVelocity.z));
+                rb.hasInitialVelocity = false;
+            }
         }
     }
 

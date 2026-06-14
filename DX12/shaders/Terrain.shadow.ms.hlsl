@@ -28,11 +28,10 @@ cbuffer ShadowPerViewCB : register(b1, space0)
     float4x4 g_shadowVP;
 };
 
-// TerrainCB layout matches Terrain.ms.hlsl exactly so the same CB upload
-// from Renderer feeds both passes. We only USE the geometry-side fields
-// (worldOrigin, worldSize, heightScale, UV remap, tile count); the layer
-// fields are read by the regular PS only — kept as padding here so the
-// offsets line up bit-for-bit.
+// TerrainCB — geometry prefix only. The same Renderer CB feeds the colour and
+// shadow passes; the shadow MS reads ONLY the geometry fields (worldOrigin,
+// worldSize, heightScale, UV remap, tile count), so it declares just the prefix
+// (declaring fewer trailing fields than the bound buffer is legal in HLSL).
 cbuffer TerrainCB : register(b2, space0)
 {
     float2 g_worldOrigin;
@@ -47,25 +46,10 @@ cbuffer TerrainCB : register(b2, space0)
     uint   _hasSplatmap;
     float  g_worldCenterY;
 
-    int4   _layerBindlessIdx;
-    float4 _layerTilingScale;
-    int4   _layerNormalIdx;
-    int4   _layerARMIdx;
-    int4   _layerDispIdx;
-
     uint   g_tilesPerSide;
-    uint   _g_enableFrustumCull;   // AS-only — kept for parity
-    float  _g_pad8a;
-    float  _g_pad8b;
-
-    float4 _g_layerMinHeight;      // PS-only — laid out for parity
-    float4 _g_layerMaxHeight;      // PS-only
-    float4 _g_layerFadeHeight;     // PS-only
-    float4 _g_layerMinSlopeDeg;    // PS-only
-    float4 _g_layerMaxSlopeDeg;    // PS-only
-    float4 _g_layerFadeSlopeDeg;   // PS-only
-
-    float4 _g_frustumPlanes[6];    // AS-only — laid out for parity
+    uint   _g_enableFrustumCull;
+    uint   _g_layerCount;
+    uint   _g_pad0;
 };
 
 Texture2D<float>  g_HeightMap   : register(t2, space0);

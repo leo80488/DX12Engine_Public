@@ -24,6 +24,9 @@ namespace
     constexpr uint32_t kBindlessTexSlot     = 27; // t0 space2
     constexpr uint32_t kSkyCubeSRVSlot      = 19; // t6 space0  — sky cube for capture sky PS
     constexpr uint32_t kSkySHSRVSlot        = 31; // t19 space0
+    constexpr uint32_t kShadowCBSlot        = 1;  // b2 space0  — ProbeShadowCB (slot 1 → b2)
+    constexpr uint32_t kShadowSRVSlot       = 22; // t9 space0  — CSM Texture2DArray (root slot 22)
+    constexpr uint32_t kShadowSamplerSlot   = 2;  // s2         — comparison sampler (slot 2 → s2)
 
     // Karis sample counts per output mip (matches SkyIBLPass).
     constexpr uint32_t kPrefilterSampleTable[7] = { 1, 128, 128, 64, 32, 32, 32 };
@@ -39,6 +42,20 @@ namespace
         float    cameraPos[3];  float pad3;
     };
     static_assert(sizeof(CaptureCB) <= kCBSlotStride, "CaptureCB exceeds 256-byte slot");
+
+    // Frame-global shadow + ambient controls bound at b2. cascadeVP matches
+    // LightCB.shadowMatrix (transposed) so the capture PS reuses the same
+    // row-vector mul + cascade-select math the deferred pass uses.
+    struct alignas(16) ProbeShadowCB
+    {
+        float    cascadeVP[4][16];                   // 256 — transposed cascade view-projs
+        float    cascadeSplits[4];                   // 16
+        float    camPos[3];     float shadowStrength;// 16
+        float    camFwd[3];     float iblStrength;   // 16
+        float    ambientScale;  float pad[3];        // 16
+    }; // 320 bytes
+    constexpr uint32_t kShadowCBSize = 512;          // 256-aligned, holds the 320-byte struct
+    static_assert(sizeof(ProbeShadowCB) <= kShadowCBSize, "ProbeShadowCB too large");
 
     struct alignas(16) PrefilterCB
     {
@@ -243,12 +260,26 @@ bool ReflectionProbeCapturePass::Init(IGraphicsDevice& gfx)
     };
     if (!makeCB(m_captureCB,   m_captureCBMapped,   kCBSlotStride * 6,            "capture"))   return false;
     if (!makeCB(m_prefilterCB, m_prefilterCBMapped, kCBSlotStride * kFaceMips * 6, "prefilter")) return false;
+    if (!makeCB(m_shadowCB,    m_shadowCBMapped,    kShadowCBSize,                "shadow"))     return false;
 
     // Linear-wrap sampler for material base-colour sampling (mirrors GBuffer's s0).
     {
         RHI::SamplerDesc sd;
         if (!gfx.CreateSampler(sd, m_linearSamplerIdx))
             LOG_ERROR("ReflectionProbeCapturePass: linear sampler creation failed");
+    }
+    // Comparison sampler for CSM sun shadows (reversed-Z → GREATER_EQUAL),
+    // mirrors LightingPass::m_shadowSampler so the bake matches deferred shadows.
+    {
+        RHI::SamplerDesc sd;
+        sd.filter          = RHI::Filter::COMPARISON_MIN_MAG_MIP_LINEAR;
+        sd.address_u       = RHI::TextureAddressMode::BORDER;
+        sd.address_v       = RHI::TextureAddressMode::BORDER;
+        sd.address_w       = RHI::TextureAddressMode::BORDER;
+        sd.border_color    = RHI::SamplerBorderColor::OPAQUE_WHITE;
+        sd.comparison_func = RHI::ComparisonFunc::GREATER_EQUAL;
+        if (!gfx.CreateSampler(sd, m_shadowSamplerIdx))
+            LOG_ERROR("ReflectionProbeCapturePass: shadow comparison sampler creation failed");
     }
 
     LOG_INFO("ReflectionProbeCapturePass: ready (%ux%u, %u mips, temp cube + depth allocated)",
@@ -352,6 +383,15 @@ void ReflectionProbeCapturePass::DrawSceneFace(RHI::CommandList cl,
     if (ctx.skySHSrv)
         dx12.BindDescriptorTableGpuHandle(kSkySHSRVSlot, ctx.skySHSrv, cl);
 
+    // Shadow/ambient CB at b2 + CSM shadow array (t9) + comparison sampler (s2).
+    // The capture PS shadows the direct sun and scales/AO-occludes the ambient.
+    // When shadowArraySrv is 0 the PS reads shadowStrength==0 → unshadowed bake.
+    dx12.BindConstantBufferAtOffset(kShadowCBSlot, m_shadowCB, 0, cl);
+    if (ctx.shadowArraySrv)
+        dx12.BindDescriptorTableGpuHandle(kShadowSRVSlot, ctx.shadowArraySrv, cl);
+    if (m_shadowSamplerIdx >= 0)
+        dx12.BindSampler(m_shadowSamplerIdx, kShadowSamplerSlot, cl);
+
     // Iterate opaque draws, then shadow-only draws (entities behind the camera
     // that the main frustum cull rejected but CSM shadow cull kept). Drawing
     // both unions camera-visible + sun-visible geometry so probes capture the
@@ -411,6 +451,23 @@ void ReflectionProbeCapturePass::BakeProbe(RHI::CommandList cl, uint32_t cubeIdx
     }
 
     auto& dx12 = static_cast<GraphicsDX12&>(*m_gfx);
+
+    // Upload the frame-global shadow/ambient CB once (bound per face at b2).
+    // Identical for every probe baked this frame, so the single buffer is safe.
+    if (m_shadowCBMapped)
+    {
+        ProbeShadowCB sb{};
+        for (int c = 0; c < 4; ++c)
+            std::memcpy(sb.cascadeVP[c], &ctx.cascadeVP[c], sizeof(DirectX::XMFLOAT4X4));
+        sb.cascadeSplits[0] = ctx.cascadeSplits.x; sb.cascadeSplits[1] = ctx.cascadeSplits.y;
+        sb.cascadeSplits[2] = ctx.cascadeSplits.z; sb.cascadeSplits[3] = ctx.cascadeSplits.w;
+        sb.camPos[0] = ctx.camPos.x; sb.camPos[1] = ctx.camPos.y; sb.camPos[2] = ctx.camPos.z;
+        sb.camFwd[0] = ctx.camFwd.x; sb.camFwd[1] = ctx.camFwd.y; sb.camFwd[2] = ctx.camFwd.z;
+        sb.shadowStrength = (ctx.shadowArraySrv != 0) ? ctx.shadowStrength : 0.0f;
+        sb.iblStrength    = ctx.iblStrength;
+        sb.ambientScale   = ctx.ambientScale;
+        std::memcpy(m_shadowCBMapped, &sb, sizeof(sb));
+    }
 
     // ---- Phase 1: render 6 faces into temp cube (mip 0) ---------------------
     if (m_tempCubeState != RHI::ResourceState::RENDERTARGET)

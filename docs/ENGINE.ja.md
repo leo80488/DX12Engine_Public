@@ -8,7 +8,7 @@
 
 - **`EntityHandle`** — 世代スタンプ付きの参照 (`IsHandleValid`) であり、長寿命の参照（フォローターゲット、イベントペイロード、アタッチメント）における再利用スロットのエイリアシングを防ぐ。
 - **エンティティ破棄リスナー** はコンポーネント消去の*前*に発火するため、キャッシュ（レンダラのテクスチャ、`GuidRegistry`）を確定させられる。リスナーは `World::Clear()` を超えて存続する。
-- コンポーネントには、シーングラフ (`Parent`, `Children`, `LocalTransform`, `GlobalTransform`, `Visibility`, `RenderLayer`, `WorldAabb`)、アニメーション／モーフ／ソケット／フォロー、物理＋キャラクターコントローラ、AI／ナビ／インテント、オーディオ、ビデオ、UI、デカール、地形、ビーム／パーティクル／トレイル、リフレクションプローブ／DDGI／クラウド／TOD が含まれる。
+- コンポーネントには、シーングラフ (`Parent`, `Children`, `LocalTransform`, `GlobalTransform`, `Visibility`, `RenderLayer`, `WorldAabb`)、アニメーション／モーフ／ソケット／フォロー、物理＋キャラクターコントローラ、AI／ナビ／インテント、オーディオ、ビデオ、UI、デカール、地形／草原／水面、ビーム／パーティクル／トレイル／ビルボード FX、リフレクションプローブ／DDGI／クラウド／ハイトフォグ／TOD、ポストプロセスボリューム が含まれる。
 
 ## システムスケジューラ
 
@@ -33,7 +33,9 @@
 
 ## シーングラフ＆ゲームフロー
 
-- **`GameModeStack`** (`IGameMode`) が現役のシーンフローモデルである：Title → Game → End（加えて Test、ShaderLab）。それぞれワールドを `Clear()` し、`.iscn` を `LoadScene` する（あるいはフォールバックのカメラ／ライト／スカイボックスをスポーンする）。遷移は `requestReplaceMode` 経由。`GameScene` は `game.json` から `startup_scene` を解決する。（旧来の `SceneManager` / `IScene` スタックは並行して存在するレガシー抽象であり、現役パスにはない。）
+- **`GameModeStack`** (`IGameMode`) が現役のシーンフローモデルであり、旧来のハードコードされた Title / Game / End クラスを置き換える単一の**データ駆動 `DataScene`** モードの上に構築されている。シーンは `game.json` レジストリ（`name → .iscn` パス＋オプションの Lua シーンスクリプト。`.iscn` 自身も `sceneScript` を持てる）で宣言され、`startup_scene` がそれをラップする `DataScene` を起動する。遷移は `requestReplaceMode` 経由。Editor / ShaderLab は専用の `TestScene` / `ShaderLabScene` ツールモードを保持する。
+- **`SceneManager`** はブロッキングなワールド再ロードパイプラインを統括する（`DataScene::Init` と Lua の `Scene.Load` パスが使用）：`WaitIdle` ＋ GPU 遅延解放 → `Renderer::OnWorldClear`（キャッシュを退避）→ `PhysicsSystem::OnWorldClear`（再利用されるエンティティ ID の孤児化を防ぐため `World::Clear` の前に Jolt ボディを破棄）→ `LoadScene`（`.iscn` ＋付随するナビメッシュ）→ シーンスクリプトのスワップをキューイング。解決できない名前／パスは `SpawnDefaultWorld`（カメラ＋ディレクショナルライト＋IBL スカイボックス）へフォールバックする。
+- **シーンスクリプト** — 各シーンは、遅延実行される `OnSceneEnter` / `OnSceneUpdate` / `OnSceneExit` コールバックを持つ Lua スクリプトを指定できる。World が有効な間に次のティックで `ScriptSystem` が処理する（そのためエディタの再生／一時停止ゲーティングを尊重する）。Lua からは `Scene.Load / LoadInstant / Reload / Current / List` で駆動する。
 - **`SceneInstanceLoader`** — ランタイムで Assimp 非依存の `.iscn` インスタンサ（`SceneLoader` のランタイムパスは廃止）。
 - **`TransformSystem::Propagate`** — BFS による階層更新であり、`Visibility::inherited_hidden` を伝播し、`WorldAabb` を再計算する。定常状態ではアロケーションフリー。
 
@@ -87,7 +89,7 @@
 - `FileWatcher` 経由のホットリロード。World のエンティティ破棄リスナー経由の同期 `OnDestroy`。
 - ヒットストップ／バレットタイム向けのタイムスケール (`SetTimeScale`)。`Engine.AfterDelay` タイマーは実時間（スケールなし）の dt でティックする。
 - **エディタ公開のスクリプト変数**（スキーマ＋エンティティごとのオーバーライドを `OnSpawn` の前に注入）。
-- バインディングモジュール：数学型、`Input`、`Time`、`Camera`、`Animation`、`Physics.Raycast`、`Nav.*`、`Character.*` / `Player.*`、`Intent.*` / `AI.*`、BT アクション、`ui` ウィジェット、ECS コマンド。
+- バインディングモジュール：数学型、`Input`、`Time`、`Camera`、`Animation`、`Physics.Raycast`、`Nav.*`、`Character.*` / `Player.*`、`Intent.*` / `AI.*`、BT アクション、`ui` ウィジェット、ECS コマンド、`Scene.*`（データ駆動のシーンフロー）、`PostProcess.*`（ボリュームのスポーン／プロパティごとのオーバーライド／一時的エンベロープ）。
 
 ## オーディオ
 

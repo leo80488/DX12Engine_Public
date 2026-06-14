@@ -15,6 +15,7 @@
 #include "UI/BasicWidgets.h"
 #include "ECS/TerrainComponent.h"     // TerrainComponent + TerrainLayer
 #include "ECS/BillboardComponent.h"   // BillboardComponent
+#include "ECS/BillboardFXComponent.h" // BillboardFXComponent (animated sprite billboard)
 #include "ECS/ParticleComponent.h"    // ParticleEmitterComponent
 #include "ECS/VideoComponent.h"       // VideoComponent (inspector postDraw)
 #include "ECS/VideoHelpers.h"         // Video::Play/Pause/Stop/Restart/Seek
@@ -54,15 +55,17 @@
 #include "RenderGraph/RenderPass/SSRPass.h"
 #include "RenderGraph/RenderPass/CASPass.h"
 #include "PostProcess/PostProcessStack.h"
-#include "PostProcess/ParameterStore.h"
-#include "PostProcess/VolumeSystem.h"
-#include "PostProcess/ScriptedOverride.h"
-#include "ECS/VolumeComponent.h"
+#include "PostProcess/ProfileSystem.h"
+#include "PostProcess/PostProcessProfile.h"
+#include "PostProcess/PostProcessProfileSerializer.h"
+#include "PostProcess/PostProcessRuntime.h"
+#include "ECS/PostProcessVolumeComponent.h"
 #include "ECS/IKSystem.h"
 #include "RenderGraph/RenderPass/DebugWirePass.h"
 #include "RenderGraph/RenderPass/DDGIProbeDebugPass.h"
 #include "RenderGraph/RenderPass/DecalPass.h"
 #include "RenderGraph/RenderPass/SpotShadowPass.h"
+#include "RenderGraph/RenderPass/PointShadowPass.h"
 #include "System/Log.h"
 #include "Resource/TextureSystem.h"
 #include "Resource/ResourceManager.h"
@@ -796,8 +799,47 @@ namespace
 // ImGui lifecycle (editor-owned). Engine is ImGui-free; backends initialised in InitImGuiBackends.
 EditorLayer::EditorLayer() = default;
 
+// Bind the editor to a World + install an entity-destroy listener that clears a
+// stale selection/highlight (otherwise a recycled entity ID gets silently
+// re-selected, and the Inspector shows the wrong / a dead entity). App calls
+// this EVERY frame, so we early-out unless the World pointer actually changed —
+// without that guard we'd thrash a listener on/off the World 60+ times a second.
+void EditorLayer::SetWorld(World* world)
+{
+    if (world == m_world) return;
+
+    if (m_world && m_entityDestroyListener != 0)
+        m_world->RemoveEntityDestroyListener(m_entityDestroyListener);
+    m_entityDestroyListener = 0;
+
+    m_world = world;
+    // Selection does not carry across a world swap.
+    m_selectedEntity         = NullEntity;
+    m_hierarchyHighlight     = NullEntity;
+    m_lastSeenSelectedEntity = NullEntity;
+
+    if (m_world)
+    {
+        m_entityDestroyListener = m_world->AddEntityDestroyListener(
+            [this](Entity e)
+            {
+                if (m_selectedEntity         == e) m_selectedEntity         = NullEntity;
+                if (m_hierarchyHighlight     == e) m_hierarchyHighlight     = NullEntity;
+                if (m_lastSeenSelectedEntity == e) m_lastSeenSelectedEntity = NullEntity;
+            });
+    }
+}
+
 EditorLayer::~EditorLayer()
 {
+    // Drop the entity-destroy listener so a World that outlives the editor never
+    // fires into a destroyed `this`.
+    if (m_world && m_entityDestroyListener != 0)
+    {
+        m_world->RemoveEntityDestroyListener(m_entityDestroyListener);
+        m_entityDestroyListener = 0;
+    }
+
     // Detach from Window first so in-flight messages don't re-enter half-destroyed ImGui state.
     Window::SetMessageHook       (nullptr);
     Window::SetWantCaptureMouse  (nullptr);
@@ -868,17 +910,32 @@ void EditorLayer::ProcessPendingActions()
     if (m_renderer)
         m_renderer->OnWorldClear();
 
+    // Destroy the outgoing scene's Jolt bodies before LoadScene clears the World
+    // (recycled entity IDs would otherwise orphan bodies — ghost colliders +
+    // body-pool leak). Mirrors SceneManager::ActivateScene's reload order.
+    if (m_physicsSys)
+        m_physicsSys->OnWorldClear();
+
     std::string sceneName;
     std::string ppcPath;
     std::string navPath;
+    std::string sceneScript;
     Resource::LoadScene(loadPath, *m_world, *m_assetMgr,
-                       m_renderer, m_animClipSys, &sceneName, &ppcPath, &navPath);
+                       m_renderer, m_animClipSys, &sceneName, &ppcPath, &navPath,
+                       &sceneScript);
     m_postProcessConfigPath = ppcPath;
 
     // .iscene stored a .inav alongside — load it so runtime FindPath /
     // NavAgent path-following are live without a separate "Load NavMesh" click.
     if (!navPath.empty() && m_navSys)
         m_navSys->Load(navPath);
+
+    // Activate the scene's Lua scene script (if it declares one). The swap is
+    // deferred inside ScriptSystem until the editor is Playing (ScriptLogicSystem
+    // skips while Stopped), so OnSceneEnter fires on the first played frame —
+    // Unity-style. Empty path cleanly deactivates any prior scene's script.
+    if (m_scriptSys)
+        m_scriptSys->SetActiveSceneScript(sceneScript, sceneName);
 }
 
 void EditorLayer::EndImGuiFrame(RHI::CommandList cmd)
@@ -1532,6 +1589,32 @@ void EditorLayer::RenderMenuBar()
             }
         }
 
+        if (ImGui::MenuItem("Billboard FX (Sprite)"))
+        {
+            if (m_world)
+            {
+                Entity e = m_world->CreateEntity();
+                m_world->SetName(e, "Billboard FX");
+
+                LocalTransform lt{};
+                lt.translation = { 0.f, 2.f, 0.f };
+                m_world->AddComponent<LocalTransform>(e, lt);
+                m_world->AddComponent<GlobalTransform>(e, GlobalTransform{});
+
+                // Sensible flipbook defaults — assign a sprite sheet + grid in
+                // the Inspector. Additive + emissive so it glows through Bloom.
+                BillboardFXComponent b{};
+                b.columns  = 4;
+                b.rows     = 4;
+                b.fps      = 24.0f;
+                b.size     = 1.0f;
+                b.emissive = 1.0f;
+                m_world->AddComponent<BillboardFXComponent>(e, b);
+
+                m_selectedEntity = e;
+            }
+        }
+
         if (ImGui::MenuItem("Trail"))
         {
             if (m_world)
@@ -2042,6 +2125,7 @@ void EditorLayer::RenderMenuBar()
                                             0.0f, 200.0f, "%.0f m");
                     }
                     catItem("  Show NavMesh",           DebugCategory::NavMesh);
+                    catItem("  Show PP Volumes",        DebugCategory::PostProcessVolumes);
                 }
             }
             if (auto* pdbg = m_renderer->GetDDGIProbeDebugPass())
@@ -4152,6 +4236,20 @@ void EditorLayer::RenderMaterialInspector(MaterialComponent& mat)
             { mat.SetEditDirty(); mat.SetOutlineScreenSpaceEnabled(ssOutline); }
         }
 
+        // Per-vertex color: multiply baseColor by the mesh's vertex-color stream
+        // (imported meshes that carry vertex colors). Opt-in so primitives /
+        // meshes whose color is incidental aren't tinted.
+        bool useVtxColor = mat.IsUsingVertexColors();
+        if (ImGui::Checkbox("Vertex Color", &useVtxColor))
+        {
+            mat.SetEditDirty();
+            if (useVtxColor) mat._flags |= MaterialComponent::USE_VERTEXCOLORS;
+            else             mat._flags &= ~MaterialComponent::USE_VERTEXCOLORS;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Multiply base color by the mesh's per-vertex color stream\n"
+                              "(FBX/glTF/PMX meshes that carry vertex colors).");
+
         // Skip XeGTAO for characters/skin (avoids temporal ghosts on moving meshes); flag short-circuits to 1.0.
         bool excludeSSAO = (mat._flags & MaterialComponent::EXCLUDE_FROM_SSAO) != 0;
         if (ImGui::Checkbox("Exclude from SSAO", &excludeSSAO))
@@ -5648,6 +5746,105 @@ void EditorLayer::RenderDecalMaterialsWindow()
 }
 
 // ---- Post Processing / Color Grading panel ----
+// ===========================================================================
+// Post-process profile inspector — per-property override widgets driven by the
+// SAME X-macro that powers resolve + serialization (PostProcessProperties.inl),
+// so a new property appears here automatically. Each row is an override
+// checkbox + the value widget (greyed when not overriding) — the Unreal/Unity
+// "bOverride_X" UX. Shared by the global-look panel and the volume inspector.
+// ===========================================================================
+namespace
+{
+    bool DrawOvBool(const char* label, PostProcess::Overridable<bool>& o)
+    {
+        ImGui::PushID(label);
+        bool changed = ImGui::Checkbox("##ov", &o.overrideState);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.overrideState);
+        changed |= ImGui::Checkbox(label, &o.value);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        return changed;
+    }
+    bool DrawOvFloat(const char* label, PostProcess::Overridable<float>& o, float mn, float mx)
+    {
+        ImGui::PushID(label);
+        bool changed = ImGui::Checkbox("##ov", &o.overrideState);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.overrideState);
+        changed |= ImGui::SliderFloat(label, &o.value, mn, mx, "%.3f");
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        return changed;
+    }
+    bool DrawOvFloat3(const char* label, PostProcess::Overridable<DirectX::XMFLOAT3>& o)
+    {
+        ImGui::PushID(label);
+        bool changed = ImGui::Checkbox("##ov", &o.overrideState);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.overrideState);
+        changed |= ImGui::DragFloat3(label, &o.value.x, 0.01f);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        return changed;
+    }
+    bool DrawOvColor(const char* label, PostProcess::Overridable<DirectX::XMFLOAT3>& o)
+    {
+        ImGui::PushID(label);
+        bool changed = ImGui::Checkbox("##ov", &o.overrideState);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.overrideState);
+        changed |= ImGui::ColorEdit3(label, &o.value.x);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        return changed;
+    }
+    bool DrawOvUint(const char* label, PostProcess::Overridable<uint32_t>& o, uint32_t mn, uint32_t mx)
+    {
+        ImGui::PushID(label);
+        bool changed = ImGui::Checkbox("##ov", &o.overrideState);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!o.overrideState);
+        int v = static_cast<int>(o.value);
+        if (ImGui::SliderInt(label, &v, static_cast<int>(mn), static_cast<int>(mx)))
+        { o.value = static_cast<uint32_t>(v < 0 ? 0 : v); changed = true; }
+        ImGui::EndDisabled();
+        ImGui::PopID();
+        return changed;
+    }
+
+    // Draw every property of a profile, grouped. Returns true if anything changed.
+    bool DrawProfileInspector(PostProcess::PostProcessProfile& p)
+    {
+        bool changed = false;
+        // Scope every property by its unique "group_member" name so duplicate
+        // visible labels (e.g. "Levels" in both Posterize and Dither) don't
+        // collide on the ImGui ID (which is derived from the widget label).
+        //
+        // Unreal/Unity-style fold: a group's body is drawn (indented) only while
+        // its 'enabled' toggle is checked, and collapses to just the header +
+        // toggle when off. The 'enabled' bool is always the FIRST property of
+        // its group in PostProcessProperties.inl, so PP_BOOL latches `ppOpen`
+        // for every PP_* that follows until the next PP_GROUP. Groups with no
+        // 'enabled' member (e.g. Bloom) have nothing to gate on and stay open.
+        bool ppOpen   = true;   // is the current group's body being drawn?
+        bool ppIndent = false;  // have we Indent()-ed the current group's body?
+#define PP_ENDSEC()  do { if (ppIndent) { ImGui::Unindent(); ppIndent = false; } } while (0)
+#define PP_BODY(...) do { if (ppOpen) { if (!ppIndent) { ImGui::Indent(); ppIndent = true; } __VA_ARGS__; } } while (0)
+#define PP_GROUP(g, l)                 PP_ENDSEC(); ImGui::SeparatorText(l); ppOpen = true;
+#define PP_BOOL(g, m, l, d)            ImGui::PushID(#g "_" #m); changed |= DrawOvBool(l, p.g.m); ImGui::PopID(); ppOpen = p.g.m.value;
+#define PP_FLOAT(g, m, l, d, a, b)     PP_BODY(ImGui::PushID(#g "_" #m); changed |= DrawOvFloat(l, p.g.m, (a), (b)); ImGui::PopID());
+#define PP_FLOAT3(g, m, l, dx, dy, dz) PP_BODY(ImGui::PushID(#g "_" #m); changed |= DrawOvFloat3(l, p.g.m); ImGui::PopID());
+#define PP_COLOR(g, m, l, dr, dg, db)  PP_BODY(ImGui::PushID(#g "_" #m); changed |= DrawOvColor(l, p.g.m); ImGui::PopID());
+#define PP_UINT(g, m, l, d, a, b)      PP_BODY(ImGui::PushID(#g "_" #m); changed |= DrawOvUint(l, p.g.m, (uint32_t)(a), (uint32_t)(b)); ImGui::PopID());
+#include "PostProcess/PostProcessProperties.inl"
+        PP_ENDSEC();   // balance the final group's indent
+#undef PP_ENDSEC
+#undef PP_BODY
+        return changed;
+    }
+}
+
 void EditorLayer::RenderPostProcessPanel()
 {
     ImGui::Begin("Post Processing");
@@ -5668,13 +5865,18 @@ void EditorLayer::RenderPostProcessPanel()
         ImGui::End();
         return;
     }
-    PostProcess::ParameterStore& ppParams = ppStack->GetParameters();
+    (void)ppStack; // stack is a pure consumer now; the look lives in the profile system
 
-    // ---- Config Save/Load — persists panel state as .ippc; bound path stamped into next SaveScene. ----
-    if (ImGui::CollapsingHeader("Config", 0))
+    auto& profiles    = PostProcess::ProfileSystem::Get();
+    auto& engineLook  = profiles.EngineDefault();
+
+    // ---- Config Save/Load — render features (.ippc) + base look (.ppprofile). ----
+    if (ImGui::CollapsingHeader("Config", ImGuiTreeNodeFlags_DefaultOpen))
     {
         static constexpr const char* kPPCFilter =
             "Post-Process Config (*.ippc)\0*.ippc\0All Files\0*.*\0\0";
+        static constexpr const char* kProfFilter =
+            "Post-Process Profile (*.ppprofile)\0*.ppprofile\0All Files\0*.*\0\0";
 
         if (ImGui::Button("Save Config..."))
         {
@@ -5684,6 +5886,7 @@ void EditorLayer::RenderPostProcessPanel()
             {
                 Resource::PostProcessConfig cfg;
                 cfg.CaptureFrom(*m_renderer);
+                cfg.engineProfilePath = m_engineProfilePath;  // bind the look asset
                 if (Resource::SavePostProcessConfig(cfg, path))
                     m_postProcessConfigPath = path;
             }
@@ -5698,8 +5901,9 @@ void EditorLayer::RenderPostProcessPanel()
                 Resource::PostProcessConfig cfg;
                 if (Resource::LoadPostProcessConfig(path, cfg))
                 {
-                    cfg.ApplyTo(*m_renderer);
+                    cfg.ApplyTo(*m_renderer);   // also loads the .ppprofile look
                     m_postProcessConfigPath = path;
+                    m_engineProfilePath     = cfg.engineProfilePath;
                 }
             }
         }
@@ -5710,15 +5914,52 @@ void EditorLayer::RenderPostProcessPanel()
         if (m_postProcessConfigPath.empty())
             ImGui::TextDisabled("(no config bound — scene will save without one)");
         else
-            ImGui::TextWrapped("Bound: %s", m_postProcessConfigPath.c_str());
+            ImGui::TextWrapped("Config: %s", m_postProcessConfigPath.c_str());
+
+        ImGui::Separator();
+
+        // Engine-default profile (.ppprofile) — the base look the volume blend
+        // starts from.
+        if (ImGui::Button("Save Look..."))
+        {
+            std::string path = SaveFileDialog(kProfFilter, "ppprofile",
+                m_assetDir.empty() ? nullptr : m_assetDir.c_str());
+            if (!path.empty() && PostProcess::SaveProfile(engineLook, path))
+                m_engineProfilePath = path;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Load Look..."))
+        {
+            std::string path = OpenFileDialog(kProfFilter,
+                m_assetDir.empty() ? nullptr : m_assetDir.c_str());
+            if (!path.empty())
+            {
+                engineLook = PostProcess::MakeEngineDefaultProfile();
+                if (PostProcess::LoadProfile(path, engineLook))
+                    m_engineProfilePath = path;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset Look"))
+            engineLook = PostProcess::MakeEngineDefaultProfile();
+
+        if (m_engineProfilePath.empty())
+            ImGui::TextDisabled("(look not saved as a .ppprofile yet)");
+        else
+            ImGui::TextWrapped("Look: %s", m_engineProfilePath.c_str());
     }
 
     ImGui::Separator();
 
-    // ---- Bloom Strength ----------------------------------------------------------------
-
-    ImGui::SliderFloat("Bloom Strength",
-        &ppParams.GetTonemapping().bloomStrength, 0.f, 1.f, "%.3f");
+    // ---- Global Look — the engine-default profile (blend base). All the
+    // post-process look knobs (CAS / exposure / bloom / color grade / lens
+    // flare) live here now, edited per-property via the override widgets. ----
+    if (ImGui::CollapsingHeader("Global Look (Engine Default Profile)",
+                                ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::TextDisabled("Volumes layer over this; gameplay overrides on top.");
+        DrawProfileInspector(engineLook);
+    }
     ImGui::Separator();
 
     // ---- AA mode selector --------------------------------------------------
@@ -5852,66 +6093,6 @@ void EditorLayer::RenderPostProcessPanel()
         }
     }
 
-    // ---- CAS Sharpening -----------------------------------------------------
-    if (ImGui::CollapsingHeader("Sharpening (AMD CAS)", 0))
-    {
-        PostProcess::CASParams& cas = ppParams.GetCAS();
-        ImGui::Checkbox("Enabled##CAS", &cas.enabled);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(FidelityFX Contrast Adaptive Sharpening)");
-
-        // 0=off, 1=max; ~0.4 cleans TAA softness, >0.6 reveals noise.
-        ImGui::SliderFloat("Sharpness", &cas.sharpness, 0.0f, 1.0f, "%.2f");
-        ImGui::TextDisabled("0 = off | 0.3-0.5 subtle | 0.8+ aggressive");
-    }
-
-
-
-
-    ImGui::Separator();
-
-    // ---- Auto Exposure ------------------------------------------------------
-    if (ImGui::CollapsingHeader("Auto Exposure", 0))
-    {
-        PostProcess::AutoExposureParams& ae = ppParams.GetAutoExposure();
-
-        ImGui::Checkbox("Enabled", &ae.enabled);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(off = use manual exposure)");
-
-        if (!ae.enabled)
-        {
-            ImGui::SliderFloat("Manual Exposure", &ae.manualExposure,
-                0.05f, 16.f, "%.3f", ImGuiSliderFlags_Logarithmic);
-            ImGui::Separator();
-        }
-
-        ImGui::BeginDisabled(!ae.enabled);
-
-        // EV bias: the main "subject too dark because of bright sky" knob.
-        ImGui::SliderFloat("EV Compensation", &ae.evBias, -3.f, 3.f, "%.2f EV");
-        ImGui::SameLine();
-        ImGui::TextDisabled("(+ = brighter)");
-
-        ImGui::SliderFloat("Key (middle-grey)", &ae.keyValue, 0.05f, 0.5f, "%.3f");
-        ImGui::SliderFloat("Min Exposure",      &ae.minExposure, 0.01f, 5.f, "%.2f");
-        ImGui::SliderFloat("Max Exposure",      &ae.maxExposure, 0.1f, 32.f, "%.2f");
-
-        // Histogram clipping — tighten to ignore sky/highlight pixels.
-        bool pctChanged = false;
-        pctChanged |= ImGui::SliderFloat("Low Percentile",  &ae.lowPercent,  0.f, 0.9f, "%.2f");
-        pctChanged |= ImGui::SliderFloat("High Percentile", &ae.highPercent, 0.1f, 1.f, "%.2f");
-        if (pctChanged && ae.lowPercent > ae.highPercent - 0.01f)
-            ae.lowPercent = ae.highPercent - 0.01f;
-
-        ImGui::TextDisabled("Tip: raise EV Compensation or lower High Percentile");
-        ImGui::TextDisabled("when a bright IBL sky crushes character exposure.");
-
-        ImGui::EndDisabled();
-    }
-
-    ImGui::Separator();
-
     // ---- Sky / Atmosphere knobs now live on AtmosphereComponent. ------------
     // Select the Sky entity in Hierarchy to edit procedural-atmosphere fields.
 
@@ -5986,316 +6167,91 @@ void EditorLayer::RenderPostProcessPanel()
 
     ImGui::Separator();
 
-    // Color Grading
-    PostProcess::TonemappingParams& tm = ppParams.GetTonemapping();
-    ImGui::Checkbox("Color Grading", &tm.colorGradingEnabled);
-
-    if (tm.colorGradingEnabled)
-    {
-        ColorGradingParams& p = tm.grading;
-
-        if (ImGui::CollapsingHeader("Tone", 0))
-        {
-            ImGui::SliderFloat("Exposure",   &p.exposure,   -5.f, 5.f,  "%.2f EV");
-            ImGui::SliderFloat("Contrast",   &p.contrast,    0.2f, 3.f,  "%.2f");
-            ImGui::SliderFloat("Brightness", &p.brightness, -0.5f, 0.5f, "%.3f");
-        }
-
-        if (ImGui::CollapsingHeader("White Balance"))
-        {
-            ImGui::SliderFloat("Temperature", &p.temperature, -1.f, 1.f, "%.2f");
-            ImGui::SliderFloat("Tint",        &p.tint,        -1.f, 1.f, "%.2f");
-        }
-
-        if (ImGui::CollapsingHeader("Color"))
-        {
-            ImGui::SliderFloat("Saturation", &p.saturation, 0.f, 2.f, "%.2f");
-            ImGui::SliderFloat("Vibrance",   &p.vibrance,   0.f, 2.f, "%.2f");
-            ImGui::SliderFloat("Hue Shift",  &p.hueShift, -180.f, 180.f, "%.1f deg");
-        }
-
-        if (ImGui::CollapsingHeader("Lift / Gamma / Gain"))
-        {
-            ImGui::ColorEdit3("Lift",  &p.lift.x);
-            ImGui::ColorEdit3("Gamma", &p.gamma.x);
-            ImGui::ColorEdit3("Gain",  &p.gain.x);
-        }
-
-        if (ImGui::Button("Reset to Defaults"))
-            p = ColorGradingParams{};
-    }
-
-    // ---- Volumes — spatial overrides; each layers per-stage override onto base by camera-distance weight. ----
+    // ---- Volumes — now ordinary entities. Add a "Post-Process Volume"
+    // component to any entity (it gets its bounds from the Transform) and edit
+    // its profile in the entity inspector. ----
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Volumes", 0))
+    ImGui::TextDisabled("Volumes are entities: add a Post-Process Volume component");
+    ImGui::TextDisabled("to an entity and edit it in the Inspector.");
+
+    // ---- Volume Debug Overlay — which volumes the main camera is inside and
+    // each one's effective weight (filled by PostProcessResolveSystem). ----
+    ImGui::Separator();
     {
-        PostProcess::VolumeSystem* vs = m_renderer->GetPostProcessVolumes();
-        if (!vs)
+        auto& rt = PostProcess::Runtime::Get();
+        if (ImGui::CollapsingHeader("Volume Debug Overlay", 0))
         {
-            ImGui::TextDisabled("(volume system not available)");
+            rt.debugCapture = true;   // ask the resolve system to snapshot hits
+            if (rt.debugHits.empty())
+                ImGui::TextDisabled("(camera not inside any contributing volume)");
+            for (const auto& h : rt.debugHits)
+                ImGui::Text("%-24s w=%.3f  prio=%.1f%s",
+                    h.label, h.weight, h.priority, h.isGlobal ? "  [global]" : "");
         }
         else
         {
-            if (ImGui::Button("+ Global"))
-            {
-                PostProcess::Volume v;
-                v.shape = PostProcess::VolumeShape::Global;
-                vs->Register(v);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("+ Box"))
-            {
-                PostProcess::Volume v;
-                v.shape = PostProcess::VolumeShape::Box;
-                vs->Register(v);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("+ Sphere"))
-            {
-                PostProcess::Volume v;
-                v.shape = PostProcess::VolumeShape::Sphere;
-                vs->Register(v);
-            }
-            ImGui::SameLine();
-            ImGui::TextDisabled("%zu volume(s)", vs->Size());
-
-            // Snapshot handles — delete range is invalidation-safe; pending deletes flushed at end.
-            std::vector<PostProcess::VolumeHandle> handles;
-            vs->ForEach([&](PostProcess::VolumeHandle h, const PostProcess::Volume&)
-            {
-                handles.push_back(h);
-            });
-
-            PostProcess::VolumeHandle pendingDelete = PostProcess::kInvalidVolumeHandle;
-
-            for (PostProcess::VolumeHandle h : handles)
-            {
-                PostProcess::Volume* v = vs->Get(h);
-                if (!v) continue;
-
-                ImGui::PushID(static_cast<int>(h));
-
-                const char* shapeName =
-                      (v->shape == PostProcess::VolumeShape::Global) ? "Global"
-                    : (v->shape == PostProcess::VolumeShape::Box)    ? "Box"
-                    :                                                  "Sphere";
-                char header[96];
-                snprintf(header, sizeof(header), "[%u] %s%s%s",
-                    h, shapeName,
-                    v->label[0] ? " - " : "",
-                    v->label);
-
-                if (ImGui::TreeNode(header))
-                {
-                    ImGui::Checkbox("Enabled", &v->enabled);
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Delete"))
-                        pendingDelete = h;
-
-                    ImGui::InputText("Label", v->label, sizeof(v->label));
-
-                    int shape = static_cast<int>(v->shape);
-                    static const char* kShapes[] = { "Global", "Box", "Sphere" };
-                    if (ImGui::Combo("Shape", &shape, kShapes, 3))
-                        v->shape = static_cast<PostProcess::VolumeShape>(shape);
-
-                    if (v->shape != PostProcess::VolumeShape::Global)
-                    {
-                        ImGui::DragFloat3("Center", &v->center.x, 0.1f);
-                        if (v->shape == PostProcess::VolumeShape::Sphere)
-                            ImGui::DragFloat("Radius", &v->extents.x, 0.1f, 0.0f, 1000.0f);
-                        else
-                            ImGui::DragFloat3("Half-Extents", &v->extents.x,
-                                0.1f, 0.0f, 1000.0f);
-                        ImGui::DragFloat("Blend Distance", &v->blendDistance,
-                            0.05f, 0.0f, 100.0f);
-                    }
-                    ImGui::InputInt("Priority", &v->priority);
-
-                    ImGui::Separator();
-                    ImGui::TextDisabled("Overrides");
-
-                    // Enabling an override seeds the optional with current base params (sane starting point).
-
-                    // --- CAS ---
-                    {
-                        bool has = v->override.cas.has_value();
-                        if (ImGui::Checkbox("Override CAS", &has))
-                        {
-                            if (has) v->override.cas = ppParams.GetCAS();
-                            else     v->override.cas.reset();
-                        }
-                        if (v->override.cas)
-                        {
-                            auto& cas = *v->override.cas;
-                            ImGui::Indent();
-                            ImGui::Checkbox("Enabled##vol_cas", &cas.enabled);
-                            ImGui::SliderFloat("Sharpness##vol_cas",
-                                &cas.sharpness, 0.0f, 1.0f, "%.2f");
-                            ImGui::Unindent();
-                        }
-                    }
-
-                    // --- AutoExposure ---
-                    {
-                        bool has = v->override.autoExposure.has_value();
-                        if (ImGui::Checkbox("Override AutoExposure", &has))
-                        {
-                            if (has) v->override.autoExposure = ppParams.GetAutoExposure();
-                            else     v->override.autoExposure.reset();
-                        }
-                        if (v->override.autoExposure)
-                        {
-                            auto& ae = *v->override.autoExposure;
-                            ImGui::Indent();
-                            ImGui::Checkbox("Enabled##vol_ae", &ae.enabled);
-                            ImGui::SliderFloat("Manual Exposure##vol_ae",
-                                &ae.manualExposure, 0.05f, 16.0f, "%.3f",
-                                ImGuiSliderFlags_Logarithmic);
-                            ImGui::SliderFloat("EV Bias##vol_ae",
-                                &ae.evBias, -3.0f, 3.0f, "%.2f EV");
-                            ImGui::SliderFloat("Key##vol_ae",
-                                &ae.keyValue, 0.05f, 0.5f, "%.3f");
-                            ImGui::Unindent();
-                        }
-                    }
-
-                    // --- Bloom (reserved; no fields) ---
-                    {
-                        bool has = v->override.bloom.has_value();
-                        if (ImGui::Checkbox("Override Bloom", &has))
-                        {
-                            if (has) v->override.bloom = ppParams.GetBloom();
-                            else     v->override.bloom.reset();
-                        }
-                        if (v->override.bloom)
-                        {
-                            ImGui::Indent();
-                            ImGui::TextDisabled("(no user-facing params yet)");
-                            ImGui::Unindent();
-                        }
-                    }
-
-                    // --- Tonemapping (bloom strength + color grading) ---
-                    {
-                        bool has = v->override.tonemapping.has_value();
-                        if (ImGui::Checkbox("Override Tonemapping", &has))
-                        {
-                            if (has) v->override.tonemapping = ppParams.GetTonemapping();
-                            else     v->override.tonemapping.reset();
-                        }
-                        if (v->override.tonemapping)
-                        {
-                            auto& tm = *v->override.tonemapping;
-                            ImGui::Indent();
-                            ImGui::SliderFloat("Bloom Strength##vol_tm",
-                                &tm.bloomStrength, 0.0f, 1.0f, "%.3f");
-                            ImGui::Checkbox("Color Grading##vol_tm",
-                                &tm.colorGradingEnabled);
-                            if (tm.colorGradingEnabled)
-                            {
-                                auto& g = tm.grading;
-                                ImGui::SliderFloat("Exposure##vol_tmg",
-                                    &g.exposure, -5.0f, 5.0f, "%.2f EV");
-                                ImGui::SliderFloat("Contrast##vol_tmg",
-                                    &g.contrast, 0.2f, 3.0f, "%.2f");
-                                ImGui::SliderFloat("Saturation##vol_tmg",
-                                    &g.saturation, 0.0f, 2.0f, "%.2f");
-                                ImGui::SliderFloat("Temperature##vol_tmg",
-                                    &g.temperature, -1.0f, 1.0f, "%.2f");
-                                ImGui::SliderFloat("Tint##vol_tmg",
-                                    &g.tint, -1.0f, 1.0f, "%.2f");
-                            }
-                            ImGui::Unindent();
-                        }
-                    }
-
-                    ImGui::TreePop();
-                }
-                ImGui::PopID();
-            }
-
-            if (pendingDelete != PostProcess::kInvalidVolumeHandle)
-                vs->Unregister(pendingDelete);
+            rt.debugCapture = false;
         }
     }
 
-    // ---- Scripted Overrides — transient, time-driven overrides that auto-expire (damage flash, flashbang, etc.). ----
+    // ---- Gameplay Override Stack — non-spatial, time-enveloped overrides
+    // (damage flash, cool pulse, …). Pushed onto PostProcess::Runtime; applied
+    // last in the resolve, above all volumes. ----
     ImGui::Separator();
-    if (ImGui::CollapsingHeader("Scripted Overrides", 0))
+    if (ImGui::CollapsingHeader("Gameplay Overrides", 0))
     {
-        auto& scripted = ppStack->GetScriptedOverrides();
+        auto& rt = PostProcess::Runtime::Get();
 
-        if (ImGui::Button("Trigger Damage Flash"))
+        if (ImGui::Button("Damage Flash"))
         {
-            // Red tint + vignette ~0.6s; tonemapping override snapshots base + tweaks grading for clean blend.
-            PostProcess::ScriptedOverrideDesc desc;
-            desc.priority = 2000;
-            desc.fadeIn   = 0.05f;
-            desc.hold     = 0.1f;
-            desc.fadeOut  = 0.45f;
-            snprintf(desc.label, sizeof(desc.label), "DamageFlash");
-
-            PostProcess::TonemappingParams tm = ppParams.GetTonemapping();
-            tm.colorGradingEnabled     = true;
-            tm.grading.temperature     = 1.0f;        // warm/red
-            tm.grading.saturation      = 1.6f;        // vivid
-            tm.grading.contrast        = 1.3f;
-            tm.grading.vignetteStrength = 0.6f;        // edge darkening
-            desc.override.tonemapping = tm;
-
-            scripted.Push(desc);
+            PostProcess::PostProcessOverride ov;
+            ov.priority = 2000.0f;
+            ov.fadeIn = 0.05f; ov.hold = 0.10f; ov.fadeOut = 0.45f;
+            snprintf(ov.label, sizeof(ov.label), "DamageFlash");
+            auto& cg = ov.profile.colorGrading;
+            cg.enabled.Set(true);
+            cg.temperature.Set(1.0f);
+            cg.saturation.Set(1.6f);
+            cg.contrast.Set(1.3f);
+            cg.vignetteStrength.Set(0.6f);
+            rt.PushOverride(ov);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Trigger Cool Pulse"))
+        if (ImGui::Button("Cool Pulse"))
         {
-            // Longer, subtler — demos hold phase + stacked priorities.
-            PostProcess::ScriptedOverrideDesc desc;
-            desc.priority = 1500;
-            desc.fadeIn   = 0.3f;
-            desc.hold     = 1.5f;
-            desc.fadeOut  = 0.8f;
-            snprintf(desc.label, sizeof(desc.label), "CoolPulse");
-
-            PostProcess::TonemappingParams tm = ppParams.GetTonemapping();
-            tm.colorGradingEnabled = true;
-            tm.grading.temperature = -0.7f;  // cool/blue
-            tm.grading.saturation  = 0.6f;   // slightly desaturated
-            desc.override.tonemapping = tm;
-
-            scripted.Push(desc);
+            PostProcess::PostProcessOverride ov;
+            ov.priority = 1500.0f;
+            ov.fadeIn = 0.3f; ov.hold = 1.5f; ov.fadeOut = 0.8f;
+            snprintf(ov.label, sizeof(ov.label), "CoolPulse");
+            auto& cg = ov.profile.colorGrading;
+            cg.enabled.Set(true);
+            cg.temperature.Set(-0.7f);
+            cg.saturation.Set(0.6f);
+            rt.PushOverride(ov);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Trigger Glass Shatter"))
+        if (ImGui::Button("Glass Shatter"))
         {
-            // GlassShatterPass: direct trigger (outside PP stack); pass auto-deactivates after duration.
             if (m_renderer) m_renderer->TriggerGlassShatter(0.5f, 0.5f);
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("%zu active", scripted.ActiveCount());
+        ImGui::TextDisabled("%zu active", rt.overrides.size());
 
-        // Live entries — lets user see timings and pop early.
-        auto live = scripted.GetLiveEntries();
-        if (!live.empty())
+        uint64_t pendingRemove = 0;
+        for (const auto& o : rt.overrides)
         {
-            ImGui::Indent();
-            for (const auto& e : live)
-            {
-                const float frac = (e.totalDuration > 0.0f)
-                    ? e.elapsedSeconds / e.totalDuration : 0.0f;
-                char line[128];
-                snprintf(line, sizeof(line),
-                    "#%u %s  t=%.2f/%.2fs  p=%d",
-                    e.handle, (e.label[0] ? e.label : "(unnamed)"),
-                    e.elapsedSeconds, e.totalDuration, e.priority);
-                ImGui::ProgressBar(frac, ImVec2(-1, 0), line);
-                ImGui::PushID(static_cast<int>(e.handle));
-                if (ImGui::SmallButton("Pop##scr"))
-                    scripted.Pop(e.handle);
-                ImGui::PopID();
-            }
-            ImGui::Unindent();
+            const float total = o.fadeIn + (o.hold < 0.f ? 0.f : o.hold) + o.fadeOut;
+            const float frac  = (total > 0.f) ? (o.elapsed / total) : 0.f;
+            char line[128];
+            snprintf(line, sizeof(line), "#%llu %s  t=%.2fs  p=%.0f",
+                (unsigned long long)o.id, (o.label[0] ? o.label : "(unnamed)"),
+                o.elapsed, o.priority);
+            ImGui::ProgressBar(o.hold < 0.f ? 1.0f : frac, ImVec2(-1, 0), line);
+            ImGui::PushID(static_cast<int>(o.id));
+            if (ImGui::SmallButton("Remove")) pendingRemove = o.id;
+            ImGui::PopID();
         }
+        if (pendingRemove) rt.RemoveOverride(pendingRemove);
     }
 
     ImGui::End();
@@ -6991,6 +6947,12 @@ void EditorLayer::RegisterDefaultEditors()
     RegisterReflectedComponent<MoonLightTag>        ("Moon Light Tag",/*priority*/ 105);
     // Volumetric clouds — author tunables on the Sky entity; TOD drives sun direction/color.
     RegisterReflectedComponent<CloudComponent>      ("Volumetric Clouds", /*priority*/ 106);
+    // Exponential height fog — analytic UE-style fog on the Sky entity.
+    RegisterReflectedComponent<HeightFogComponent>  ("Height Fog",        /*priority*/ 106);
+    // Procedural grass field (GoT-style GPU blades) — anchors to the scene's TerrainComponent heightmap.
+    RegisterReflectedComponent<GrassComponent>      ("Grass Field",       /*priority*/ 107);
+    // Water surface — Fresnel sky reflection + flow normals; worldCenter.y is the water level.
+    RegisterReflectedComponent<WaterComponent>      ("Water Surface",     /*priority*/ 108);
 
     // Terrain — heightmap + 4 PBR layers; path edits trigger TextureSystem rebind in BuildScene_SyncTerrain.
     // Numeric fields feed per-frame TerrainParamsCB so changes show next frame (no reimport).
@@ -7001,14 +6963,17 @@ void EditorLayer::RegisterDefaultEditors()
             auto* tc = &tcRef;
 
             // Per-instance text input buffers — avoid InputText truncation + per-frame strncpy. Keyed by component addr.
+            // layers is variable-count now; slots per layer = albedo/normal/arm/disp.
             struct PathBufs
             {
-                std::array<char, 512>                       heightmap;
-                std::array<char, 512>                       splatmap;
-                std::array<std::array<std::array<char, 512>, 4>, 4> layers; // [layer][slot]
+                std::array<char, 512>                                heightmap;
+                std::array<char, 512>                                splatmap;
+                std::vector<std::array<std::array<char, 512>, 4>>    layers; // [layer][slot]
             };
             static std::unordered_map<void*, PathBufs> s_bufs;
             auto& bufs = s_bufs[tc];
+            // GPU cap on rendered layers — mirrors Renderer::kMaxTerrainLayers.
+            constexpr size_t kMaxTerrainLayersUI = 8;
 
             auto syncBuf = [](std::array<char, 512>& buf, const std::string& src)
             {
@@ -7104,7 +7069,9 @@ void EditorLayer::RegisterDefaultEditors()
             ImGui::DragFloat3("World Center",
                 reinterpret_cast<float*>(&tc->worldCenter), 1.0f);
             ImGui::DragFloat("World Size", &tc->worldSize, 8.0f, 16.0f, 65536.0f, "%.0f m");
-            ImGui::DragFloat("Height Scale", &tc->heightScale, 4.0f, 1.0f, 65536.0f, "%.0f m");
+            ImGui::DragFloat("Height Scale", &tc->heightScale, 1.0f, 1.0f, 65536.0f, "%.0f m");
+            ImGui::TextDisabled("Relief floor->peak. Valley floor stays pinned at");
+            ImGui::TextDisabled("World Center Y while you scale (data-range re-anchored).");
 
             // tilesPerSide as int slider — clamp to sane range; the
             // mesh-shader dispatch count is N² so the upper bound matters.
@@ -7114,22 +7081,56 @@ void EditorLayer::RegisterDefaultEditors()
                 tc->tilesPerSide = static_cast<uint32_t>(tps);
             ImGui::TextDisabled("≈ %.2f m per quad", tc->worldSize / float(std::max(tps, 1) * 11));
 
+            // ---- Height-correlated blend section ----
+            ImGui::Separator();
+            ImGui::Checkbox("Height Blend (disp)", &tc->heightBlendEnabled);
+            ImGui::TextDisabled("Bias layer transitions by each layer's Disp map");
+            ImGui::TextDisabled("so they follow the micro-relief. Off = plain lerp.");
+            if (tc->heightBlendEnabled)
+            {
+                ImGui::SliderFloat("Blend Strength", &tc->heightBlendStrength,
+                    0.0f, 1.0f, "%.3f");
+                ImGui::SliderFloat("Blend Range", &tc->heightBlendRange,
+                    0.001f, 0.5f, "%.3f");
+                ImGui::TextDisabled("Strength: how hard disp biases. Range: smaller = sharper interlock.");
+            }
+
             // ---- Auto-blend section ----
             ImGui::Separator();
             ImGui::TextUnformatted("Auto-Blend (no splatmap)");
             ImGui::TextDisabled("Each layer is gated by a world-meter height range");
             ImGui::TextDisabled("AND a degree slope range — both must hold.");
 
-            // ---- 4 layers ---- baseY/topY hint the slider range; DragFloat doesn't hard-clamp.
+            // ---- Variable-count layers ---- baseY/topY hint the slider range; DragFloat doesn't hard-clamp.
             const float baseY = tc->worldCenter.y;
             const float topY  = tc->worldCenter.y + tc->heightScale;
 
-            for (int i = 0; i < 4; ++i)
+            // Keep the per-instance text buffers tracking the layer count.
+            if (bufs.layers.size() != tc->layers.size())
+                bufs.layers.resize(tc->layers.size());
+
+            // Add / remove layers (data-driven count; capped at the GPU max).
+            if (tc->layers.size() < kMaxTerrainLayersUI)
+            {
+                if (ImGui::Button("+ Add Layer"))
+                {
+                    tc->layers.emplace_back();
+                    bufs.layers.emplace_back();
+                }
+            }
+            else
+            {
+                ImGui::TextDisabled("Max %zu layers (GPU cap)", kMaxTerrainLayersUI);
+            }
+            ImGui::TextDisabled("Layers: %zu  (splatmap uses the first 4 channels)", tc->layers.size());
+
+            int removeIdx = -1;
+            for (size_t i = 0; i < tc->layers.size(); ++i)
             {
                 auto& l = tc->layers[i];
-                ImGui::PushID(i);
+                ImGui::PushID(static_cast<int>(i));
                 char hdr[32];
-                snprintf(hdr, sizeof(hdr), "Layer %d", i);
+                snprintf(hdr, sizeof(hdr), "Layer %zu", i);
                 if (ImGui::CollapsingHeader(hdr,
                         i == 0 ? ImGuiTreeNodeFlags_DefaultOpen : 0))
                 {
@@ -7144,7 +7145,7 @@ void EditorLayer::RegisterDefaultEditors()
                     pathRow("ARM (AO/Rough/Metal)", bufs.layers[i][2],
                             l.armPath,    l.armHandle,    kLayerPreview);
                     syncBuf(bufs.layers[i][3], l.dispPath);
-                    pathRow("Disp",                 bufs.layers[i][3],
+                    pathRow("Disp (height-blend)",  bufs.layers[i][3],
                             l.dispPath,   l.dispHandle,   kLayerPreview);
 
                     // Tiling density (rep/m): 0.5 ≈ 2m cycle, 0.05 ≈ 20m cycle.
@@ -7173,10 +7174,20 @@ void EditorLayer::RegisterDefaultEditors()
                         0.1f, 45.0f, "%.1f\xc2\xb0");
 
                     ImGui::TextDisabled("Bindless: albedo=%d nor=%d arm=%d disp=%d",
-                        l.albedoBindlessIdx, l.normalBindlessIdx,
-                        l.armBindlessIdx, l.dispBindlessIdx);
+                        l.albedoBindlessIdx, l.normalBindlessIdx, l.armBindlessIdx,
+                        l.dispBindlessIdx);
+
+                    // Keep at least one layer; defer the erase past the loop.
+                    if (tc->layers.size() > 1 && ImGui::SmallButton("Remove Layer"))
+                        removeIdx = static_cast<int>(i);
                 }
                 ImGui::PopID();
+            }
+            if (removeIdx >= 0 && static_cast<size_t>(removeIdx) < tc->layers.size())
+            {
+                tc->layers.erase(tc->layers.begin() + removeIdx);
+                if (static_cast<size_t>(removeIdx) < bufs.layers.size())
+                    bufs.layers.erase(bufs.layers.begin() + removeIdx);
             }
         });
 
@@ -7189,8 +7200,11 @@ void EditorLayer::RegisterDefaultEditors()
                 ImGui::TextDisabled("dir  %.3f  %.3f  %.3f",
                     ld.direction.x, ld.direction.y, ld.direction.z);
             if (ld.type == LightType::Spot && ld.castsShadow)
-                ImGui::TextDisabled("(uses 1 of %u atlas slices)",
+                ImGui::TextDisabled("(uses 1 of %u spot atlas slices)",
                                     SpotShadowPass::kMaxCasters);
+            if (ld.type == LightType::Point && ld.castsShadow)
+                ImGui::TextDisabled("(uses 1 of %u cube shadow casters)",
+                                    PointShadowPass::kMaxCasters);
         });
 
     // SkeletonComponent — read-only meta + bone hierarchy via custom postDraw.
@@ -7466,9 +7480,382 @@ void EditorLayer::RegisterDefaultEditors()
             return w.HasComponent<SkeletonComponent>(e);
         });
 
-    // ChainPhysicsComponent — REFLECT_COLLAPSE for Hair/Skirt/Spring Root/Spring Child sub-sections.
+    // ChainPhysicsComponent — KawaiiPhysics-style chain authoring. The legacy
+    // Hair/Skirt/Spring sliders are drawn by the reflection pass (REFLECT_BEGIN);
+    // this postDraw adds the explicit chain groups: per-group root-bone pick +
+    // descendant propagation + an exclude checkbox tree, an Auto-detect button,
+    // and a live viewport overlay (see EmitChainPhysicsOverlay).
     RegisterReflectedComponent<ChainPhysicsComponent>("Chain Physics",
-        /*priority*/ 40, /*postDraw*/ nullptr,
+        /*priority*/ 40,
+        [renderer, this](ChainPhysicsComponent& comp, World* world, Entity entity)
+        {
+            if (!renderer || !world) return;
+
+            const SkeletonComponent* skc = world->GetComponent<SkeletonComponent>(entity);
+            const SkeletonAsset* skel = nullptr;
+            if (skc && skc->assetIndex != kInvalidSkeletonIndex
+                && skc->assetIndex < renderer->GetSkeletonRegistry().Count())
+                skel = &renderer->GetSkeletonRegistry().Get(skc->assetIndex);
+            if (!skel) { ImGui::TextDisabled("(entity has no skeleton asset)"); return; }
+
+            ChainPhysicsSystem* cps = renderer->GetChainPhysicsSystem();
+            auto invalidate = [&]() { if (cps) cps->Invalidate(entity); };
+
+            // bone NAME -> index (linear scan; authoring only, never per-frame hot).
+            auto resolveBone = [&](const char* nm) -> uint32_t {
+                if (!nm || !nm[0]) return ~0u;
+                for (uint32_t b = 0; b < skel->boneCount; ++b)
+                    if (std::strcmp(skel->boneNames[b], nm) == 0) return b;
+                return ~0u;
+            };
+            // case-insensitive substring (self-contained — no <cctype>/<algorithm>).
+            auto icontains = [](const char* hay, const char* needle) -> bool {
+                if (!needle || !needle[0]) return true;
+                for (const char* h = hay; *h; ++h) {
+                    const char* a = h; const char* b = needle;
+                    while (*a && *b) {
+                        char ca = *a, cb = *b;
+                        if (ca >= 'A' && ca <= 'Z') ca += 32;
+                        if (cb >= 'A' && cb <= 'Z') cb += 32;
+                        if (ca != cb) break;
+                        ++a; ++b;
+                    }
+                    if (!*b) return true;
+                }
+                return false;
+            };
+
+            // children[] / roots[] for the bone trees.
+            std::vector<std::vector<uint32_t>> children(skel->boneCount);
+            std::vector<uint32_t> roots;
+            for (uint32_t i = 0; i < skel->boneCount; ++i) {
+                if (skel->parentIndex[i] < 0) roots.push_back(i);
+                else children[static_cast<uint32_t>(skel->parentIndex[i])].push_back(i);
+            }
+
+            ImGui::Separator();
+            ImGui::Checkbox("Show chain overlay in viewport", &m_chainOverlayEnabled);
+
+            if (comp.groups.empty())
+                ImGui::TextDisabled("No authored chains — using legacy bone-name auto-detection.\n"
+                                    "Add a chain or press Auto-detect to take explicit control.");
+
+            static const char* kTypeNames[] = { "Chain", "Cloth", "Spring" };
+
+            // Draw one group's editable body (root picker + ring/pair ids +
+            // exclude tree). Returns true if the user clicked Remove. Shared by
+            // all three type panels below; the group's TYPE is fixed by the panel
+            // it lives in, so there is no per-group type combo here.
+            auto drawGroupBody = [&](ChainGroupDef& g) -> bool
+            {
+                const uint32_t rootIdx = resolveBone(g.rootBone);
+
+                if (ImGui::Checkbox("Enabled", &g.enabled)) invalidate();
+                ImGui::InputText("Name", g.name, sizeof(g.name));
+
+                // ---- Root bone picker ----
+                ImGui::Text("Root: %s", g.rootBone[0] ? g.rootBone : "(none)");
+                ImGui::SameLine();
+                if (ImGui::Button("Pick...")) ImGui::OpenPopup("pick_root");
+                if (ImGui::BeginPopup("pick_root"))
+                {
+                    static char s_filter[64] = "";
+                    ImGui::InputText("Filter", s_filter, sizeof(s_filter));
+                    ImGui::BeginChild("bonetree", ImVec2(300, 320), true);
+                    auto pick = [&](uint32_t b) {
+                        snprintf(g.rootBone, sizeof(g.rootBone), "%s", skel->boneNames[b]);
+                        if (g.name[0] == '\0')
+                            snprintf(g.name, sizeof(g.name), "%s", skel->boneNames[b]);
+                        invalidate();
+                        ImGui::CloseCurrentPopup();
+                    };
+                    if (s_filter[0]) {
+                        for (uint32_t b = 0; b < skel->boneCount; ++b) {
+                            if (!skel->boneNames[b][0] || !icontains(skel->boneNames[b], s_filter)) continue;
+                            char lbl[96]; snprintf(lbl, sizeof(lbl), "[%u] %s", b, skel->boneNames[b]);
+                            if (ImGui::Selectable(lbl)) pick(b);
+                        }
+                    } else {
+                        // The bone NAME is the tree-node label so a single click on
+                        // the row selects it (IsItemClicked); the expand arrow /
+                        // double-click toggles children. Using a separate SameLine
+                        // Selectable over a SpanAvailWidth node makes their hitboxes
+                        // overlap -> clicks land unpredictably ("sometimes can't pick").
+                        std::function<void(uint32_t)> drawTree = [&](uint32_t b) {
+                            const char* nm = skel->boneNames[b][0] ? skel->boneNames[b] : "(unnamed)";
+                            const bool leaf = children[b].empty();
+                            ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_SpanAvailWidth
+                                                 | ImGuiTreeNodeFlags_OpenOnArrow
+                                                 | ImGuiTreeNodeFlags_OpenOnDoubleClick;
+                            if (leaf) f |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                            ImGui::PushID(static_cast<int>(b));
+                            const bool open = ImGui::TreeNodeEx(nm, f);
+                            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+                                pick(b);
+                            if (open && !leaf) {
+                                for (uint32_t c : children[b]) drawTree(c);
+                                ImGui::TreePop();
+                            }
+                            ImGui::PopID();
+                        };
+                        for (uint32_t r : roots) drawTree(r);
+                    }
+                    ImGui::EndChild();
+                    ImGui::EndPopup();
+                }
+
+                if (g.rootBone[0] && rootIdx >= skel->boneCount)
+                    ImGui::TextColored(ImVec4(1,0.4f,0.4f,1),
+                                       "Root bone not found in this skeleton!");
+
+                // ---- Ring / pair ids ----
+                if (g.type == ChainGroupType::Cloth) {
+                    if (ImGui::InputInt("Cloth piece id", &g.ringGroup)) invalidate();
+                    if (ImGui::InputInt("Order in ring (-1 = auto)", &g.ringIndex)) invalidate();
+                } else if (g.type == ChainGroupType::Spring) {
+                    if (ImGui::InputInt("Pair id (-1 = independent)", &g.pairGroupId)) invalidate();
+                    ImGui::TextDisabled("Spring: the root bone itself jiggles (no subtree).");
+                }
+
+                // ---- Per-group physics override (this chain's material) ----
+                // Live params (read every frame in Simulate) -> no Invalidate; the
+                // automatic root->tip stiffness falloff still applies on top.
+                ImGui::Checkbox("Override global params", &g.ovrEnabled);
+                if (g.ovrEnabled) {
+                    ImGui::Indent();
+                    if (g.type == ChainGroupType::Spring) {
+                        ImGui::DragFloat("Stiffness##ovr", &g.ovrSpringStiffness, 1.0f,  1.f,  500.f, "%.1f");
+                        ImGui::DragFloat("Damping##ovr",   &g.ovrSpringDamping,   0.1f,  0.f,  50.f,  "%.2f");
+                        ImGui::DragFloat("Mass##ovr",      &g.ovrSpringMass,      0.05f, 0.05f,20.f,  "%.2f");
+                        ImGui::DragFloat("Gravity##ovr",   &g.ovrSpringGravity,   0.1f, -50.f, 0.f,   "%.2f");
+                    } else {
+                        ImGui::SliderFloat("Damping##ovr",    &g.ovrDamping,        0.f,    1.f,  "%.3f");
+                        ImGui::DragFloat  ("Gravity##ovr",    &g.ovrGravity,        0.5f, -100.f, 0.f, "%.1f");
+                        ImGui::SliderFloat("Stiffness##ovr",  &g.ovrStiffness,      0.1f,   5.f,  "%.2f");
+                        ImGui::SliderFloat("Hold shape##ovr", &g.ovrLocalStiffness, 0.f,    1.f,  "%.3f");
+                        ImGui::SliderFloat("Tip hold##ovr",   &g.ovrTipHold,        0.f,    1.f,  "%.2f");
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Min hold-shape force along the whole chain.\n"
+                                              "0 = tip fully free (floppy); 1 = whole chain holds\n"
+                                              "its silhouette uniformly. Raise for short bangs.");
+                    }
+                    ImGui::Unindent();
+                } else {
+                    ImGui::TextDisabled("Inherits the global %s params above.",
+                                        g.type == ChainGroupType::Spring ? "Spring" :
+                                        g.type == ChainGroupType::Cloth  ? "Cloth" : "Chain");
+                }
+
+                // ---- Exclude tree (Hair / Skirt only) ----
+                if (g.type != ChainGroupType::Spring && rootIdx < skel->boneCount)
+                {
+                    if (ImGui::Checkbox("Exclude whole subtree on uncheck", &g.excludeSubtree))
+                        invalidate();
+
+                    // live "simulated bone" count (subtree minus excludes).
+                    int simCount = 0;
+                    {
+                        std::vector<uint8_t> mk(skel->boneCount, 0), ex(skel->boneCount, 0);
+                        mk[rootIdx] = 1;
+                        for (uint32_t b = rootIdx + 1; b < skel->boneCount; ++b)
+                            if (skel->parentIndex[b] >= 0 && mk[skel->parentIndex[b]]) mk[b] = 1;
+                        for (int j = 0; j < g.excludeCount; ++j) {
+                            uint32_t exb = resolveBone(g.excludeBones[j]);
+                            if (exb < skel->boneCount) ex[exb] = 1;
+                        }
+                        if (g.excludeSubtree)
+                            for (uint32_t b = 0; b < skel->boneCount; ++b)
+                                if (skel->parentIndex[b] >= 0 && ex[skel->parentIndex[b]]) ex[b] = 1;
+                        for (uint32_t b = 0; b < skel->boneCount; ++b)
+                            if (mk[b] && !ex[b]) ++simCount;
+                    }
+                    ImGui::Text("Simulated bones: %d  (excluded: %d)", simCount, g.excludeCount);
+
+                    if (ImGui::TreeNode("Bones (uncheck to exclude)"))
+                    {
+                        auto findExcl = [&](const char* nm) -> int {
+                            for (int j = 0; j < g.excludeCount; ++j)
+                                if (std::strcmp(g.excludeBones[j], nm) == 0) return j;
+                            return -1;
+                        };
+                        auto setExcl = [&](const char* nm, bool excl) {
+                            int idx = findExcl(nm);
+                            if (excl && idx < 0 && g.excludeCount < ChainGroupDef::MAX_EXCLUDE) {
+                                snprintf(g.excludeBones[g.excludeCount], 64, "%s", nm);
+                                g.excludeCount++;
+                            } else if (!excl && idx >= 0) {
+                                for (int k = idx; k < g.excludeCount - 1; ++k)
+                                    snprintf(g.excludeBones[k], 64, "%s", g.excludeBones[k + 1]);
+                                g.excludeCount--;
+                            }
+                        };
+                        std::function<void(uint32_t)> drawExcl = [&](uint32_t b) {
+                            const char* nm = skel->boneNames[b][0] ? skel->boneNames[b] : "(unnamed)";
+                            bool sim = (findExcl(nm) < 0);
+                            ImGui::PushID(static_cast<int>(b));
+                            if (ImGui::Checkbox("##e", &sim)) { setExcl(nm, !sim); invalidate(); }
+                            ImGui::SameLine();
+                            ImGuiTreeNodeFlags f = ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen;
+                            if (children[b].empty()) f |= ImGuiTreeNodeFlags_Leaf;
+                            if (ImGui::TreeNodeEx(nm, f)) {
+                                for (uint32_t c : children[b]) drawExcl(c);
+                                ImGui::TreePop();
+                            }
+                            ImGui::PopID();
+                        };
+                        for (uint32_t c : children[rootIdx]) drawExcl(c);
+                        ImGui::TreePop();
+                    }
+                }
+                else if (g.type != ChainGroupType::Spring)
+                {
+                    ImGui::TextDisabled("(pick a valid root bone to edit exclusions)");
+                }
+
+                ImGui::Spacing();
+                return ImGui::Button("Remove chain");
+            };
+
+            // ---- One collapsing panel per physics type; chains live inside ----
+            int removeGroup = -1;
+            // Recomputed each frame: the expanded group is highlighted in the
+            // viewport overlay (read one frame later by EmitChainPhysicsOverlay).
+            m_chainHighlightGroup = -1;
+            const bool full = comp.groups.size() >= static_cast<size_t>(ChainPhysicsComponent::MAX_GROUPS);
+
+            // One chain's collapsible node (header + editable body); shared by the
+            // flat panels (Chain/Spring) and the Cloth-piece sub-groups.
+            auto drawGroupNode = [&](int gi) {
+                ChainGroupDef& g = comp.groups[gi];
+                ImGui::PushID(gi);
+                char gh[176];
+                snprintf(gh, sizeof(gh), "%s  |  %s###grp%d",
+                         g.name[0] ? g.name : "(chain)",
+                         g.rootBone[0] ? g.rootBone : "(no root)", gi);
+                if (ImGui::TreeNodeEx(gh, ImGuiTreeNodeFlags_SpanAvailWidth)) {
+                    m_chainHighlightGroup = gi; // expanded -> highlight in viewport
+                    if (drawGroupBody(g)) removeGroup = gi;
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            };
+
+            const ChainGroupType kTypes[3] = {
+                ChainGroupType::Chain, ChainGroupType::Cloth, ChainGroupType::Spring
+            };
+
+            for (int ti = 0; ti < 3; ++ti)
+            {
+                const ChainGroupType T = kTypes[ti];
+                int count = 0;
+                for (int gi = 0; gi < static_cast<int>(comp.groups.size()); ++gi)
+                    if (comp.groups[gi].type == T) ++count;
+
+                char secHdr[64];
+                snprintf(secHdr, sizeof(secHdr), "%s  (%d)###sec%d", kTypeNames[ti], count, ti);
+                if (!ImGui::CollapsingHeader(secHdr, ImGuiTreeNodeFlags_DefaultOpen))
+                    continue;
+
+                ImGui::PushID(ti);
+                ImGui::Indent();
+
+                if (T == ChainGroupType::Cloth)
+                {
+                    // Cloth chains are sub-grouped into "Cloth pieces" by ringGroup —
+                    // each piece is one ring of horizontal/shear constraints, so
+                    // multiple cloth pieces (skirt + cape + ...) stay separated and
+                    // chains within a piece tie together.
+                    std::vector<int> pieces; int maxRg = -1;
+                    for (int gi = 0; gi < static_cast<int>(comp.groups.size()); ++gi) {
+                        if (comp.groups[gi].type != ChainGroupType::Cloth) continue;
+                        const int rg = comp.groups[gi].ringGroup;
+                        if (rg > maxRg) maxRg = rg;
+                        bool seen = false; for (int pv : pieces) if (pv == rg) { seen = true; break; }
+                        if (!seen) pieces.push_back(rg);
+                    }
+                    // small insertion sort (avoids an <algorithm> dependency)
+                    for (size_t a = 1; a < pieces.size(); ++a) {
+                        int v = pieces[a]; size_t b = a;
+                        while (b > 0 && pieces[b - 1] > v) { pieces[b] = pieces[b - 1]; --b; }
+                        pieces[b] = v;
+                    }
+
+                    for (int rg : pieces) {
+                        int pc = 0;
+                        for (int gi = 0; gi < static_cast<int>(comp.groups.size()); ++gi)
+                            if (comp.groups[gi].type == ChainGroupType::Cloth && comp.groups[gi].ringGroup == rg) ++pc;
+
+                        ImGui::PushID(rg);
+                        char ph[72];
+                        snprintf(ph, sizeof(ph), "Cloth piece %d  (%d chains)###piece%d", rg, pc, rg);
+                        if (ImGui::CollapsingHeader(ph, ImGuiTreeNodeFlags_DefaultOpen)) {
+                            ImGui::Indent();
+                            for (int gi = 0; gi < static_cast<int>(comp.groups.size()); ++gi)
+                                if (comp.groups[gi].type == ChainGroupType::Cloth && comp.groups[gi].ringGroup == rg)
+                                    drawGroupNode(gi);
+                            ImGui::BeginDisabled(full);
+                            if (ImGui::Button("+ Add chain to this piece")) {
+                                ChainGroupDef ng{}; ng.type = ChainGroupType::Cloth;
+                                ng.ringGroup = rg; ng.ringIndex = -1;
+                                snprintf(ng.name, sizeof(ng.name), "Cloth %d.%d", rg, pc);
+                                comp.groups.push_back(ng); invalidate();
+                            }
+                            ImGui::EndDisabled();
+                            ImGui::Unindent();
+                        }
+                        ImGui::PopID();
+                    }
+
+                    ImGui::BeginDisabled(full);
+                    if (ImGui::Button("+ Add Cloth piece")) {
+                        ChainGroupDef ng{}; ng.type = ChainGroupType::Cloth;
+                        ng.ringGroup = maxRg + 1; ng.ringIndex = -1;
+                        snprintf(ng.name, sizeof(ng.name), "Cloth %d.0", maxRg + 1);
+                        comp.groups.push_back(ng); invalidate();
+                    }
+                    ImGui::EndDisabled();
+                }
+                else
+                {
+                    for (int gi = 0; gi < static_cast<int>(comp.groups.size()); ++gi)
+                        if (comp.groups[gi].type == T) drawGroupNode(gi);
+
+                    ImGui::BeginDisabled(full);
+                    char addLbl[40];
+                    snprintf(addLbl, sizeof(addLbl), "+ Add %s", kTypeNames[ti]);
+                    if (ImGui::Button(addLbl)) {
+                        ChainGroupDef ng{}; ng.type = T;
+                        snprintf(ng.name, sizeof(ng.name), "%s %d", kTypeNames[ti], count);
+                        comp.groups.push_back(ng); invalidate();
+                    }
+                    ImGui::EndDisabled();
+                }
+
+                ImGui::Unindent();
+                ImGui::PopID();
+            }
+
+            if (removeGroup >= 0 && removeGroup < static_cast<int>(comp.groups.size())) {
+                comp.groups.erase(comp.groups.begin() + removeGroup);
+                invalidate();
+            }
+
+            ImGui::Separator();
+            ImGui::TextDisabled("Total chains: %d / %d",
+                                static_cast<int>(comp.groups.size()), ChainPhysicsComponent::MAX_GROUPS);
+            if (ImGui::Button("Auto-detect from bone names")) {
+                ChainPhysicsSystem::BuildGroupsFromNames(*skel, comp);
+                invalidate();
+            }
+            if (!comp.groups.empty()) {
+                ImGui::SameLine();
+                if (ImGui::Button("Clear all")) { comp.groups.clear(); invalidate(); }
+            }
+            if (full)
+                ImGui::TextColored(ImVec4(1.f, 0.7f, 0.3f, 1.f),
+                                   "Max chains reached — remove one (or consolidate skirt "
+                                   "panels under a single root + excludes) to add more.");
+        },
         /*requires*/ [](World& w, Entity e) -> bool {
             return w.HasComponent<SkeletonComponent>(e);
         });
@@ -8012,123 +8399,61 @@ void EditorLayer::RegisterDefaultEditors()
             return w.GetComponent<GlobalTransform>(e) != nullptr;
         });
 
-    // Post-Process Volume — center follows GlobalTransform; 4 override sections in postDraw need Stack base params.
-    RegisterReflectedComponent<ECS::VolumeComponent>("Post-Process Volume",
+    // Post-Process Volume — bounds come from the Transform; the look is a shared
+    // PostProcessProfile resource edited inline via the override widgets.
+    RegisterReflectedComponent<ECS::PostProcessVolumeComponent>("Post-Process Volume",
         /*priority*/ 55,
-        [renderer](ECS::VolumeComponent& vc, World*, Entity)
+        [](ECS::PostProcessVolumeComponent& vc, World*, Entity)
         {
-            PostProcess::Volume& v = vc.volume;
-            PostProcess::ParameterStore* baseParams = nullptr;
-            if (renderer)
-            {
-                if (auto* stack = renderer->GetPostProcessStack())
-                    baseParams = &stack->GetParameters();
-            }
-            ImGui::InputText("Label", v.label, sizeof(v.label));
+            static constexpr const char* kProfFilter =
+                "Post-Process Profile (*.ppprofile)\0*.ppprofile\0All Files\0*.*\0\0";
+
+            auto& ps = PostProcess::ProfileSystem::Get();
+
             ImGui::Separator();
-            ImGui::TextDisabled("Overrides");
+            ImGui::TextDisabled("Profile");
 
-            // --- CAS ---
+            if (vc.profilePath.empty())
+                ImGui::TextDisabled("(runtime profile — not saved as an asset)");
+            else
+                ImGui::TextWrapped("Asset: %s", vc.profilePath.c_str());
+
+            PostProcess::PostProcessProfile* prof = ps.Get(vc.profile);
+
+            if (!prof)
             {
-                bool has = v.override.cas.has_value();
-                if (ImGui::Checkbox("Override CAS", &has))
+                if (ImGui::Button("New Profile"))
                 {
-                    if (has)
-                        v.override.cas = baseParams ? baseParams->GetCAS()
-                                                    : PostProcess::CASParams{};
-                    else v.override.cas.reset();
+                    vc.profile = ps.CreateRuntime();
+                    vc.profilePath.clear();
+                    prof = ps.Get(vc.profile);
                 }
-                if (v.override.cas)
+                ImGui::SameLine();
+            }
+            if (ImGui::Button("Load .ppprofile..."))
+            {
+                std::string path = OpenFileDialog(kProfFilter, nullptr);
+                if (!path.empty())
                 {
-                    auto& cas = *v.override.cas;
-                    ImGui::Indent();
-                    ImGui::Checkbox("Enabled##vc_cas", &cas.enabled);
-                    ImGui::SliderFloat("Sharpness##vc_cas",
-                        &cas.sharpness, 0.0f, 1.0f, "%.2f");
-                    ImGui::Unindent();
+                    PostProcess::ProfileHandle h = ps.Acquire(path);
+                    if (h.IsValid()) { vc.profile = h; vc.profilePath = path; prof = ps.Get(h); }
                 }
             }
-
-            // --- AutoExposure ---
+            if (prof)
             {
-                bool has = v.override.autoExposure.has_value();
-                if (ImGui::Checkbox("Override AutoExposure", &has))
+                ImGui::SameLine();
+                if (ImGui::Button("Save As..."))
                 {
-                    if (has)
-                        v.override.autoExposure = baseParams
-                            ? baseParams->GetAutoExposure()
-                            : PostProcess::AutoExposureParams{};
-                    else v.override.autoExposure.reset();
+                    std::string path = SaveFileDialog(kProfFilter, "ppprofile", nullptr);
+                    if (!path.empty() && ps.Save(vc.profile, path))
+                        vc.profilePath = path;
                 }
-                if (v.override.autoExposure)
-                {
-                    auto& ae = *v.override.autoExposure;
-                    ImGui::Indent();
-                    ImGui::Checkbox("Enabled##vc_ae", &ae.enabled);
-                    ImGui::SliderFloat("Manual Exposure##vc_ae",
-                        &ae.manualExposure, 0.05f, 16.0f, "%.3f",
-                        ImGuiSliderFlags_Logarithmic);
-                    ImGui::SliderFloat("EV Bias##vc_ae",
-                        &ae.evBias, -3.0f, 3.0f, "%.2f EV");
-                    ImGui::SliderFloat("Key##vc_ae",
-                        &ae.keyValue, 0.05f, 0.5f, "%.3f");
-                    ImGui::Unindent();
-                }
+
+                DrawProfileInspector(*prof);
             }
-
-            // --- Bloom (placeholder) ---
+            else
             {
-                bool has = v.override.bloom.has_value();
-                if (ImGui::Checkbox("Override Bloom", &has))
-                {
-                    if (has)
-                        v.override.bloom = baseParams ? baseParams->GetBloom()
-                                                      : PostProcess::BloomParams{};
-                    else v.override.bloom.reset();
-                }
-                if (v.override.bloom)
-                {
-                    ImGui::Indent();
-                    ImGui::TextDisabled("(no user-facing params yet)");
-                    ImGui::Unindent();
-                }
-            }
-
-            // --- Tonemapping ---
-            {
-                bool has = v.override.tonemapping.has_value();
-                if (ImGui::Checkbox("Override Tonemapping", &has))
-                {
-                    if (has)
-                        v.override.tonemapping = baseParams
-                            ? baseParams->GetTonemapping()
-                            : PostProcess::TonemappingParams{};
-                    else v.override.tonemapping.reset();
-                }
-                if (v.override.tonemapping)
-                {
-                    auto& tm = *v.override.tonemapping;
-                    ImGui::Indent();
-                    ImGui::SliderFloat("Bloom Strength##vc_tm",
-                        &tm.bloomStrength, 0.0f, 1.0f, "%.3f");
-                    ImGui::Checkbox("Color Grading##vc_tm",
-                        &tm.colorGradingEnabled);
-                    if (tm.colorGradingEnabled)
-                    {
-                        auto& g = tm.grading;
-                        ImGui::SliderFloat("Exposure##vc_tmg",
-                            &g.exposure, -5.0f, 5.0f, "%.2f EV");
-                        ImGui::SliderFloat("Contrast##vc_tmg",
-                            &g.contrast, 0.2f, 3.0f, "%.2f");
-                        ImGui::SliderFloat("Saturation##vc_tmg",
-                            &g.saturation, 0.0f, 2.0f, "%.2f");
-                        ImGui::SliderFloat("Temperature##vc_tmg",
-                            &g.temperature, -1.0f, 1.0f, "%.2f");
-                        ImGui::SliderFloat("Tint##vc_tmg",
-                            &g.tint, -1.0f, 1.0f, "%.2f");
-                    }
-                    ImGui::Unindent();
-                }
+                ImGui::TextDisabled("No profile — create or load one to edit the look.");
             }
         });
 
@@ -8155,6 +8480,21 @@ void EditorLayer::RegisterDefaultEditors()
         {
             ImGui::TextDisabled("Slot: %u  (auto-assigned on first sample)",
                                 tc.trailSlot);
+        });
+
+    // BillboardFX — animated sprite-sheet billboard; postDraw shows the bound
+    // texture + the live flipbook frame.
+    RegisterReflectedComponent<BillboardFXComponent>("Billboard FX (Sprite)",
+        /*priority*/ 62,
+        [](BillboardFXComponent& b, World*, Entity)
+        {
+            const int cols  = (b.columns > 0) ? b.columns : 1;
+            const int rows  = (b.rows    > 0) ? b.rows    : 1;
+            const int total = (b.frameCount > 0) ? b.frameCount : (cols * rows);
+            ImGui::TextDisabled("Texture: %s  idx=%d",
+                b.texturePath.empty() ? "(no texture)" : "bound",
+                b.textureBindlessIdx);
+            ImGui::TextDisabled("Frame: %d / %d", b.frame, total);
         });
 
     // Timeline — AnimNotify tracks. Uses the raw RegisterComponentEditor
@@ -8421,7 +8761,10 @@ void EditorLayer::RegisterDefaultEditors()
     SetComponentCategory<SunLightTag>                     ("Environment");
     SetComponentCategory<MoonLightTag>                    ("Environment");
     SetComponentCategory<CloudComponent>                  ("Environment");
+    SetComponentCategory<HeightFogComponent>              ("Environment");
     SetComponentCategory<TerrainComponent>                ("Environment");
+    SetComponentCategory<GrassComponent>                  ("Environment");
+    SetComponentCategory<WaterComponent>                  ("Environment");
 
     // -- Camera -- (lens + controllers + VCam stack)
     SetComponentCategory<CameraComponent>                 ("Camera");
@@ -8461,7 +8804,7 @@ void EditorLayer::RegisterDefaultEditors()
     SetComponentCategory<BeamComponent>                   ("VFX");
 
     // -- Post-Process --
-    SetComponentCategory<ECS::VolumeComponent>            ("Post-Process");
+    SetComponentCategory<ECS::PostProcessVolumeComponent> ("Post-Process");
 
     // -- UI -- (screen-space + world-space widgets)
     SetComponentCategory<UI::UIRootComponent>             ("UI");
@@ -8985,4 +9328,137 @@ void EditorLayer::RenderProfilerPanel()
     // Sync enabled state when window is closed via X button.
     if (!m_showProfiler && m_gpuProfiler)
         m_gpuProfiler->enabled = false;
+}
+
+// ===========================================================================
+// Chain-physics (KawaiiPhysics-style) authoring overlay
+// ===========================================================================
+
+// Returns the entity whose authored chains should be drawn this frame, or
+// NullEntity. Shared guard for the prepare/emit phases.
+static Entity ChainOverlayTarget(bool enabled, Entity selected, World& world)
+{
+    if (!enabled || selected == NullEntity || !world.IsAlive(selected))
+        return NullEntity;
+    const ChainPhysicsComponent* comp = world.GetComponent<ChainPhysicsComponent>(selected);
+    if (!comp || comp->groups.empty()) return NullEntity;
+    return selected;
+}
+
+void EditorLayer::PrepareChainPhysicsOverlay(Renderer& renderer, World& world)
+{
+    if (ChainOverlayTarget(m_chainOverlayEnabled, m_selectedEntity, world) == NullEntity)
+        return;
+    // Force the wire pass on for this frame so BuildScene_DebugWireframes runs
+    // Clear() (which caches the live ring-slot write pointer). ApplyTo ran just
+    // before us and may have set enabled=false when the debug master is off;
+    // with master off every show* gather flag is also false, so this reveals
+    // nothing except our own overlay lines pushed in EmitChainPhysicsOverlay.
+    if (DebugWirePass* dbg = renderer.GetDebugWirePass())
+        dbg->enabled = true;
+}
+
+void EditorLayer::EmitChainPhysicsOverlay(Renderer& renderer, World& world)
+{
+    using namespace DirectX;
+
+    const Entity e = ChainOverlayTarget(m_chainOverlayEnabled, m_selectedEntity, world);
+    if (e == NullEntity) return;
+
+    const ChainPhysicsComponent* comp = world.GetComponent<ChainPhysicsComponent>(e);
+    const SkeletonComponent* skc = world.GetComponent<SkeletonComponent>(e);
+    if (!comp || !skc || skc->assetIndex == kInvalidSkeletonIndex) return;
+
+    SkeletonRegistry& reg = renderer.GetSkeletonRegistry();
+    if (skc->assetIndex >= reg.Count()) return;
+    const SkeletonAsset& skel = reg.Get(skc->assetIndex);
+    if (skel.boneCount == 0) return;
+
+    DebugWirePass* dbg = renderer.GetDebugWirePass();
+    if (!dbg) return;
+
+    // Live simulated bone matrices if the entity is initialized, else the bind
+    // pose transformed by the entity's world matrix (static preview).
+    const std::vector<XMFLOAT4X4>* mats = nullptr;
+    if (ChainPhysicsSystem* cps = renderer.GetChainPhysicsSystem())
+        mats = cps->GetBoneWorldMatrices(e);
+
+    XMMATRIX entWorld = XMMatrixIdentity();
+    if (const GlobalTransform* gt = world.GetComponent<GlobalTransform>(e))
+        entWorld = XMLoadFloat4x4(&gt->matrix);
+
+    auto bonePos = [&](uint32_t b) -> XMFLOAT3 {
+        if (mats && b < mats->size()) {
+            const XMFLOAT4X4& m = (*mats)[b];
+            return { m._41, m._42, m._43 };
+        }
+        XMMATRIX bp = XMLoadFloat4x4(&skel.bindPose[b]); // bone-space -> model-space
+        XMVECTOR p  = XMVector3TransformCoord(XMVectorZero(), XMMatrixMultiply(bp, entWorld));
+        XMFLOAT3 o; XMStoreFloat3(&o, p); return o;
+    };
+    auto resolveBone = [&](const char* nm) -> uint32_t {
+        if (!nm || !nm[0]) return ~0u;
+        for (uint32_t b = 0; b < skel.boneCount; ++b)
+            if (std::strcmp(skel.boneNames[b], nm) == 0) return b;
+        return ~0u;
+    };
+
+    // Colors are 0xAARRGGBB (see Renderer_Scene.cpp debug-wire usage).
+    // Three palettes: normal (no group focused), dimmed (a non-focused group
+    // while another is expanded), and highlight (the expanded group — a vivid
+    // orange, distinct from the cyan default, so it's easy to pick out).
+    constexpr uint32_t kRoot  = 0xFFFFD000u, kChain  = 0xFF00E0FFu, kLink  = 0xFF40FF40u, kExcl  = 0xFFFF3030u;
+    constexpr uint32_t kRootD = 0xFF6A5A00u, kChainD = 0xFF0A5A6Au, kLinkD = 0xFF1E5A1Eu, kExclD = 0xFF6A1A1Au;
+    constexpr uint32_t kRootH = 0xFFFFFFFFu, kChainH = 0xFFFF7A00u, kLinkH = 0xFFFFB000u, kExclH = 0xFFFF3030u;
+
+    const int hi = m_chainHighlightGroup;
+
+    for (int gi = 0; gi < static_cast<int>(comp->groups.size()); ++gi)
+    {
+        const ChainGroupDef& g = comp->groups[gi];
+        if (!g.enabled) continue;
+        const uint32_t root = resolveBone(g.rootBone);
+        if (root >= skel.boneCount) continue;
+
+        const bool isHi = (gi == hi);
+        const bool dim  = (hi >= 0 && !isHi);
+        const uint32_t cRoot  = isHi ? kRootH  : (dim ? kRootD  : kRoot);
+        const uint32_t cChain = isHi ? kChainH : (dim ? kChainD : kChain);
+        const uint32_t cLink  = isHi ? kLinkH  : (dim ? kLinkD  : kLink);
+        const uint32_t cExcl  = isHi ? kExclH  : (dim ? kExclD  : kExcl);
+        const float rootR  = isHi ? 0.06f  : (dim ? 0.03f  : 0.04f);
+        const float chainR = isHi ? 0.03f  : (dim ? 0.015f : 0.02f);
+        const float crossR = isHi ? 0.045f : 0.03f;
+
+        dbg->AddSphere(bonePos(root), rootR, cRoot, 12);
+
+        if (g.type == ChainGroupType::Spring) continue; // single jiggle bone, no chain
+
+        // Mark subtree + excludes — mirrors InitEntity so the overlay matches sim.
+        std::vector<uint8_t> mk(skel.boneCount, 0), ex(skel.boneCount, 0);
+        mk[root] = 1;
+        for (uint32_t b = root + 1; b < skel.boneCount; ++b)
+            if (skel.parentIndex[b] >= 0 && mk[skel.parentIndex[b]]) mk[b] = 1;
+        for (int j = 0; j < g.excludeCount; ++j) {
+            uint32_t exb = resolveBone(g.excludeBones[j]);
+            if (exb < skel.boneCount) ex[exb] = 1;
+        }
+        if (g.excludeSubtree)
+            for (uint32_t b = 0; b < skel.boneCount; ++b)
+                if (skel.parentIndex[b] >= 0 && ex[skel.parentIndex[b]]) ex[b] = 1;
+
+        for (uint32_t b = 0; b < skel.boneCount; ++b)
+        {
+            if (!mk[b] || b == root) continue;
+            const XMFLOAT3 p = bonePos(b);
+            if (ex[b]) {
+                dbg->AddCross(p, crossR, cExcl);
+            } else {
+                dbg->AddSphere(p, chainR, cChain, 8);
+                const int32_t par = skel.parentIndex[b];
+                if (par >= 0 && mk[par] && !ex[par])
+                    dbg->AddLine(bonePos(static_cast<uint32_t>(par)), p, cLink);
+            }
+        }
+    }
 }

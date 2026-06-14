@@ -18,7 +18,7 @@ struct ReflectionProbe
     float3 position;        float influenceRadius;
     float3 boxMin;          uint   cubemapSlice;
     float3 boxMax;          uint   flags;
-    float3 innerExtents;    float  pad0;
+    float3 innerExtents;    float  intensity; // unused here; keeps layout in sync
 };
 
 struct ProbeGridEntry

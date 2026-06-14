@@ -22,7 +22,7 @@ struct Texture_DX12
     D3D12_RESOURCE_STATES   state = D3D12_RESOURCE_STATE_COMMON;
     DescriptorAllocation    srv;        // CBV_SRV_UAV shader-visible heap (native fmt incl. SRGB)
     DescriptorAllocation    previewSrv; // UNORM alias SRV for editor preview (SRGB only)
-    DescriptorAllocation    stencilSrv; // X24_TYPELESS_G8_UINT view of D24_S8
+    DescriptorAllocation    stencilSrv; // stencil-plane view (X32_TYPELESS_G8X24 / X24_TYPELESS_G8)
     // NV12 UV-plane SRV (R8G8_UNORM, PlaneSlice=1). srv above holds the
     // Y-plane (R8_UNORM PlaneSlice=0) when desc.format == NV12. Empty for
     // every non-NV12 texture.

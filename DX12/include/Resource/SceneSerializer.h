@@ -38,10 +38,17 @@ namespace Resource
     // sceneName is stored as metadata (displayed in editor title bar, etc.)
     // postProcessConfigPath, if non-empty, is stored on the W line and causes
     // LoadScene to automatically load + apply that .ippc after world restore.
+    // sceneScript, if non-empty, is the path to a Lua "scene script" — a
+    // singleton bound to the whole scene (NOT an entity) with lifecycle hooks
+    // OnSceneEnter / OnSceneUpdate(dt) / OnSceneExit. It drives the data-driven
+    // scene flow (what used to be the hardcoded TitleScene/GameScene/EndScene
+    // Update logic). Stored on the W line and surfaced via LoadScene's
+    // outSceneScript so the runtime SceneManager can activate it on load.
     bool SaveScene(World& world, const std::string& path,
                    const std::string& sceneName = "Untitled",
                    const std::string& postProcessConfigPath = "",
-                   const std::string& navMeshPath = "");
+                   const std::string& navMeshPath = "",
+                   const std::string& sceneScript = "");
 
     // Deserialize a .iscene file, CLEAR the world, then rebuild all entities.
     // If the scene referenced a .ippc and a Renderer is supplied, the post-
@@ -55,5 +62,6 @@ namespace Resource
                    AnimationClipSystem* animClipSys = nullptr,
                    std::string* outSceneName = nullptr,
                    std::string* outPostProcessConfigPath = nullptr,
-                   std::string* outNavMeshPath = nullptr);
+                   std::string* outNavMeshPath = nullptr,
+                   std::string* outSceneScript = nullptr);
 }

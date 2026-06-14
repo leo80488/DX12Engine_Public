@@ -204,4 +204,11 @@ struct IndirectLightingSettingsComponent
     // gaps where neither SSR nor a probe covers them. See plan §5.1 Layer D.
     bool   reflectionProbePriorityOverDDGI = true;
     bool   useDDGIForRoughSpecularFallback = false;
+
+    // Scale on the SKY-SH ambient term baked into reflection-probe cubemaps
+    // (ProbeCapture.ps). The bake also multiplies by the live iblStrength, so
+    // a probe captures the environment at the same indirect level the main
+    // pass uses. Lower this to darken over-bright interior captures without
+    // touching the runtime sky IBL. 1.0 = full captured ambient.
+    float  reflectionProbeBakeAmbient = 1.0f;
 };

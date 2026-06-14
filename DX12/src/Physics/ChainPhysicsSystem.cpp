@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <map>
@@ -143,6 +144,18 @@ static void BuildChildrenList(const SkeletonAsset& skel,
     }
 }
 
+// Resolve a bone NAME to its skeleton index. Linear scan (boneCount <= 1024,
+// called only at init / authoring, never on the per-frame hot path) — avoids
+// depending on the importer's private FNV-32 keying of SkeletonAsset.nameToIndex.
+// Returns ~0u when not found / empty.
+static uint32_t ResolveBoneByName(const SkeletonAsset& skel, const char* name)
+{
+    if (!name || !name[0]) return ~0u;
+    for (uint32_t b = 0; b < skel.boneCount; ++b)
+        if (std::strcmp(skel.boneNames[b], name) == 0) return b;
+    return ~0u;
+}
+
 // ===========================================================================
 // ComputeWorldTransform  -  same as IKSystem
 // ===========================================================================
@@ -220,25 +233,135 @@ void ChainPhysicsSystem::TraceChains(
 // ===========================================================================
 void ChainPhysicsSystem::InitEntity(
     Entity e,
+    const ChainPhysicsComponent& cfg,
     const SkeletonAsset& skel,
     const AnimationSystem::LocalPose* poses)
 {
     EntityData& data = m_entityData[e];
     data = EntityData{}; // reset
 
-    // Step 1: Classify all bones
-    std::vector<int> boneClass(skel.boneCount, 0);
+    // Step 1: Classify all bones -> boneClass[] (0=none,1=hair,2=skirt,3=spring)
+    // + isPhysBone[]. Two sources, selected by whether cfg.groups is empty:
+    //   empty     : legacy bone-NAME keyword classification (back-compat for old scenes)
+    //   non-empty : explicit authored groups (KawaiiPhysics-style root + exclude)
+    std::vector<int>  boneClass (skel.boneCount, 0);
     std::vector<bool> isPhysBone(skel.boneCount, false);
 
-    for (uint32_t b = 0; b < skel.boneCount; ++b)
-    {
-        boneClass[b] = ClassifyBone(skel.boneNames[b]);
-        isPhysBone[b] = (boneClass[b] != 0);
-    }
+    // Per-bone authoring metadata consumed by the skirt (Step 5) and spring
+    // (Step 7) builders, so those stay agnostic to how a bone got classified:
+    //   ringGroupOf/ringIndexOf : for a skirt ROOT, its ParseSkirtID-equivalent ids
+    //   springPairId            : spring bones sharing a value >=0 form a virtual root
+    std::vector<int> ringGroupOf (skel.boneCount, 0);
+    std::vector<int> ringIndexOf (skel.boneCount, -1);
+    std::vector<int> springPairId(skel.boneCount, -1);
 
-    // Step 2: Build children list once (shared by all TraceChains calls)
+    // bone -> source ChainGroupDef index (authored path only; -1 = none/legacy).
+    // Threaded onto each Strand/Constraint/SpringBone so Simulate can resolve the
+    // group's per-chain param overrides (else falls back to the type-globals).
+    std::vector<int> boneGroup(skel.boneCount, -1);
+
+    const bool authored = !cfg.groups.empty();
+
+    // Step 2: Build children list once (shared by TraceChains + authored mark).
     std::vector<std::vector<uint32_t>> children;
     BuildChildrenList(skel, children);
+
+    if (!authored)
+    {
+        // ---- Legacy keyword path (verbatim behavior) ----
+        for (uint32_t b = 0; b < skel.boneCount; ++b)
+        {
+            boneClass[b]  = ClassifyBone(skel.boneNames[b]);
+            isPhysBone[b] = (boneClass[b] != 0);
+
+            if (boneClass[b] == 2)
+            {
+                SkirtID sid = ParseSkirtID(skel.boneNames[b]);
+                ringGroupOf[b] = sid.group;
+                ringIndexOf[b] = sid.chain;
+            }
+            else if (boneClass[b] == 3)
+            {
+                // Chest bones sharing a parent pair up under a virtual root;
+                // Butt (and lone chest) stay independent. Encode "shared parent"
+                // as the pair id so Step 7 groups them identically.
+                std::string nm(skel.boneNames[b]);
+                if (nm.find("Chest") != std::string::npos ||
+                    nm.find("chest") != std::string::npos)
+                    springPairId[b] = skel.parentIndex[b];
+            }
+        }
+    }
+    else
+    {
+        // ---- Authored group path (KawaiiPhysics-style) ----
+        // For each enabled group: resolve the root bone by name, mark its whole
+        // descendant subtree (forward pass — valid by the parentIndex[i] < i
+        // invariant), subtract excluded bones/subtrees, then stamp boneClass[].
+        for (int gi = 0; gi < static_cast<int>(cfg.groups.size()); ++gi)
+        {
+            const ChainGroupDef& g = cfg.groups[gi];
+            if (!g.enabled) continue;
+
+            const uint32_t root = ResolveBoneByName(skel, g.rootBone);
+            if (root >= skel.boneCount)
+            {
+                LOG_WARNING("ChainPhysics: group '%s' root bone '%s' not found in skeleton — skipped",
+                            g.name[0] ? g.name : "(unnamed)",
+                            g.rootBone[0] ? g.rootBone : "(empty)");
+                continue;
+            }
+
+            if (g.type == ChainGroupType::Spring)
+            {
+                // The root bone IS the jiggle bone (no subtree descent). Pairing
+                // comes from pairGroupId (replaces the "Chest"+shared-parent rule).
+                boneClass[root]    = 3;
+                isPhysBone[root]   = true;
+                springPairId[root] = (g.pairGroupId >= 0) ? g.pairGroupId : -1;
+                boneGroup[root]    = gi;
+                continue;
+            }
+
+            const int cls = static_cast<int>(g.type) + 1; // Hair=1, SkirtRing=2
+
+            // Mark root + descendant subtree.
+            std::vector<bool> marked(skel.boneCount, false);
+            marked[root] = true;
+            for (uint32_t b = root + 1; b < skel.boneCount; ++b)
+                if (skel.parentIndex[b] >= 0 &&
+                    marked[static_cast<uint32_t>(skel.parentIndex[b])])
+                    marked[b] = true;
+
+            // Subtract excludes: seed excluded bones, then (optionally) cascade
+            // the exclusion down their subtrees with the same forward pass.
+            std::vector<bool> excluded(skel.boneCount, false);
+            for (int j = 0; j < g.excludeCount && j < ChainGroupDef::MAX_EXCLUDE; ++j)
+            {
+                uint32_t ex = ResolveBoneByName(skel, g.excludeBones[j]);
+                if (ex < skel.boneCount) excluded[ex] = true;
+            }
+            if (g.excludeSubtree)
+                for (uint32_t b = 0; b < skel.boneCount; ++b)
+                    if (skel.parentIndex[b] >= 0 &&
+                        excluded[static_cast<uint32_t>(skel.parentIndex[b])])
+                        excluded[b] = true;
+
+            for (uint32_t b = 0; b < skel.boneCount; ++b)
+                if (marked[b] && !excluded[b])
+                {
+                    boneClass[b]  = cls;
+                    isPhysBone[b] = true;
+                    boneGroup[b]  = gi;
+                }
+
+            if (g.type == ChainGroupType::Cloth)
+            {
+                ringGroupOf[root] = g.ringGroup;
+                ringIndexOf[root] = g.ringIndex;
+            }
+        }
+    }
 
     // Step 3: Find chain roots (physics bones whose parent is NOT a physics bone)
     std::vector<uint32_t> hairRoots, skirtRoots;
@@ -272,6 +395,8 @@ void ChainPhysicsSystem::InitEntity(
             strand.particleOffset = static_cast<uint32_t>(data.particles.size());
             strand.particleCount  = static_cast<uint32_t>(chain.size());
             strand.ringIndex      = -1;
+            strand.groupIdx       = (boneGroup[root] >= 0)
+                                  ? static_cast<uint8_t>(boneGroup[root]) : 0xFF;
 
             for (size_t i = 0; i < chain.size(); ++i)
             {
@@ -290,20 +415,43 @@ void ChainPhysicsSystem::InitEntity(
     // Step 5: Build skirt strands
     // Parse Skirt_X_Y: group by X (constraint group), sort by Y (chain position in ring).
     // Each X group forms an independent ring of horizontal/shear constraints.
-    struct SkirtChainEntry { int group; int chain; std::vector<uint32_t> bones; };
+    struct SkirtChainEntry { int group; int chain; int srcGroup; std::vector<uint32_t> bones; };
     std::vector<SkirtChainEntry> skirtEntries;
 
     for (uint32_t root : skirtRoots)
     {
-        SkirtID sid = ParseSkirtID(skel.boneNames[root]);
-        if (sid.chain < 0) sid.chain = static_cast<int>(skirtEntries.size());
-
         std::vector<std::vector<uint32_t>> chains;
         std::vector<uint32_t> current;
         TraceChains(root, skel, isPhysBone, children, current, chains);
+        if (chains.empty()) continue;
 
-        if (chains.empty() || chains[0].size() < 2) continue;
-        skirtEntries.push_back({ sid.group, sid.chain, std::move(chains[0]) });
+        const int baseGroup = ringGroupOf[root];
+        const int baseChain = ringIndexOf[root];
+        const int srcGroup  = boneGroup[root]; // -1 in legacy
+
+        if (authored)
+        {
+            // Each leaf path traced from the root is one ring member. A single
+            // skirt group rooted at the panels' shared parent thus closes the
+            // whole ring; ringIndex (if set) offsets the around-ring order.
+            for (size_t ci = 0; ci < chains.size(); ++ci)
+            {
+                if (chains[ci].size() < 2) continue;
+                const int chainIdx = (baseChain >= 0)
+                    ? baseChain + static_cast<int>(ci)
+                    : static_cast<int>(skirtEntries.size());
+                skirtEntries.push_back({ baseGroup, chainIdx, srcGroup, std::move(chains[ci]) });
+            }
+        }
+        else
+        {
+            // Legacy: one chain per Skirt_X_Y root (verbatim).
+            if (chains[0].size() < 2) continue;
+            const int chainIdx = (baseChain >= 0)
+                ? baseChain
+                : static_cast<int>(skirtEntries.size());
+            skirtEntries.push_back({ baseGroup, chainIdx, srcGroup, std::move(chains[0]) });
+        }
     }
 
     // Sort by group first, then by chain index within group
@@ -331,6 +479,8 @@ void ChainPhysicsSystem::InitEntity(
         strand.particleOffset = static_cast<uint32_t>(data.particles.size());
         strand.particleCount  = static_cast<uint32_t>(entry.bones.size());
         strand.ringIndex      = entry.chain;
+        strand.groupIdx       = (entry.srcGroup >= 0)
+                              ? static_cast<uint8_t>(entry.srcGroup) : 0xFF;
 
         for (size_t i = 0; i < entry.bones.size(); ++i)
         {
@@ -364,6 +514,7 @@ void ChainPhysicsSystem::InitEntity(
             c.restLength = Distance3(data.particles[pA].position,
                                      data.particles[pB].position);
             c.stiffness  = 1.0f;
+            c.groupIdx   = strand.groupIdx;
 
             int group = i % 2; // 0 or 1
             data.constraintGroups[group].push_back(c);
@@ -408,6 +559,7 @@ void ChainPhysicsSystem::InitEntity(
                                              data.particles[pB].position);
                     h.stiffness  = 0.8f;
                     h.segmentT   = t;
+                    h.groupIdx   = cur->groupIdx;
                     data.constraintGroups[2 + (ci % 2)].push_back(h);
 
                     // Shear constraint (cross-level)
@@ -423,6 +575,7 @@ void ChainPhysicsSystem::InitEntity(
                                                  data.particles[pC].position);
                         s.stiffness  = 0.5f;
                         s.segmentT   = tShear;
+                        s.groupIdx   = cur->groupIdx;
                         data.constraintGroups[4 + (ci % 2)].push_back(s);
                     }
                 }
@@ -431,42 +584,35 @@ void ChainPhysicsSystem::InitEntity(
         data.groupCount = 6;
     }
 
-    // Step 7: Detect spring bones (single jiggle bones like Chest, Butt)
-    // First pass: collect all class-3 bones and detect chest L/R pairs.
-    struct SpringCandidate { uint32_t bone; bool isChest; };
-    std::vector<SpringCandidate> springCandidates;
-
-    // Detect "Chest" bones that share the same parent — eligible for virtual root.
-    std::vector<uint32_t> chestBones;
+    // Step 7: Build spring bones (single jiggle bones). Pairing comes from
+    // springPairId[] (legacy: chest bones sharing a parent; authored: Spring
+    // groups sharing pairGroupId). Bones sharing a pair value >= 2 collapse to a
+    // virtual midpoint root; everything else is an independent spring bone.
+    std::vector<uint32_t> springBoneIdx;
     for (uint32_t b = 0; b < skel.boneCount; ++b)
-    {
-        if (boneClass[b] != 3) continue;
-        std::string name(skel.boneNames[b]);
-        bool isChest = (name.find("Chest") != std::string::npos ||
-                        name.find("chest") != std::string::npos);
-        springCandidates.push_back({ b, isChest });
-        if (isChest) chestBones.push_back(b);
-    }
+        if (boneClass[b] == 3) springBoneIdx.push_back(b);
 
-    // Group chest bones by shared parent — a pair with the same parent gets a virtual root.
-    std::unordered_map<int32_t, std::vector<uint32_t>> chestByParent;
-    for (uint32_t cb : chestBones)
-        chestByParent[skel.parentIndex[cb]].push_back(cb);
+    // Group by pair id (>= 0 only). std::map for deterministic iteration order.
+    std::map<int, std::vector<uint32_t>> springByPair;
+    for (uint32_t b : springBoneIdx)
+        if (springPairId[b] >= 0) springByPair[springPairId[b]].push_back(b);
 
-    // Build a set of chest bones that will be reparented under a virtual root.
-    std::unordered_set<uint32_t> chestWithVirtualRoot;
-    for (auto& [parentIdx, group] : chestByParent)
-    {
+    // Bones that will live under a virtual root (pair groups of size >= 2).
+    std::unordered_set<uint32_t> pairedWithVirtual;
+    for (auto& [pid, group] : springByPair)
         if (group.size() >= 2)
-            chestWithVirtualRoot.insert(group.begin(), group.end());
-    }
+            pairedWithVirtual.insert(group.begin(), group.end());
 
-    // Create spring bones: virtual roots first, then children, then independent.
-    for (auto& [parentIdx, group] : chestByParent)
+    // Create virtual roots first, then their children.
+    for (auto& [pid, group] : springByPair)
     {
-        if (group.size() < 2) continue; // no pair, handled as independent below
+        if (group.size() < 2) continue; // lone pair member -> independent below
 
-        // Compute midpoint of all chest bones in this group.
+        // Virtual root's parent bone (for its world xform) = parent of the first
+        // group member (the shared parent in the legacy chest-pair case).
+        const int32_t parentIdx = skel.parentIndex[group[0]];
+
+        // Compute midpoint of all spring bones in this group.
         XMFLOAT3 midpoint = { 0.f, 0.f, 0.f };
         for (uint32_t cb : group)
         {
@@ -485,6 +631,8 @@ void ChainPhysicsSystem::InitEntity(
         root.velocity       = { 0.f, 0.f, 0.f };
         root.isVirtual      = true;
         root.parentBoneIndex = (parentIdx >= 0) ? static_cast<uint32_t>(parentIdx) : 0u;
+        root.groupIdx       = (boneGroup[group[0]] >= 0)
+                            ? static_cast<uint8_t>(boneGroup[group[0]]) : 0xFF;
         data.springBones.push_back(root);
 
         LOG_INFO("ChainPhysics: created virtual Chest_Root (parent bone %d) for %zu chest bones",
@@ -501,20 +649,24 @@ void ChainPhysicsSystem::InitEntity(
             child.velocity       = { 0.f, 0.f, 0.f };
             child.parentSpringIdx = rootIdx;
             child.offsetFromRoot  = { wp.x - midpoint.x, wp.y - midpoint.y, wp.z - midpoint.z };
+            child.groupIdx        = (boneGroup[cb] >= 0)
+                                  ? static_cast<uint8_t>(boneGroup[cb]) : 0xFF;
             data.springBones.push_back(child);
         }
     }
 
-    // Independent spring bones (non-paired chest or non-chest like Butt).
-    for (auto& sc : springCandidates)
+    // Independent spring bones (lone pair members + unpaired jiggle bones).
+    for (uint32_t b : springBoneIdx)
     {
-        if (chestWithVirtualRoot.count(sc.bone)) continue; // already handled above
+        if (pairedWithVirtual.count(b)) continue; // already a virtual-root child
 
         SpringBone sb;
-        sb.boneIndex      = sc.bone;
-        sb.restLocalPos   = { poses[sc.bone].pos.x, poses[sc.bone].pos.y, poses[sc.bone].pos.z };
-        sb.currentWorldPos = ComputeBindWorldPos(sc.bone, skel, poses);
+        sb.boneIndex      = b;
+        sb.restLocalPos   = { poses[b].pos.x, poses[b].pos.y, poses[b].pos.z };
+        sb.currentWorldPos = ComputeBindWorldPos(b, skel, poses);
         sb.velocity       = { 0.f, 0.f, 0.f };
+        sb.groupIdx       = (boneGroup[b] >= 0)
+                          ? static_cast<uint8_t>(boneGroup[b]) : 0xFF;
         data.springBones.push_back(sb);
     }
 
@@ -791,6 +943,11 @@ void ChainPhysicsSystem::SimulateSpringBones(
         }
     };
 
+    // Per-group override (or nullptr -> use the global spring params).
+    auto grpOvr = [&](uint8_t gi) -> const ChainGroupDef* {
+        return (gi < cfg.groups.size() && cfg.groups[gi].ovrEnabled) ? &cfg.groups[gi] : nullptr;
+    };
+
     // Pass 1: virtual roots — goal = midpoint of children's animation positions.
     for (size_t i = 0; i < data.springBones.size(); ++i)
     {
@@ -815,9 +972,13 @@ void ChainPhysicsSystem::SimulateSpringBones(
             goal.x *= inv; goal.y *= inv; goal.z *= inv;
         }
 
+        const ChainGroupDef* o = grpOvr(sb.groupIdx);
         simulateOne(sb, goal,
-                    cfg.springStiffness, cfg.springDamping,
-                    cfg.springMass, cfg.springGravity, cfg.springMaxDisp);
+                    o ? o->ovrSpringStiffness : cfg.springStiffness,
+                    o ? o->ovrSpringDamping   : cfg.springDamping,
+                    o ? o->ovrSpringMass      : cfg.springMass,
+                    o ? o->ovrSpringGravity   : cfg.springGravity,
+                    cfg.springMaxDisp);
     }
 
     // Pass 2: children of virtual roots — goal = root simulated pos + offset.
@@ -832,9 +993,13 @@ void ChainPhysicsSystem::SimulateSpringBones(
             parent.currentWorldPos.z + sb.offsetFromRoot.z
         };
 
+        const ChainGroupDef* o = grpOvr(sb.groupIdx);
         simulateOne(sb, goal,
-                    cfg.springChildStiffness, cfg.springChildDamping,
-                    cfg.springChildMass, cfg.springChildGravity, cfg.springChildMaxDisp);
+                    o ? o->ovrSpringStiffness : cfg.springChildStiffness,
+                    o ? o->ovrSpringDamping   : cfg.springChildDamping,
+                    o ? o->ovrSpringMass      : cfg.springChildMass,
+                    o ? o->ovrSpringGravity   : cfg.springChildGravity,
+                    cfg.springChildMaxDisp);
     }
 
     // Pass 3: independent spring bones (no virtual parent).
@@ -843,9 +1008,13 @@ void ChainPhysicsSystem::SimulateSpringBones(
         if (sb.isVirtual || sb.parentSpringIdx >= 0) continue;
 
         XMFLOAT3 goalWorld = ComputeBindWorldPos(sb.boneIndex, skel, poses);
+        const ChainGroupDef* o = grpOvr(sb.groupIdx);
         simulateOne(sb, goalWorld,
-                    cfg.springStiffness, cfg.springDamping,
-                    cfg.springMass, cfg.springGravity, cfg.springMaxDisp);
+                    o ? o->ovrSpringStiffness : cfg.springStiffness,
+                    o ? o->ovrSpringDamping   : cfg.springDamping,
+                    o ? o->ovrSpringMass      : cfg.springMass,
+                    o ? o->ovrSpringGravity   : cfg.springGravity,
+                    cfg.springMaxDisp);
     }
 }
 
@@ -971,9 +1140,13 @@ void ChainPhysicsSystem::Simulate(
         const float subDt = cdt / static_cast<float>(nSub);
         const bool  hasCapsules = capsules && capsuleCount > 0;
 
-        const float invN        = 1.0f / static_cast<float>(nSub);
-        const float hairDampSS  = std::powf(cfg.damping,      invN);
-        const float skirtDampSS = std::powf(cfg.skirtDamping,  invN);
+        const float invN = 1.0f / static_cast<float>(nSub);
+
+        // Per-group override (or nullptr -> the type-global params). Damping is
+        // substep-adjusted per strand below (powf), since each chain may differ.
+        auto grpOvr = [&](uint8_t gi) -> const ChainGroupDef* {
+            return (gi < cfg.groups.size() && cfg.groups[gi].ovrEnabled) ? &cfg.groups[gi] : nullptr;
+        };
 
         for (int sub = 0; sub < nSub; ++sub)
         {
@@ -990,9 +1163,13 @@ void ChainPhysicsSystem::Simulate(
             for (auto& strand : data.strands)
             {
                 const bool  isSkirt = (strand.type == StrandType::Skirt);
-                const float damp    = isSkirt ? skirtDampSS     : hairDampSS;
-                const float grav    = isSkirt ? cfg.skirtGravity : cfg.gravity;
-                const float maxV    = isLastSub
+                const ChainGroupDef* o = grpOvr(strand.groupIdx);
+                const float baseDamp = o ? o->ovrDamping
+                                         : (isSkirt ? cfg.skirtDamping : cfg.damping);
+                const float damp     = std::powf(baseDamp, invN);
+                const float grav     = o ? o->ovrGravity
+                                         : (isSkirt ? cfg.skirtGravity : cfg.gravity);
+                const float maxV     = isLastSub
                     ? (isSkirt ? cfg.skirtMaxVelocity : cfg.maxVelocity)
                     : 0.f;
 
@@ -1004,7 +1181,6 @@ void ChainPhysicsSystem::Simulate(
             {
                 for (int g = 0; g < data.groupCount; ++g)
                 {
-                    const float gs = (g < 2) ? cfg.stiffness : cfg.skirtStiffness;
                     const bool isHoriz = (g >= 2);
                     for (auto& c : data.constraintGroups[g])
                     {
@@ -1016,6 +1192,11 @@ void ChainPhysicsSystem::Simulate(
                         float dz = pB.position.z - pA.position.z;
                         float dist = std::sqrtf(dx*dx + dy*dy + dz*dz);
                         if (dist < 1e-6f) continue;
+
+                        // Per-group stiffness override, else the type-global.
+                        const ChainGroupDef* o = grpOvr(c.groupIdx);
+                        const float gs = o ? o->ovrStiffness
+                                            : ((g < 2) ? cfg.stiffness : cfg.skirtStiffness);
 
                         float error = (dist - c.restLength) / dist;
                         float stiffness = c.stiffness * gs * invN;
@@ -1041,7 +1222,12 @@ void ChainPhysicsSystem::Simulate(
         for (auto& strand : data.strands)
         {
             const bool isSkirt = (strand.type == StrandType::Skirt);
-            const float ls = isSkirt ? cfg.skirtLocalStiffness : cfg.localStiffness;
+            const ChainGroupDef* o = grpOvr(strand.groupIdx);
+            const float ls = o ? o->ovrLocalStiffness
+                               : (isSkirt ? cfg.skirtLocalStiffness : cfg.localStiffness);
+            // Floor for the root->tip falloff: keeps the whole chain holding its
+            // shape (short bang chains) instead of the tip going fully free.
+            const float tipHold = o ? std::min(std::max(o->ovrTipHold, 0.f), 1.f) : 0.f;
             if (ls <= 0.f) continue;
 
             const float chainLen = static_cast<float>(strand.particleCount);
@@ -1053,6 +1239,7 @@ void ChainPhysicsSystem::Simulate(
 
                 float t = static_cast<float>(i) / (chainLen - 1.f);
                 float falloff = (1.f - t) * (1.f - t);
+                if (falloff < tipHold) falloff = tipHold;
                 float blend = ls * falloff;
 
                 p.position.x += (restWorld.x - p.position.x) * blend;
@@ -1118,7 +1305,7 @@ void ChainPhysicsSystem::Update(World& world, float dt,
         auto it = m_entityData.find(e);
         if (it == m_entityData.end() || !it->second.initialized)
         {
-            InitEntity(e, skel, poses);
+            InitEntity(e, *phys, skel, poses);
             EntityData& d = m_entityData[e];
             LOG_INFO("ChainPhysics: RUNNING entity %u — damping=%.3f gravity=%.1f maxVel=%.2f stiffness=%.2f iter=%d strands=%zu particles=%zu springs=%zu",
                      e, phys->damping, phys->gravity, phys->maxVelocity,
@@ -1214,4 +1401,90 @@ void ChainPhysicsSystem::Update(World& world, float dt,
 void ChainPhysicsSystem::Invalidate(Entity e)
 {
     m_entityData.erase(e);
+}
+
+// ===========================================================================
+// GetBoneWorldMatrices  -  editor overlay query (read-only, per-frame cache)
+//
+// Returns the bone world matrices rebuilt every frame in Update() for an
+// initialized entity, or nullptr when no simulation data exists yet (e.g. the
+// frame right after Invalidate, before the next Update rebuilds the cache).
+// World position of bone b = (m._41, m._42, m._43) of matrices[b].
+// ===========================================================================
+const std::vector<DirectX::XMFLOAT4X4>*
+ChainPhysicsSystem::GetBoneWorldMatrices(Entity e) const
+{
+    auto it = m_entityData.find(e);
+    if (it == m_entityData.end()) return nullptr;
+    const EntityData& d = it->second;
+    if (!d.initialized || d.boneWorldMatCache.empty()) return nullptr;
+    return &d.boneWorldMatCache;
+}
+
+// ===========================================================================
+// BuildGroupsFromNames  -  editor "Auto-detect from bone names"
+//
+// Runs the legacy keyword classification (ClassifyBone / ParseSkirtID) once and
+// fills cfg.groups with explicit, editable ChainGroupDef entries that reproduce
+// the legacy runtime result: one Hair group per hair root, one SkirtRing group
+// per skirt root (ring ids copied verbatim from ParseSkirtID so the ring
+// topology + order are preserved), one Spring group per jiggle bone (chest
+// bones sharing a parent share a pairGroupId so they re-pair under a virtual
+// root). The keyword logic therefore lives in exactly one place.
+// ===========================================================================
+void ChainPhysicsSystem::BuildGroupsFromNames(const SkeletonAsset& skel,
+                                              ChainPhysicsComponent& cfg)
+{
+    cfg.groups.clear();
+
+    std::vector<int> boneClass(skel.boneCount, 0);
+    for (uint32_t b = 0; b < skel.boneCount; ++b)
+        boneClass[b] = ClassifyBone(skel.boneNames[b]);
+
+    auto isPhys = [&](int32_t b) {
+        return b >= 0 && static_cast<uint32_t>(b) < skel.boneCount && boneClass[b] != 0;
+    };
+    auto addGroup = [&](uint32_t root, ChainGroupType type,
+                        int ringG, int ringI, int pair)
+    {
+        if (cfg.groups.size() >= static_cast<size_t>(ChainPhysicsComponent::MAX_GROUPS)) return;
+        ChainGroupDef g{};
+        snprintf(g.name,     sizeof(g.name),     "%s", skel.boneNames[root]);
+        snprintf(g.rootBone, sizeof(g.rootBone), "%s", skel.boneNames[root]);
+        g.type        = type;
+        g.ringGroup   = ringG;
+        g.ringIndex   = ringI;
+        g.pairGroupId = pair;
+        cfg.groups.push_back(g);
+    };
+
+    // Hair + skirt: chain roots = phys bone whose parent is NOT a phys bone.
+    for (uint32_t b = 0; b < skel.boneCount; ++b)
+    {
+        if (boneClass[b] == 1 && !isPhys(skel.parentIndex[b]))
+            addGroup(b, ChainGroupType::Chain, 0, -1, -1);
+        else if (boneClass[b] == 2 && !isPhys(skel.parentIndex[b]))
+        {
+            SkirtID sid = ParseSkirtID(skel.boneNames[b]);
+            addGroup(b, ChainGroupType::Cloth, sid.group, sid.chain, -1);
+        }
+    }
+
+    // Spring: one group per class-3 bone; chest bones sharing a parent share a
+    // pairGroupId (encoded as the parent index) to recreate the virtual root.
+    for (uint32_t b = 0; b < skel.boneCount; ++b)
+    {
+        if (boneClass[b] != 3) continue;
+        std::string nm(skel.boneNames[b]);
+        const bool isChest = nm.find("Chest") != std::string::npos ||
+                             nm.find("chest") != std::string::npos;
+        const int pair = (isChest && skel.parentIndex[b] >= 0)
+                       ? skel.parentIndex[b] : -1;
+        addGroup(b, ChainGroupType::Spring, 0, -1, pair);
+    }
+
+    if (cfg.groups.size() >= static_cast<size_t>(ChainPhysicsComponent::MAX_GROUPS))
+        LOG_WARNING("ChainPhysics: BuildGroupsFromNames hit MAX_GROUPS (%d) — some chains "
+                    "were not captured; consolidate skirt panels under one root group + excludes.",
+                    ChainPhysicsComponent::MAX_GROUPS);
 }

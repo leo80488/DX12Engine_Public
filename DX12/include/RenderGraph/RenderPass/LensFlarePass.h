@@ -33,6 +33,11 @@ public:
     void SetDepthSourceSize(uint32_t w, uint32_t h) { m_depthW = w; m_depthH = h; }
     void SetViewportSize  (uint32_t w, uint32_t h)  { m_vpW = w; m_vpH = h; }
 
+    // Quarter-res cloud raymarch SRV (a = view-ray transmittance) — clouds
+    // don't write depth, so this is the only way the flare sees overcast.
+    // 0 = clouds didn't render this frame; occlusion falls back to depth-only.
+    void SetCloudSrvHandle(uint64_t h)   { m_cloudSrv = h; }
+
     void SetSun(const DirectX::XMFLOAT2& sunUV, bool sunBehind,
                 const DirectX::XMFLOAT3& sunColor)
     {
@@ -92,13 +97,14 @@ private:
         uint32_t ghostCount;
         float    streakWidth;
         float    occlusionRadius;
-        float    _pad0;
+        uint32_t cloudValid;
     };
     FrameCB<LensFlareCB> m_cb;
 
     // Per-frame inputs
     bool                m_enabled    = true;
     uint64_t            m_depthSrv   = 0;
+    uint64_t            m_cloudSrv   = 0;
     uint32_t            m_depthW     = 0;
     uint32_t            m_depthH     = 0;
     uint32_t            m_vpW        = 0;

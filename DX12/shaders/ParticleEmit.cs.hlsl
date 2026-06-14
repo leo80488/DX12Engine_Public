@@ -35,6 +35,7 @@ struct MeshDescriptor
     StreamDescriptor tangent;
     StreamDescriptor uv0;
     StreamDescriptor uv1;
+    StreamDescriptor color;   // must mirror RHI::MeshDescriptor / pvf_fetch.hlsli (112 B)
     uint indexBufferIndex;
     uint indexByteOffset;
     uint indexFormat;    // 0 = uint16, 1 = uint32

@@ -61,7 +61,8 @@ struct PSIn
     float3 wn        : NORMAL;
     float3 wt        : TANGENT;
     float3 wbt       : BINORMAL;
-    float3 col       : COLOR;
+    float3 col       : COLOR;       // per-vertex color (rgb; white when absent)
+    float2 uv1       : TEXCOORD3;   // second UV set (0,0 when absent)
     float4 curClip   : TEXCOORD1;   // current clip-space position
     float4 prevClip  : TEXCOORD2;   // previous clip-space position
 };
@@ -112,6 +113,13 @@ GOut main(PSIn i)
         baseColor *= g_AllTextures[texBaseColor].Sample(g_LinearWrap, i.uv);
     else
         baseColor *= g_BaseColor.Sample(g_LinearWrap, i.uv);
+
+    // Per-vertex color tint — opt-in per material (MaterialComponent::
+    // USE_VERTEXCOLORS). i.col is white for meshes without a color stream, so
+    // this is harmless there. Skipped on the fallback path, which already set
+    // baseColor = float4(i.col, 1) so vertex color isn't applied twice.
+    if (!useFallback && (mat.materialFlags & MAT_FLAG_USE_VERTEXCOLOR))
+        baseColor.rgb *= i.col;
 
 #if ALPHA_TEST
     // Ben Golus "Anti-aliased Alpha Test": rescale alpha so the threshold

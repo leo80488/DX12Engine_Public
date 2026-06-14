@@ -96,6 +96,11 @@ namespace Resource
         // GBuffer.vs synthesise the basis from the normal alone.
         bool GetHasTangent(Handle libHandle) const;
 
+        // Raw MeshLibraryMetadata::flags (MESHLIB_FLAG_*). MeshManager feeds
+        // this to ComputeMeshLibVertexLayout() to derive the per-stream
+        // (uv1 / color) byte offsets without duplicating the layout rules.
+        uint32_t GetMeshLibFlags(Handle libHandle) const;
+
         // Release every loaded library. Call before IGraphicsDevice::Shutdown.
         void Shutdown(IGraphicsDevice& gfx);
 
@@ -137,6 +142,9 @@ namespace Resource
             // libraries leave this false and rely on GBuffer.vs's synthesised
             // basis fallback.
             bool               hasTangent       = false;
+            // Raw MeshLibraryMetadata::flags (MESHLIB_FLAG_*). Drives per-stream
+            // offset computation (uv1/color) via ComputeMeshLibVertexLayout.
+            uint32_t           flags            = 0;
             // Path-dedup refcount: bumped by Load() on cache hit, decremented
             // by Release(); slot only freed when this reaches 0. Mirrors
             // TextureSystem's TextureEntry::refCount.

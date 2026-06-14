@@ -6,6 +6,7 @@
 // Compute root signature (space2):
 //   [0] cbuffer PerDispatch b0 space2
 //   [1] SRV t0 space2  — hardware depth (reverse-Z; 0 = far/sky, 1 = near)
+//   [2] SRV t1 space2  — cloud raymarch (a = view-ray transmittance)
 //   [4] UAV u0 space2  — output flare RGBA16F (overwrite)
 
 cbuffer PerDispatch : register(b0, space2)
@@ -30,10 +31,11 @@ cbuffer PerDispatch : register(b0, space2)
     uint   g_ghostCount;      // 0..8
     float  g_streakWidth;     // vertical thickness of streak
     float  g_occlusionRadius; // UV radius for depth taps
-    float  _pad0;
+    uint   g_cloudValid;      // 1 = g_cloud bound and rendered this frame
 };
 
 Texture2D<float>     g_depth  : register(t0, space2);
+Texture2D<float4>    g_cloud  : register(t1, space2);
 RWTexture2D<float4>  g_output : register(u0, space2);
 SamplerState         g_linear : register(s0, space2);
 
@@ -81,6 +83,29 @@ float SampleSunOcclusion(float2 sunUV)
     return visible / float(kTaps + 1);
 }
 
+// Volumetric clouds never write depth, so the depth test above sees clear
+// sky through full overcast. Sample the cloud raymarch's transmittance
+// (alpha; 1 = clear, 0 = opaque cloud) in the same small disc instead —
+// continuous, so the flare fades smoothly as a cloud edge crosses the sun.
+float SampleCloudTransmittance(float2 sunUV)
+{
+    if (g_cloudValid == 0u) return 1.0f;
+    if (any(sunUV < float2(0.0f, 0.0f)) || any(sunUV > float2(1.0f, 1.0f)))
+        return 1.0f;
+
+    const int kTaps = 8;
+    float tr = g_cloud.SampleLevel(g_linear, sunUV, 0).a;
+    [unroll]
+    for (int i = 0; i < kTaps; ++i)
+    {
+        float ang = 6.2831853f * (float(i) + 0.5f) / float(kTaps);
+        float2 uv = saturate(sunUV + float2(cos(ang), sin(ang))
+                                     * (g_occlusionRadius * 2.0f));
+        tr += g_cloud.SampleLevel(g_linear, uv, 0).a;
+    }
+    return tr / float(kTaps + 1);
+}
+
 [numthreads(8, 8, 1)]
 void CSMain(uint3 id : SV_DispatchThreadID)
 {
@@ -104,8 +129,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     float2 edge = min(g_sunUV, 1.0f - g_sunUV);
     float onScreen = saturate(min(edge.x, edge.y) / 0.10f + 0.05f);
 
-    // Depth-based occlusion (computed once per pixel — cheap, fully unrolled tap loop).
-    float occ = SampleSunOcclusion(g_sunUV);
+    // Depth-based occlusion (computed once per pixel — cheap, fully unrolled
+    // tap loop), attenuated by cloud transmittance at the sun.
+    float occ = SampleSunOcclusion(g_sunUV) * SampleCloudTransmittance(g_sunUV);
 
     float intensity = g_intensity * onScreen * occ;
     if (intensity <= 1e-4f)

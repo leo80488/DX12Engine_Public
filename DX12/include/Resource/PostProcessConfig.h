@@ -1,11 +1,16 @@
 #pragma once
 
-// PostProcessConfig — a single POD snapshot of every user-tunable
-// post-processing parameter exposed in the editor. Persists as a .ippc file
-// (line-based text, same formatting conventions as .iscene / .ipfb). A Scene
-// asset can reference a .ippc by path so that loading the scene restores its entire
-// look (bloom strength, exposure curve, AO parameters, volumetric fog,
-// atmosphere / time-of-day, color grading, outline settings, …).
+// PostProcessConfig — a single POD snapshot of the non-volume render features
+// exposed in the editor. Persists as a .ippc file (line-based text, same
+// formatting conventions as .iscene / .ipfb). A Scene asset can reference a
+// .ippc by path so that loading the scene restores its AO / volumetric fog /
+// atmosphere / outline settings.
+//
+// NOTE: the post-process LOOK (CAS, auto-exposure, bloom, tonemap, color
+// grading, lens flare) is owned by the volume/profile system now — it lives in
+// the engine-default PostProcessProfile (.ppprofile) referenced by the scene,
+// NOT here. This struct only carries render features that are not part of the
+// post-process volume blend.
 //
 // Usage:
 //   Save:  PostProcessConfig cfg; cfg.CaptureFrom(renderer); Save(cfg, path);
@@ -14,7 +19,6 @@
 // Missing keys in the file keep their C++ defaults, so older configs continue
 // to work after new fields are added.
 
-#include "RenderGraph/RenderPass/ColorGradingParams.h"
 #include <DirectXMath.h>
 #include <cstdint>
 #include <string>
@@ -25,30 +29,10 @@ namespace Resource
 {
     struct PostProcessConfig
     {
-        // ---- CASPass -------------------------------------------------------
-        bool  casEnabled     = true;
-        float casSharpness   = 0.6f;
-
-        // ---- ToneMapPass ---------------------------------------------------
-        float              bloomStrength         = 0.04f;
-        bool               colorGradingEnabled   = true;
-        ColorGradingParams grading;
-
-        // ---- AutoExposurePass ----------------------------------------------
-        bool  autoExposureEnabled = true;
-        float manualExposure      = 1.0f;   // used when autoExposureEnabled = false
-        // Tonemapping response time constant (seconds). Adapter derives per-
-        // frame rate as 1 - exp(-dt/tau). Replaces the old adaptationRate
-        // field (rate is now derived, not stored).
-        float adaptationTau  = 1.5f;
-        float minLogLuma     = -5.0f;
-        float maxLogLuma     =  3.5f;
-        float lowPercent     = 0.50f;
-        float highPercent    = 0.85f;
-        float minExposure    = 0.10f;
-        float maxExposure    = 8.0f;
-        float evBias         = 0.0f;
-        float keyValue       = 0.18f;
+        // ---- Engine-default PostProcessProfile (.ppprofile) ----------------
+        // The base post-process look for the scene (volume system's blend base).
+        // Loaded into PostProcess::ProfileSystem::EngineDefault() by ApplyTo().
+        std::string engineProfilePath;
 
         // ---- XeGTAOPass ----------------------------------------------------
         bool     ssaoEnabled                = true;  // Renderer-level toggle

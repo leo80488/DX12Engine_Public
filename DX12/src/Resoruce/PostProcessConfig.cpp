@@ -2,8 +2,8 @@
 #include "Resource/AssetFS.h"
 
 #include "Graphics/Renderer.h"
-#include "PostProcess/PostProcessStack.h"
-#include "PostProcess/ParameterStore.h"
+#include "PostProcess/ProfileSystem.h"
+#include "PostProcess/PostProcessProfileSerializer.h"
 #include "RenderGraph/RenderPass/XeGTAOPass.h"
 #include "RenderGraph/RenderPass/OutlinePass.h"
 #include "RenderGraph/RenderPass/VolumetricFogPass.h"
@@ -59,6 +59,41 @@ namespace
         return v;
     }
 
+    // Percent-encode spaces/percent so a path survives the whitespace-tokenized
+    // line parser. Mirrors the SceneSerializer convention.
+    std::string PercentEncode(const std::string& s)
+    {
+        std::string o;
+        for (char c : s)
+        {
+            if (c == '%')      o += "%25";
+            else if (c == ' ') o += "%20";
+            else               o += c;
+        }
+        return o;
+    }
+    std::string PercentDecode(const std::string& s)
+    {
+        std::string o;
+        for (size_t i = 0; i < s.size(); ++i)
+        {
+            if (s[i] == '%' && i + 2 < s.size())
+            {
+                const std::string h = s.substr(i + 1, 2);
+                if (h == "25") { o += '%'; i += 2; continue; }
+                if (h == "20") { o += ' '; i += 2; continue; }
+            }
+            o += s[i];
+        }
+        return o;
+    }
+    std::string GetStr(const std::unordered_map<std::string, std::string>& m,
+                       const char* key, const std::string& def)
+    {
+        auto it = m.find(key);
+        return (it == m.end()) ? def : PercentDecode(it->second);
+    }
+
     bool ParseLine(const std::string& line, KV& out)
     {
         std::istringstream ls(line);
@@ -82,35 +117,10 @@ void Resource::PostProcessConfig::CaptureFrom(const Renderer& rc)
 {
     Renderer& r = const_cast<Renderer&>(rc); // accessors are non-const
 
-    // CAS / Tonemapping / AutoExposure now live in the PostProcess::Stack's
-    // ParameterStore — that's the authoritative source, so capture from
-    // there instead of per-pass getters.
-    if (const auto* stack = r.GetPostProcessStack())
-    {
-        const auto& params = stack->GetParameters();
-
-        const auto& cas = params.GetCAS();
-        casEnabled   = cas.enabled;
-        casSharpness = cas.sharpness;
-
-        const auto& tm = params.GetTonemapping();
-        bloomStrength       = tm.bloomStrength;
-        colorGradingEnabled = tm.colorGradingEnabled;
-        grading             = tm.grading;
-
-        const auto& ae = params.GetAutoExposure();
-        autoExposureEnabled = ae.enabled;
-        manualExposure      = ae.manualExposure;
-        adaptationTau       = ae.adaptationTau;
-        minLogLuma          = ae.minLogLuma;
-        maxLogLuma          = ae.maxLogLuma;
-        lowPercent          = ae.lowPercent;
-        highPercent         = ae.highPercent;
-        minExposure         = ae.minExposure;
-        maxExposure         = ae.maxExposure;
-        evBias              = ae.evBias;
-        keyValue            = ae.keyValue;
-    }
+    // NOTE: the post-process look (CAS / tonemap / auto-exposure / color
+    // grading / lens flare) lives in the engine-default PostProcessProfile now,
+    // serialized separately to a .ppprofile. This config only carries the
+    // non-volume render features below.
 
     if (auto* gt = r.GetXeGTAOPass())
     {
@@ -164,31 +174,14 @@ void Resource::PostProcessConfig::CaptureFrom(const Renderer& rc)
 
 void Resource::PostProcessConfig::ApplyTo(Renderer& r) const
 {
-    if (auto* stack = r.GetPostProcessStack())
+    // Restore the base post-process look into the engine-default profile.
+    // Reset to shipping defaults first, then overlay the file's overrides, so a
+    // profile that only overrides a few properties leaves the rest at default.
+    if (!engineProfilePath.empty())
     {
-        auto& params = stack->GetParameters();
-
-        auto& cas      = params.GetCAS();
-        cas.enabled    = casEnabled;
-        cas.sharpness  = casSharpness;
-
-        auto& tm                = params.GetTonemapping();
-        tm.bloomStrength        = bloomStrength;
-        tm.colorGradingEnabled  = colorGradingEnabled;
-        tm.grading              = grading;
-
-        auto& ae            = params.GetAutoExposure();
-        ae.enabled          = autoExposureEnabled;
-        ae.manualExposure   = manualExposure;
-        ae.adaptationTau    = adaptationTau;
-        ae.minLogLuma       = minLogLuma;
-        ae.maxLogLuma       = maxLogLuma;
-        ae.lowPercent       = lowPercent;
-        ae.highPercent      = highPercent;
-        ae.minExposure      = minExposure;
-        ae.maxExposure      = maxExposure;
-        ae.evBias           = evBias;
-        ae.keyValue         = keyValue;
+        auto& def = PostProcess::ProfileSystem::Get().EngineDefault();
+        def = PostProcess::MakeEngineDefaultProfile();
+        PostProcess::LoadProfile(engineProfilePath, def);
     }
 
     r.SetSSAOEnabled(ssaoEnabled);
@@ -252,40 +245,8 @@ bool Resource::SavePostProcessConfig(const PostProcessConfig& c, const std::stri
 
     char buf[512];
 
-    snprintf(buf, sizeof(buf),
-        "CAS enabled=%u sharpness=%.6f\n",
-        c.casEnabled ? 1u : 0u, c.casSharpness);
-    ss << buf;
-
-    snprintf(buf, sizeof(buf),
-        "ToneMap bloomStrength=%.6f colorGradingEnabled=%u"
-        " exposure=%.6f contrast=%.6f brightness=%.6f"
-        " liftR=%.6f liftG=%.6f liftB=%.6f"
-        " gammaR=%.6f gammaG=%.6f gammaB=%.6f"
-        " gainR=%.6f gainG=%.6f gainB=%.6f"
-        " hueShift=%.6f saturation=%.6f vibrance=%.6f"
-        " temperature=%.6f tint=%.6f"
-        " vignette=%.6f grain=%.6f\n",
-        c.bloomStrength, c.colorGradingEnabled ? 1u : 0u,
-        c.grading.exposure, c.grading.contrast, c.grading.brightness,
-        c.grading.lift.x, c.grading.lift.y, c.grading.lift.z,
-        c.grading.gamma.x, c.grading.gamma.y, c.grading.gamma.z,
-        c.grading.gain.x, c.grading.gain.y, c.grading.gain.z,
-        c.grading.hueShift, c.grading.saturation, c.grading.vibrance,
-        c.grading.temperature, c.grading.tint,
-        c.grading.vignetteStrength, c.grading.filmGrain);
-    ss << buf;
-
-    snprintf(buf, sizeof(buf),
-        "AutoExp enabled=%u manual=%.6f adaptTau=%.6f"
-        " minLogLuma=%.6f maxLogLuma=%.6f"
-        " lowPct=%.6f highPct=%.6f minExp=%.6f maxExp=%.6f"
-        " evBias=%.6f keyValue=%.6f\n",
-        c.autoExposureEnabled ? 1u : 0u, c.manualExposure,
-        c.adaptationTau, c.minLogLuma, c.maxLogLuma,
-        c.lowPercent, c.highPercent, c.minExposure, c.maxExposure,
-        c.evBias, c.keyValue);
-    ss << buf;
+    if (!c.engineProfilePath.empty())
+        ss << "Profile path=" << PercentEncode(c.engineProfilePath) << "\n";
 
     snprintf(buf, sizeof(buf),
         "GTAO enabled=%u radius=%.6f falloff=%.6f finalPower=%.6f"
@@ -351,48 +312,9 @@ bool Resource::LoadPostProcessConfig(const std::string& path, PostProcessConfig&
         if (!ParseLine(line, kv)) continue;
         const auto& m = kv.map;
 
-        if (kv.tag == "CAS")
+        if (kv.tag == "Profile")
         {
-            out.casEnabled   = GetB(m, "enabled",   out.casEnabled);
-            out.casSharpness = GetF(m, "sharpness", out.casSharpness);
-        }
-        else if (kv.tag == "ToneMap")
-        {
-            out.bloomStrength        = GetF(m, "bloomStrength", out.bloomStrength);
-            out.colorGradingEnabled  = GetB(m, "colorGradingEnabled", out.colorGradingEnabled);
-            out.grading.exposure     = GetF(m, "exposure",   out.grading.exposure);
-            out.grading.contrast     = GetF(m, "contrast",   out.grading.contrast);
-            out.grading.brightness   = GetF(m, "brightness", out.grading.brightness);
-            out.grading.lift.x       = GetF(m, "liftR",  out.grading.lift.x);
-            out.grading.lift.y       = GetF(m, "liftG",  out.grading.lift.y);
-            out.grading.lift.z       = GetF(m, "liftB",  out.grading.lift.z);
-            out.grading.gamma.x      = GetF(m, "gammaR", out.grading.gamma.x);
-            out.grading.gamma.y      = GetF(m, "gammaG", out.grading.gamma.y);
-            out.grading.gamma.z      = GetF(m, "gammaB", out.grading.gamma.z);
-            out.grading.gain.x       = GetF(m, "gainR",  out.grading.gain.x);
-            out.grading.gain.y       = GetF(m, "gainG",  out.grading.gain.y);
-            out.grading.gain.z       = GetF(m, "gainB",  out.grading.gain.z);
-            out.grading.hueShift     = GetF(m, "hueShift",     out.grading.hueShift);
-            out.grading.saturation   = GetF(m, "saturation",   out.grading.saturation);
-            out.grading.vibrance     = GetF(m, "vibrance",     out.grading.vibrance);
-            out.grading.temperature  = GetF(m, "temperature",  out.grading.temperature);
-            out.grading.tint         = GetF(m, "tint",         out.grading.tint);
-            out.grading.vignetteStrength = GetF(m, "vignette", out.grading.vignetteStrength);
-            out.grading.filmGrain    = GetF(m, "grain",        out.grading.filmGrain);
-        }
-        else if (kv.tag == "AutoExp")
-        {
-            out.autoExposureEnabled = GetB(m, "enabled",    out.autoExposureEnabled);
-            out.manualExposure      = GetF(m, "manual",     out.manualExposure);
-            out.adaptationTau  = GetF(m, "adaptTau",    out.adaptationTau);
-            out.minLogLuma     = GetF(m, "minLogLuma",  out.minLogLuma);
-            out.maxLogLuma     = GetF(m, "maxLogLuma",  out.maxLogLuma);
-            out.lowPercent     = GetF(m, "lowPct",      out.lowPercent);
-            out.highPercent    = GetF(m, "highPct",     out.highPercent);
-            out.minExposure    = GetF(m, "minExp",      out.minExposure);
-            out.maxExposure    = GetF(m, "maxExp",      out.maxExposure);
-            out.evBias         = GetF(m, "evBias",      out.evBias);
-            out.keyValue       = GetF(m, "keyValue",    out.keyValue);
+            out.engineProfilePath = GetStr(m, "path", out.engineProfilePath);
         }
         else if (kv.tag == "GTAO")
         {

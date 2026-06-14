@@ -23,7 +23,13 @@ uint64_t PSODesc::Hash() const noexcept
     //            were not zero-initialised in stack-allocated PSODescs; that
     //            made cache_key non-deterministic across runs and caused
     //            pso_cache.bin to grow on every launch.
-    constexpr uint64_t kRootSigVersion = 4ull;
+    //   v4 → v5: added graphics root param 46 (t41 space0 — point-light cube
+    //            shadow atlas, PointShadowPass). The old 46-param sig is a
+    //            forward-compatible prefix so solid PSOs from a stale cache
+    //            still draw, but feeding a stale (old-sig) PSO to the PSO
+    //            library's LoadGraphicsPipeline with the new sig crashes the
+    //            debug layer — bumping this purges those entries by name.
+    constexpr uint64_t kRootSigVersion = 5ull;
 
     uint64_t h = 14695981039346656037ull;
     h ^= kRootSigVersion; h *= kPrime;

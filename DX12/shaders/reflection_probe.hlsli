@@ -19,14 +19,16 @@
 //
 // Probe struct layout MIRRORS the C++ side — see
 // include/Graphics/ReflectionProbeTypes.h (Reflection::GPUReflectionProbe,
-// 48 bytes). Edit all three together.
+// 64 bytes). Edit all three copies together (here + ClusterCullProbes.cs.hlsl
+// + the C++ struct).
 
 struct ReflectionProbe
 {
     float3 position;        float influenceRadius;
     float3 boxMin;          uint   cubemapSlice;
     float3 boxMax;          uint   flags;
-    float3 innerExtents;    float  pad0;
+    // intensity = per-probe radiance multiplier, independent of iblStrength.
+    float3 innerExtents;    float  intensity;
 };
 
 TextureCubeArray<float4>          gReflectionProbeArray : register(t23, space0);

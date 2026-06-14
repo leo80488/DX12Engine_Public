@@ -60,6 +60,23 @@ public:
         // sky shader) and SkyIBLPass's currently active sky cubemap SRV.
         const RHI::GPUBuffer*   skyCubeVB          = nullptr;
         uint64_t                skyCubemapSrv      = 0;        // t6 space0
+
+        // ---- Direct-sun shadowing for the bake (optional) -----------------
+        // When shadowArraySrv != 0 the capture PS shadows the direct sun using
+        // the main camera's CSM, so roofed interiors don't bake full sunlight.
+        // Cascades are camera-relative, so a probe far outside the camera's
+        // cascade range simply bakes unshadowed (graceful fallback). All values
+        // are frame-global (identical for every probe baked this frame).
+        uint64_t                shadowArraySrv     = 0;        // CSM Texture2DArray @ t9 space0 (root slot 22)
+        DirectX::XMFLOAT4X4     cascadeVP[4]       {};         // transposed (matches LightCB.shadowMatrix)
+        DirectX::XMFLOAT4       cascadeSplits      { 0,0,0,0 };
+        DirectX::XMFLOAT3       camPos             { 0,0,0 };   // main camera (cascade selection)
+        DirectX::XMFLOAT3       camFwd             { 0,0,1 };
+        float                   shadowStrength     = 0.0f;     // 0 = no CSM this frame → bake unshadowed
+
+        // ---- Indirect/ambient bake controls -------------------------------
+        float                   iblStrength        = 1.0f;     // live sky-IBL master at bake time
+        float                   ambientScale       = 1.0f;     // IndirectLightingSettings.reflectionProbeBakeAmbient
     };
 
     bool Init(IGraphicsDevice& gfx);
@@ -98,7 +115,15 @@ private:
     RHI::GPUBuffer m_prefilterCB;
     void*          m_prefilterCBMapped = nullptr;
 
+    // Per-probe shadow/ambient CB (b2). Frame-global data (CSM cascades, camera,
+    // iblStrength, ambientScale) — uploaded once per BakeProbe, bound on each
+    // face. Single buffer is safe because the data is identical for every probe
+    // baked in a frame.
+    RHI::GPUBuffer m_shadowCB;
+    void*          m_shadowCBMapped = nullptr;
+
     int m_linearSamplerIdx = -1;
+    int m_shadowSamplerIdx = -1;  // comparison sampler at s2 (reversed-Z CSM)
 
     void DrawSceneFace(RHI::CommandList cl, uint32_t face, const BakeContext& ctx);
 };

@@ -150,7 +150,7 @@ GOut main(PSIn i)
     o.albedo   = float4(albedoOut + keepAlive.xxx, baseCol.a * AlphaScale);
     o.normal   = float4(N * 0.5 + 0.5, matIdxEnc);
     o.surface  = float4(roughness, metalness, ao, reflect_);
-    o.velocity = (curNDC - prevNDC) * 0.5;
+    o.velocity = curNDC - prevNDC;   // raw NDC delta, matches GBuffer.ps
     o.extra    = float4(0, 0, 0, 0);
     o.sceneCol = float4(emis, 1.0);
     return o;

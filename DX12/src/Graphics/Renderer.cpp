@@ -19,6 +19,8 @@
 #include "RenderGraph/RenderPass/DDGIProbeDebugPass.h"
 #include "RenderGraph/RenderPass/GBufferPass.h"
 #include "RenderGraph/RenderPass/TerrainPass.h"
+#include "RenderGraph/RenderPass/GrassPass.h"
+#include "RenderGraph/RenderPass/WaterPass.h"
 #include "RenderGraph/RenderPass/LightingPass.h"
 #include "RenderGraph/RenderPass/PickingPass.h"
 #include "RenderGraph/RenderPass/SkyboxPass.h"
@@ -32,6 +34,9 @@
 #include "RenderGraph/RenderPass/FXAAPass.h"
 #include "RenderGraph/RenderPass/XeGTAOPass.h"
 #include "RenderGraph/RenderPass/CASPass.h"
+#include "RenderGraph/RenderPass/UnderwaterPass.h"
+#include "RenderGraph/RenderPass/DepthOfFieldPass.h"
+#include "RenderGraph/RenderPass/StylizePass.h"
 #include "RenderGraph/RenderPass/GlassShatterPass.h"
 #include "RenderGraph/RenderPass/SkyIBLPass.h"
 #include "RenderGraph/RenderPass/VolumetricFogPass.h"
@@ -42,11 +47,13 @@
 #include "RenderGraph/RenderPass/DecalPass.h"
 #include "RenderGraph/RenderPass/ReflectionProbeCapturePass.h"
 #include "RenderGraph/RenderPass/SpotShadowPass.h"
+#include "RenderGraph/RenderPass/PointShadowPass.h"
 #include "RenderGraph/RenderPass/ParticlePasses.h"
 #include "RenderGraph/RenderPass/TracerPasses.h"
 #include "RenderGraph/RenderPass/BeamSimPass.h"
 #include "RenderGraph/RenderPass/AfterimageCapturePass.h"
 #include "RenderGraph/RenderPass/TrailPasses.h"
+#include "RenderGraph/RenderPass/BillboardFXPass.h"
 #include "RenderGraph/RenderPass/CullingPass.h"
 #include "RenderGraph/RenderPass/HiZPass.h"
 #include "RenderGraph/RenderPass/SSRPass.h"
@@ -57,14 +64,14 @@
 #include "RenderGraph/RenderPass/WorldUIBillboardPass.h"
 #include "RenderGraph/RenderPass/DebugIconPass.h"
 #include "RenderGraph/RenderPass/CloudPass.h"
+#include "RenderGraph/RenderPass/HeightFogPass.h"
 #include "RenderGraph/RenderPass/VideoPass.h"
 #include "RenderGraph/RenderPass/VideoQuadPass.h"
 
 // post-process
 #include "PostProcess/PostProcessStack.h"
 #include "PostProcess/BuiltinPostProcessEffects.h"
-#include "PostProcess/VolumeSystem.h"
-#include "PostProcess/EntityVolumeSource.h"
+#include "PostProcess/PostProcessRuntime.h"
 
 // ECS components + systems
 #include "ECS/ECS.h"
@@ -115,8 +122,10 @@ using namespace DirectX;
 using PerViewCB       = RendererDetail::PerViewCB;
 using LightCB         = RendererDetail::LightCB;
 using TerrainParamsCB = RendererDetail::TerrainParamsCB;
-static_assert(sizeof(TerrainParamsCB) == 336,
-    "TerrainParamsCB layout drift — sync Terrain.{ms,ps,as}.hlsl + Renderer.h");
+static_assert(sizeof(TerrainParamsCB) == 176,
+    "TerrainParamsCB layout drift — sync Terrain.{ms,as,ps,shadow.ms,shadow.as}.hlsl + Renderer.h");
+static_assert(sizeof(RendererDetail::TerrainLayerGPU) == 48,
+    "TerrainLayerGPU stride drift — sync StructuredBuffer<TerrainLayerGPU> in Terrain.ps.hlsl");
 
 // ---------------------------------------------------------------------------
 Renderer::Renderer(IGraphicsDevice& gfx) : m_gfx(gfx) {}
@@ -143,6 +152,7 @@ Renderer::~Renderer()
     {
         if (m_instanceBufferMapped[i])  m_gfx.UnmapBuffer(m_instanceBuffer[i]);
         if (m_spotShadowVPMapped[i])    m_gfx.UnmapBuffer(m_spotShadowVPBuffer[i]);
+        if (m_terrainLayerMapped[i])    m_gfx.UnmapBuffer(m_terrainLayerBuffer[i]);
         if (m_indirectArgMapped[i])     m_gfx.UnmapBuffer(m_indirectArgUpload[i]);
         if (m_drawCountMapped[i])       m_gfx.UnmapBuffer(m_drawCountUpload[i]);
         if (m_materialBufferMapped[i])  m_gfx.UnmapBuffer(m_materialBuffer[i]);
@@ -160,7 +170,7 @@ Renderer::~Renderer()
                 if (entry.handle != Resource::kInvalidTextureHandle)
                     m_texSys->Release(entry.handle, m_gfx);
 
-        // Release terrain textures (heightmap + splatmap + 4 layers × 4 maps per entity).
+        // Release terrain textures (heightmap + splatmap + N layers × 3 maps per entity).
         for (auto& [entity, cache] : m_terrainTexCache)
         {
             auto rel = [&](TerrainTexSlot& slot) {
@@ -177,6 +187,12 @@ Renderer::~Renderer()
                 rel(l.disp);
             }
         }
+
+        // Release water flow-normal map handles.
+        if (m_waterNormalA.handle != Resource::kInvalidTextureHandle)
+            m_texSys->Release(m_waterNormalA.handle, m_gfx);
+        if (m_waterNormalB.handle != Resource::kInvalidTextureHandle)
+            m_texSys->Release(m_waterNormalB.handle, m_gfx);
 
         // Release skybox IBL texture handles.
         for (auto& entry : m_skyboxTexCache)
@@ -207,8 +223,12 @@ void Renderer::Compile()
         { RHI::Format::R16G16B16A16_FLOAT,  0, 0, false, true,  L"GBuffer1_Normal"   });
     m_surfaceHandle  = m_graph.CreateTexture("GBuffer2_Surface",
         { RHI::Format::R8G8B8A8_UNORM,     0, 0, false, true,  L"GBuffer2_Surface"  });
+    // D32_FLOAT_S8X24: float depth so reversed-Z actually pays off — D24_UNORM's
+    // uniform quantization hit ~0.5 wu of error at 900 m (far-distance SSR holes,
+    // shadow/contact artifacts). Stencil plane retained for Outline/TAA. Every
+    // graphics PSO's dsvFormat must match this format.
     m_depthHandle    = m_graph.CreateTexture("GBuffer_Depth",
-        { RHI::Format::D24_UNORM_S8_UINT,  0, 0, true,  false, L"GBuffer_Depth"     });
+        { RHI::Format::D32_FLOAT_S8X24_UINT, 0, 0, true, false, L"GBuffer_Depth"    });
     m_velocityHandle = m_graph.CreateTexture("GBuffer3_Velocity",
         // isSRV=true: velocity is read as an SRV by TAA / XeGTAO / SSR (outside
         // the graph, via direct SRV handles), so it needs SHADER_RESOURCE + an
@@ -217,6 +237,16 @@ void Renderer::Compile()
         { RHI::Format::R16G16_FLOAT,        0, 0, false, false, L"GBuffer3_Velocity", /*isSRV*/true });
     m_emissiveHandle = m_graph.CreateTexture("GBuffer4_Emissive",
         { RHI::Format::R16G16B16A16_FLOAT,  0, 0, false, false, L"GBuffer4_Emissive" });
+    // Depth snapshot taken AFTER terrain/meshes but BEFORE GrassPass. The SSR
+    // depth HIERARCHY is built from this so thin grass blades overlapping the
+    // water on screen don't act as Hi-Z blockers (the walker used to converge
+    // on every blade tip; the 16-step finish trace couldn't clear the blade
+    // band and the fall-through thickness check killed the ray — a bright
+    // sky band "truncated" reflections behind every grass silhouette). The
+    // trace's per-pixel gDepth (origins + finish refinement) stays the MAIN
+    // depth, which water/grass do write.
+    m_ssrTraceDepthHandle = m_graph.CreateTexture("SSRTraceDepth",
+        { RHI::Format::D32_FLOAT_S8X24_UINT, 0, 0, true, false, L"SSRTraceDepth", /*isSRV*/true });
 
     // ---- Register passes — each owns its ShaderLibrary + PSOCache ----------
     // ShadowSystem owns cascade math; ShadowPass runs standalone (own CL + Texture2DArray).
@@ -248,6 +278,50 @@ void Renderer::Compile()
             m_shadowPass->SetTerrainPass(m_terrainPass);
     }
     {
+        // SSRTraceDepth snapshot: copy the depth as it stands after opaque
+        // meshes + terrain, BEFORE GrassPass stamps its blades. The SSR
+        // subsystem builds its Hi-Z march pyramid from this copy so rays from
+        // water pixels pass straight through the blade band at the grass
+        // silhouette instead of being blocked (grass is simply absent from
+        // reflections). Both textures are declared SRV reads, so the graph
+        // has them in DEPTH_READ_SRV at pass entry; the manual barriers
+        // below net out to identity, keeping graph state tracking coherent.
+        m_graph.AddPass("SSRTraceDepthSnapshot",
+            [depth = m_depthHandle, snap = m_ssrTraceDepthHandle](RG::RenderGraphBuilder& b)
+            {
+                b.ReadSRV(depth);
+                b.ReadSRV(snap);
+                b.SetColorTarget(RG::BuiltinTexture::None);
+            },
+            [this](RHI::CommandList& cl)
+            {
+                const RHI::Texture* src = m_graph.GetPhysicalTexture(m_depthHandle);
+                const RHI::Texture* dst = m_graph.GetPhysicalTexture(m_ssrTraceDepthHandle);
+                if (!src || !dst) return;
+                m_gfx.PushBarrier(RHI::GPUBarrier::Image(src,
+                    RHI::ResourceState::DEPTH_READ_SRV, RHI::ResourceState::COPY_SRC), cl);
+                m_gfx.PushBarrier(RHI::GPUBarrier::Image(dst,
+                    RHI::ResourceState::DEPTH_READ_SRV, RHI::ResourceState::COPY_DST), cl);
+                // Depth plane only (mip 0 / slice 0 / plane 0) — the stencil
+                // plane is never read through this copy.
+                m_gfx.CopyTextureSubresource(*src, 0, 0, *dst, 0, 0, cl);
+                m_gfx.PushBarrier(RHI::GPUBarrier::Image(src,
+                    RHI::ResourceState::COPY_SRC, RHI::ResourceState::DEPTH_READ_SRV), cl);
+                m_gfx.PushBarrier(RHI::GPUBarrier::Image(dst,
+                    RHI::ResourceState::COPY_DST, RHI::ResourceState::DEPTH_READ_SRV), cl);
+            });
+    }
+    {
+        // GrassPass: GoT-style procedural grass blades. Writes the same GBuffer
+        // right after TerrainPass so blades depth-test against the terrain
+        // surface they grow from. Self-disables w/o mesh-shader support or
+        // when no GrassComponent is armed (dispatchAsGroupCount == 0).
+        auto pass = std::make_unique<GrassPass>(
+            m_albedoHandle, m_normalHandle, m_surfaceHandle, m_depthHandle, m_velocityHandle, m_emissiveHandle);
+        m_grassPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
         // Compute-only env-cube → SH projection. Must precede LightingPass (PS samples SH buffer).
         auto pass = std::make_unique<SkyIBLPass>();
         m_skyIBLPass = pass.get();
@@ -257,6 +331,12 @@ void Renderer::Compile()
         // Spot shadow atlas. Must precede LightingPass + VolumetricFogPass (both sample its depth).
         auto pass = std::make_unique<SpotShadowPass>();
         m_spotShadowPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // Point-light omnidirectional cube shadow atlas. Must precede LightingPass.
+        auto pass = std::make_unique<PointShadowPass>();
+        m_pointShadowPass = pass.get();
         m_graph.AddPass(std::move(pass));
     }
     {
@@ -284,10 +364,50 @@ void Renderer::Compile()
         m_graph.AddPass(std::move(pass));
     }
     {
+        // WaterPass: forward Fresnel + flow-normal water surface. After Skybox
+        // (sky behind the water exists in HDR) and before clouds/fog so both
+        // composite above the surface; depth WRITE so they treat it as real
+        // geometry. Also stamps GBuffer normal+surface so the post-frame SSR
+        // chain traces wavy reflections off the water (composite adds them
+        // onto HDR the same frame). Self-skips without a WaterComponent or
+        // sky cube.
+        auto pass = std::make_unique<WaterPass>(
+            m_normalHandle, m_surfaceHandle, m_velocityHandle, m_depthHandle);
+        m_waterPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // Declaration-only no-op pass: WaterPass leaves GBuffer normal +
+        // surface in RENDER_TARGET (it stamps them for SSR). The engine's
+        // frame-end invariant — relied on by the out-of-graph consumers
+        // (SSR subsystem, XeGTAO, post passes) and by next frame's barrier
+        // bookkeeping — is SHADER_RESOURCE. Declaring reads here makes the
+        // graph emit the RT→SR transitions right after the water draw with
+        // its state tracking kept in sync. Execute body is intentionally
+        // empty.
+        m_graph.AddPass("WaterGBufferRestore",
+            [normal = m_normalHandle, surface = m_surfaceHandle](RG::RenderGraphBuilder& b)
+            {
+                b.ReadSRV(normal);
+                b.ReadSRV(surface);
+                b.SetColorTarget(RG::BuiltinTexture::None);
+            },
+            [](RHI::CommandList&) {});
+    }
+    {
         // Volumetric clouds: composite OVER skybox, BEFORE volumetric fog
         // (so fog can attenuate cloud god-rays / aerial perspective later).
         auto pass = std::make_unique<CloudPass>(m_depthHandle);
         m_cloudPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
+        // UE-style exponential height fog: analytic fullscreen composite.
+        // AFTER clouds (so cloud/water/sky already in HDR get fogged) and
+        // BEFORE VideoPass (cinematic overlays stay unfogged) / froxel fog
+        // (near volumetric detail composes OVER the analytic far fog).
+        auto pass = std::make_unique<HeightFogPass>(m_depthHandle);
+        m_heightFogPass = pass.get();
         m_graph.AddPass(std::move(pass));
     }
     {
@@ -349,6 +469,15 @@ void Renderer::Compile()
         m_graph.AddPass(std::move(pass));
     }
     {
+        // Animated sprite-sheet billboards (explosions, impacts, glows). Same
+        // HDR + read-only-depth phase as transparent/particle/trail/tracer:
+        // additive/alpha blend, emissive feeds Bloom. CPU-expanded camera-facing
+        // quads with per-effect flipbook UVs (see BillboardFXPass / BillboardFXComponent).
+        auto pass = std::make_unique<BillboardFXPass>(m_depthHandle);
+        m_billboardFXPass = pass.get();
+        m_graph.AddPass(std::move(pass));
+    }
+    {
         auto pass = std::make_unique<OutlinePass>(m_depthHandle, m_normalHandle);
         m_outlinePass = pass.get();
         m_graph.AddPass(std::move(pass));
@@ -393,24 +522,33 @@ void Renderer::Compile()
     m_casPass = std::make_unique<CASPass>();
     m_casPass->Init(m_gfx);
 
+    m_underwaterPass = std::make_unique<UnderwaterPass>();
+    m_underwaterPass->Init(m_gfx);
+
+    m_dofPass = std::make_unique<DepthOfFieldPass>();
+    m_dofPass->Init(m_gfx);
+
+    m_stylizePass = std::make_unique<StylizePass>();
+    m_stylizePass->Init(m_gfx);
+
     // GlassShatterPass: post-tonemap on restoreCL, composites shards to Tonemap UAV.
     // Active only Trigger()..Trigger()+duration; zero-cost otherwise.
     m_glassShatterPass = std::make_unique<GlassShatterPass>();
     m_glassShatterPass->Init(m_gfx);
 
     // PostProcess::Stack adapters are non-owning; the unique_ptrs above keep passes alive.
+    // The stack is a pure consumer of the per-frame ResolvedPostProcessSettings
+    // produced by PostProcessResolveSystem (volume blend + override stack); the
+    // Renderer just points Context::resolved at PostProcess::Runtime each frame.
     m_postProcessStack = std::make_unique<PostProcess::Stack>();
+    m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::DepthOfFieldEffect>(m_dofPass.get()));
     m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::CASEffect>(m_casPass.get()));
     m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::AutoExposureEffect>(m_autoExposurePass.get()));
     m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::BloomEffect>(m_bloomPass.get()));
     m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::LensFlareEffect>(m_lensFlarePass.get()));
+    m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::UnderwaterEffect>(m_underwaterPass.get()));
+    m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::StylizeEffect>(m_stylizePass.get()));
     m_postProcessStack->RegisterEffect(std::make_unique<PostProcess::ToneMapEffect>(m_toneMapPass.get()));
-
-    // Two volume sources: standalone registry (editor/scripted) + ECS (VolumeComponent entities).
-    m_postProcessVolumes       = std::make_unique<PostProcess::VolumeSystem>();
-    m_postProcessEntityVolumes = std::make_unique<PostProcess::EntityVolumeSource>();
-    m_postProcessStack->AddVolumeSource(m_postProcessVolumes.get());
-    m_postProcessStack->AddVolumeSource(m_postProcessEntityVolumes.get());
 
     InitSkinningSystems();
 
@@ -466,6 +604,8 @@ void Renderer::OnEntityDestroyed(Entity e)
         m_particleSystem->OnEntityDestroyed(m_gfx, e);
     if (m_afterimageSystem)
         m_afterimageSystem->OnEntityDestroyed(e);
+    if (m_billboardFXPass)
+        m_billboardFXPass->OnEntityDestroyed(e);
 
     // Beam slot release: listener fires BEFORE pool teardown, so the BeamComponent is still readable.
     if (m_beamSystem && m_subscribedWorld)
@@ -489,8 +629,13 @@ void Renderer::OnWorldClear()
     // BeginFrame re-subscribes to whichever World binds next.
     SubscribeToWorld(nullptr);
 
+    // Drop transient gameplay post-process overrides — they are per-session
+    // state and must not bleed across a world reload (design §9).
+    PostProcess::Runtime::Get().ClearOverrides();
+
     m_skin.OnWorldClear();
     if (m_afterimageSystem) m_afterimageSystem->OnWorldClear();
+    if (m_billboardFXPass)  m_billboardFXPass->OnWorldClear();  // release sprite-atlas texture refs
     m_meshMgr.OnWorldClear();  // clears per-library caches + bumps generation
     // (Skinned vertex ring's bindless slots survive automatically — they were
     //  registered via MeshDescriptorHeap::RegisterPersistentBuffer at Init.)
@@ -521,6 +666,16 @@ void Renderer::OnWorldClear()
             for (auto& [_n, entry] : byName)
                 if (entry.handle != Resource::kInvalidTextureHandle)
                     m_pendingMatTexReleaseAfterNextSync.push_back(entry.handle);
+
+        // Water flow-normal maps — same Load-then-Release deferral so a
+        // same-path reload keeps the GPU upload warm.
+        auto deferWaterSlot = [&](TerrainTexSlot& s) {
+            if (s.handle != Resource::kInvalidTextureHandle)
+                m_pendingMatTexReleaseAfterNextSync.push_back(s.handle);
+            s = {};
+        };
+        deferWaterSlot(m_waterNormalA);
+        deferWaterSlot(m_waterNormalB);
     }
     m_matTexCache.clear();
     m_customMatTexCache.clear();
@@ -596,6 +751,10 @@ void Renderer::BeginFrame(World& world, FrameIndex frame, float dt , uint32_t vp
         uint64_t srv = m_ssrSubsystem->OnResize(renderW, renderH);
         // Disabled → pass 0 so the (1 - ssrConf) IBL dampening drains to no-op.
         m_lightingPass->SetSSRResult(m_ssrEnabled ? srv : 0);
+        // Water consumes the same prev-frame result for its (1 - conf) sky
+        // dampening (0 → pass-owned black fallback, conf reads 0).
+        if (m_waterPass)
+            m_waterPass->SetSSRResult(m_ssrEnabled ? srv : 0);
     }
 
     // (MeshDescriptorHeap::BeginFrame and the entire animation chain now
@@ -678,11 +837,27 @@ void Renderer::BeginFrame(World& world, FrameIndex frame, float dt , uint32_t vp
                                        m_skin.GetVertexRing(), dt);
 
     m_shadowFrustum.Compute(world, m_camera, vpW, vpH);
+    // Advance global time BEFORE BuildRenderScene so grass/water publish
+    // time = T_n and prevTime = T_n - dt_n = exactly the T_{n-1} frame n-1
+    // published — otherwise the TAA wind-velocity window mismatches the
+    // actual pose delta under uneven frame pacing.
+    m_globalTimeSec += dt;
     BuildRenderScene(world);
     UploadFrameData(frame, vpW, vpH);
 
+    // Feed THIS frame's camera to the Aerial Perspective LUT. Must run after
+    // UploadFrameData so the LightCB ring slot it mirrors is fresh — the old
+    // push inside SyncSkyboxIBL read the slot before this frame's write
+    // (kFrameCount frames stale, zeros on the first frames → NaN rays).
+    if (m_skyIBLPass && m_lightCB.Current(m_gfx))
+    {
+        auto* lb = m_lightCB.Current(m_gfx);
+        DirectX::XMFLOAT3 apCamPos{ lb->cameraPos[0], lb->cameraPos[1], lb->cameraPos[2] };
+        DirectX::XMFLOAT3 apCamFwd{ lb->cameraForward[0], lb->cameraForward[1], lb->cameraForward[2] };
+        m_skyIBLPass->SetCameraForAerial(apCamPos, apCamFwd, lb->invViewProj);
+    }
+
     // Particle/Tracer CPU bookkeeping — must run before TracerSimPass::Execute reads in Render().
-    m_globalTimeSec += dt;
     if (m_tracerSystem)
         m_tracerSystem->BeginFrame(dt, static_cast<uint32_t>(frame), m_globalTimeSec);
 
@@ -743,6 +918,18 @@ void Renderer::BeginFrame(World& world, FrameIndex frame, float dt , uint32_t vp
     {
         m_trailSystem->CollectTrails(world, dt);
         m_trailSystem->UpdateSystemCB(dt);
+    }
+
+    // ---- Animated billboard FX — advance flipbooks + expand camera-facing
+    //      quads. Runs here because world + dt + the now-ready m_view (filled by
+    //      UploadFrameData above) are all in scope; the pass itself draws in-graph
+    //      into HDR with read-only depth.
+    if (m_billboardFXPass)
+    {
+        m_billboardFXPass->SetResourceSystems(m_texSys, m_resMgr);
+        m_billboardFXPass->BuildFrame(world, dt,
+                                      m_view.viewMatrix,
+                                      m_view.cameraPosition);
     }
 }
 
@@ -1131,6 +1318,14 @@ void Renderer::Render_BindFrameResources(uint32_t frameSlot)
         m_graph.BindConstantBuffer("SkyCB", m_skyboxPass->GetSkyCB(m_gfx));
     if (m_volFogPass)
         m_graph.BindConstantBuffer("VolApplyCB", m_volFogPass->GetApplyCB(m_gfx));
+    if (m_cloudPass)
+        m_graph.BindConstantBuffer("CloudApplyCB", m_cloudPass->GetCloudCB(m_gfx));
+    if (m_heightFogPass && m_heightFogPass->GetFogCB(m_gfx).IsValid())
+        m_graph.BindConstantBuffer("HeightFogCB", m_heightFogPass->GetFogCB(m_gfx));
+    if (m_grassPass && m_grassPass->GetGrassCB(m_gfx).IsValid())
+        m_graph.BindConstantBuffer("GrassParams", m_grassPass->GetGrassCB(m_gfx));
+    if (m_waterPass && m_waterPass->GetWaterCB(m_gfx).IsValid())
+        m_graph.BindConstantBuffer("WaterParams", m_waterPass->GetWaterCB(m_gfx));
     m_graph.BindBuffer("InstanceBuffer",      m_instanceBuffer[frameSlot]);
     m_graph.BindBuffer("MeshDescriptors",     m_meshMgr.GetDescriptorHeap().GetMeshDescBuffer());
     m_graph.BindBuffer("MaterialBuffer",      m_materialBuffer[frameSlot]);
@@ -1153,14 +1348,21 @@ void Renderer::Render_BindFrameResources(uint32_t frameSlot)
         const bool wire = (m_viewMode == ViewMode::Wireframe);
         if (m_gbufferPass)     m_gbufferPass->SetWireframe(wire);
         if (m_terrainPass)     m_terrainPass->SetWireframe(wire);
+        if (m_grassPass)       m_grassPass->SetWireframe(wire);
         if (m_transparentPass) m_transparentPass->SetWireframe(wire);
         if (m_skyboxPass)      m_skyboxPass->SetViewModeHidden(wire);
+        if (m_waterPass)       m_waterPass->SetViewModeHidden(wire);
         if (m_cloudPass)       m_cloudPass->SetViewModeHidden(wire);
+        if (m_heightFogPass)   m_heightFogPass->SetViewModeHidden(wire);
         if (m_volFogPass)      m_volFogPass->SetViewModeHidden(wire);
     }
 
     if (m_shadowPass && m_lightingPass)
         m_lightingPass->SetShadowMap(m_shadowPass->GetShadowArrayGpuHandle());
+    // Water's sun glint is direct light — same CSM array so terrain shadows
+    // kill the glint where the sun is occluded.
+    if (m_shadowPass && m_waterPass)
+        m_waterPass->SetShadowMap(m_shadowPass->GetShadowArrayGpuHandle());
 
     // Bind clustered lighting SRVs to LightingPass.
     if (m_clusterPass && m_lightingPass)
@@ -1179,6 +1381,10 @@ void Renderer::Render_BindFrameResources(uint32_t frameSlot)
         m_volFogPass->SetSpotShadowAtlas(
             m_spotShadowPass->GetAtlasSrvHandle(),
             m_spotShadowVPSrv[frameSlot]);
+
+    // Point-light omnidirectional cube shadow atlas; consumed by Lighting.ps.
+    if (m_pointShadowPass && m_lightingPass)
+        m_lightingPass->SetPointShadowAtlas(m_pointShadowPass->GetCubeAtlasSrvHandle());
 
     // Bind NPR ramp texture to LightingPass (cached in BuildRenderScene).
     if (m_lightingPass)
@@ -1436,7 +1642,7 @@ RHI::CommandList Renderer::Render()
     const uint64_t      normalSrv      = normalTex      ? m_gfx.GetTextureSRVGpuHandle(*normalTex)      : 0;
     // Stencil-plane view of the depth buffer — TAA uses it to identify
     // pixels tagged by OutlinePass and weaken their history blend weight.
-    // Zero when the depth format isn't D24_S8 — TAA disables the feature.
+    // Zero when the depth format carries no stencil — TAA disables the feature.
     const uint64_t      stencilSrv     = taaDepthTex    ? m_gfx.GetTextureStencilSRVGpuHandle(*taaDepthTex) : 0;
 
     // ---- Compute prepass: skinning / particle / trail / tracer / beam CS. ----
@@ -1692,7 +1898,9 @@ RHI::CommandList Renderer::Render()
     ProcessProbeBakeQueue(colorLastCL);
 
     // ---- Phase 4.5: Hi-Z mip chain generation (for next frame's occlusion culling) ---
-    if (m_gpuCullingEnabled && m_hiZPass)
+    // Gated by m_hiZEnabled (default false): nothing samples the Hi-Z pyramid yet,
+    // so generating it every frame was pure GPU + VRAM waste. See Renderer.h.
+    if (m_gpuCullingEnabled && m_hiZEnabled && m_hiZPass)
     {
         const RHI::Texture* depthTex = m_graph.GetPhysicalTexture(m_depthHandle);
         if (depthTex)
@@ -1741,6 +1949,7 @@ RHI::CommandList Renderer::Render()
         ctx.surfaceHandle        = m_surfaceHandle;
         ctx.depthHandle          = m_depthHandle;
         ctx.velocityHandle       = m_velocityHandle;
+        ctx.traceDepthHandle     = m_ssrTraceDepthHandle;   // grass-free Hi-Z source
         ctx.viewProj             = m_view.viewProjMatrix;
         ctx.prevViewProjJittered = m_taaJitter.GetPrevViewProjJittered();
         ctx.cameraPos            = m_camera.position;
@@ -1971,9 +2180,15 @@ RHI::CommandList Renderer::Render()
                 m_lensFlarePass->SetDepthSrvHandle(depthSrv);
                 m_lensFlarePass->SetDepthSourceSize(m_vpWidth, m_vpHeight);
                 m_lensFlarePass->SetViewportSize(m_vpWidth, m_vpHeight);
+                // Clouds don't write depth — feed their transmittance so
+                // overcast kills the flare. 0 when clouds didn't render.
+                m_lensFlarePass->SetCloudSrvHandle(
+                    m_cloudPass ? m_cloudPass->GetCloudSrvHandle() : 0);
             }
 
             // Stack drives CAS → AutoExposure → Bloom → LensFlare → Tonemap.
+            // The frame's resolved settings come from PostProcess::Runtime,
+            // filled by PostProcessResolveSystem (PreRender) earlier this frame.
             if (m_postProcessStack)
             {
                 PostProcess::Context ppCtx{};
@@ -1982,9 +2197,11 @@ RHI::CommandList Renderer::Render()
                 ppCtx.viewportWidth  = m_vpWidth;
                 ppCtx.viewportHeight = m_vpHeight;
                 ppCtx.deltaTime      = m_deltaTime;
-                ppCtx.cameraPos      = m_view.cameraPosition;
-                ppCtx.world          = m_lastWorld;   // for EntityVolumeSource
                 ppCtx.hdrSrv         = resolvedSrv;
+                ppCtx.depthSrv       = depthSrv;
+                ppCtx.cameraNear     = m_camera.nearZ;
+                ppCtx.cameraFar      = m_camera.farZ;
+                ppCtx.resolved       = &PostProcess::Runtime::Get().resolved;
                 uint32_t r = m_gfx.BeginGPUTimestamp(computeCL, "PostProcessStack");
                 m_postProcessStack->Execute(ppCtx);
                 m_gfx.EndGPUTimestamp(computeCL, r);
@@ -2153,7 +2370,9 @@ void Renderer::UploadFrameData(FrameIndex /*frame*/, uint32_t vpW, uint32_t vpH)
 
     const float aspect = static_cast<float>(vpW) / static_cast<float>(vpH);
     XMMATRIX view    = XMMatrixLookToLH(pos, forward, up);
-    // Reversed-Z: near/far swapped (NDC z=1 near, 0 far) + GREATER_EQUAL test → packs D32 precision at far.
+    // Reversed-Z: near/far swapped (NDC z=1 near, 0 far) + GREATER_EQUAL test.
+    // Main depth is D32_FLOAT_S8X24 (float distribution), so reversed-Z's
+    // precision win is fully realised across the whole depth range.
     XMMATRIX projBase = XMMatrixPerspectiveFovLH(m_camera.fov, aspect, m_camera.farZ, m_camera.nearZ);
 
     // Save unjittered VP for TAA reprojection (becomes prevViewProj next frame).
@@ -2399,6 +2618,38 @@ void Renderer::CreateConstantBuffers()
                     auto* dst = static_cast<DirectX::XMFLOAT4X4*>(m_spotShadowVPMapped[i]);
                     for (uint32_t k = 0; k < SpotShadowPass::kMaxCasters; ++k)
                         dst[k] = ident;
+                }
+            }
+        }
+    }
+
+    // ---- Terrain per-layer material table (triple-buffered) -----------------
+    // StructuredBuffer<TerrainLayerGPU> the terrain PS loops over by layerCount.
+    // Seeded to a disabled layer (all idx = -1) so a frame before SyncTerrain
+    // runs reads benign data rather than junk.
+    {
+        RHI::GPUBufferDesc desc;
+        desc.size       = static_cast<uint64_t>(kMaxTerrainLayers)
+                        * sizeof(RendererDetail::TerrainLayerGPU);
+        desc.stride     = sizeof(RendererDetail::TerrainLayerGPU);
+        desc.usage      = RHI::Usage::UPLOAD;
+        desc.bind_flags = RHI::BindFlag::SHADER_RESOURCE;
+        desc.misc_flags = RHI::ResourceMiscFlag::BUFFER_STRUCTURED;
+        for (uint32_t i = 0; i < kFrameSlots; ++i)
+        {
+            if (m_gfx.CreateBuffer(desc, m_terrainLayerBuffer[i]))
+            {
+                m_terrainLayerMapped[i] = m_gfx.MapBuffer(m_terrainLayerBuffer[i]);
+                m_terrainLayerSrv[i]    = m_gfx.GetBufferSRVGpuHandle(m_terrainLayerBuffer[i]);
+                if (m_terrainLayerMapped[i])
+                {
+                    auto* dst = static_cast<RendererDetail::TerrainLayerGPU*>(m_terrainLayerMapped[i]);
+                    for (uint32_t k = 0; k < kMaxTerrainLayers; ++k)
+                    {
+                        RendererDetail::TerrainLayerGPU empty{};
+                        empty.albedoIdx = empty.normalIdx = empty.armIdx = empty.dispIdx = -1;
+                        dst[k] = empty;
+                    }
                 }
             }
         }

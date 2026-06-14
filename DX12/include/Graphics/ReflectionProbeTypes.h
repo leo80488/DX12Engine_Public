@@ -42,7 +42,10 @@ namespace Reflection
         DirectX::XMFLOAT3 position;        float influenceRadius; // 16
         DirectX::XMFLOAT3 boxMin;          uint32_t cubemapSlice; // 32
         DirectX::XMFLOAT3 boxMax;          uint32_t flags;        // 48
-        DirectX::XMFLOAT3 innerExtents;    float    pad0;         // 64
+        // intensity = per-probe brightness multiplier on the sampled radiance.
+        // Independent of the sky/atmosphere iblStrength master gate, so a local
+        // probe lights surfaces even when sky IBL is fully off. Default 1.0.
+        DirectX::XMFLOAT3 innerExtents;    float    intensity;    // 64
     };
     static_assert(sizeof(GPUReflectionProbe) == 64, "GPUReflectionProbe must be 64 bytes");
 

@@ -20,7 +20,8 @@
 
 #define AS_GROUP_SIZE 32
 
-// CB layout MUST match Terrain.{ms,ps}.hlsl bit-for-bit.
+// Full TerrainParamsCB layout (Renderer.h): the colour AS is the only stage
+// that reads g_frustumPlanes, so it declares the geometry prefix + the planes.
 cbuffer TerrainCB : register(b2, space0)
 {
     float2 g_worldOrigin;
@@ -35,23 +36,15 @@ cbuffer TerrainCB : register(b2, space0)
     uint   _g_hasSplatmap;
     float  g_worldCenterY;
 
-    int4   _g_layerBindlessIdx;
-    float4 _g_layerTilingScale;
-    int4   _g_layerNormalIdx;
-    int4   _g_layerARMIdx;
-    int4   _g_layerDispIdx;
-
     uint   g_tilesPerSide;
     uint   g_enableFrustumCull;
-    float  _g_pad8a;
-    float  _g_pad8b;
+    uint   _g_layerCount;
+    uint   _g_heightBlendEnable;   // PS-only — declared for offset parity
 
-    float4 _g_layerMinHeight;
-    float4 _g_layerMaxHeight;
-    float4 _g_layerFadeHeight;
-    float4 _g_layerMinSlopeDeg;
-    float4 _g_layerMaxSlopeDeg;
-    float4 _g_layerFadeSlopeDeg;
+    float  _g_heightBlendStrength; // PS-only
+    float  _g_heightBlendRange;    // PS-only
+    float  _g_pad1;
+    float  _g_pad2;
 
     float4 g_frustumPlanes[6];     // inward-normal planes; dot(p.xyz, P) + p.w ≥ 0 ⇒ inside
 };

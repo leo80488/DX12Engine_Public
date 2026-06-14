@@ -10,6 +10,7 @@
 #include "ECS/Components.h"
 #include "ECS/HierarchyComponents.h"
 #include "ECS/FrameContext.h"
+#include "ECS/PostProcessVolumeComponent.h"
 
 #include <DirectXMath.h>
 
@@ -38,6 +39,96 @@ namespace
             if (!gt) continue;
             icons.AddIcon({ gt->matrix._41, gt->matrix._42, gt->matrix._43 },
                           halfSize, texIdx);
+        }
+    }
+
+    // ---- Post-process volume gizmos ---------------------------------------
+    using namespace DirectX;
+
+    // Draw an OBB (center+rotation+half-extents) as 12 edges.
+    void DrawOBB(DebugWirePass& dbg, FXMVECTOR center, FXMVECTOR rotQ,
+                 const XMFLOAT3& half, uint32_t color)
+    {
+        XMFLOAT3 c[8];
+        for (int i = 0; i < 8; ++i)
+        {
+            const float sx = (i & 1) ? 1.f : -1.f;
+            const float sy = (i & 2) ? 1.f : -1.f;
+            const float sz = (i & 4) ? 1.f : -1.f;
+            XMVECTOR local = XMVectorSet(sx * half.x, sy * half.y, sz * half.z, 0.f);
+            XMVECTOR world = XMVectorAdd(center, XMVector3Rotate(local, rotQ));
+            XMStoreFloat3(&c[i], world);
+        }
+        static const int e[12][2] = {
+            {0,1},{2,3},{4,5},{6,7},  // x edges
+            {0,2},{1,3},{4,6},{5,7},  // y edges
+            {0,4},{1,5},{2,6},{3,7},  // z edges
+        };
+        for (auto& edge : e) dbg.AddLine(c[edge[0]], c[edge[1]], color);
+    }
+
+    // Draw a sphere as three great-circle rings.
+    void DrawSphere(DebugWirePass& dbg, const XMFLOAT3& center, float radius, uint32_t color)
+    {
+        constexpr int kSeg = 24;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            XMFLOAT3 prev{};
+            for (int s = 0; s <= kSeg; ++s)
+            {
+                const float a = (float(s) / kSeg) * XM_2PI;
+                const float u = std::cos(a) * radius;
+                const float v = std::sin(a) * radius;
+                XMFLOAT3 p = center;
+                if (axis == 0)      { p.x += u; p.y += v; }
+                else if (axis == 1) { p.y += u; p.z += v; }
+                else                { p.x += u; p.z += v; }
+                if (s > 0) dbg.AddLine(prev, p, color);
+                prev = p;
+            }
+        }
+    }
+
+    void EmitVolumeGizmos(World& world, DebugWirePass& dbg)
+    {
+        auto* pool = world.GetPool<ECS::PostProcessVolumeComponent>();
+        if (!pool) return;
+        constexpr uint32_t kBounds = 0xFF66CCFFu;  // light blue
+        constexpr uint32_t kShell  = 0x8033AACCu;  // dimmer, translucent-ish
+
+        const auto& ents = pool->Entities();
+        auto&       data = pool->Data();
+        for (std::size_t i = 0; i < ents.size(); ++i)
+        {
+            const ECS::PostProcessVolumeComponent& v = data[i];
+            if (v.isGlobal) continue;  // unbounded — nothing spatial to draw
+            const Entity e = ents[i];
+            const GlobalTransform* gt = world.GetComponent<GlobalTransform>(e);
+            if (!gt) continue;
+
+            const XMMATRIX M = XMLoadFloat4x4(&gt->matrix);
+            XMVECTOR scale, rotQ, trans;
+            if (!XMMatrixDecompose(&scale, &rotQ, &trans, M)) continue;
+            XMFLOAT3 half; XMStoreFloat3(&half, scale);
+
+            if (v.shape == ECS::PPVolumeShape::Sphere)
+            {
+                XMFLOAT3 c; XMStoreFloat3(&c, trans);
+                const float r = half.x;
+                DrawSphere(dbg, c, r, kBounds);
+                if (v.blendDistance > 0.f) DrawSphere(dbg, c, r + v.blendDistance, kShell);
+            }
+            else
+            {
+                DrawOBB(dbg, trans, rotQ, half, kBounds);
+                if (v.blendDistance > 0.f)
+                {
+                    const XMFLOAT3 outer{ half.x + v.blendDistance,
+                                          half.y + v.blendDistance,
+                                          half.z + v.blendDistance };
+                    DrawOBB(dbg, trans, rotQ, outer, kShell);
+                }
+            }
         }
     }
 
@@ -121,6 +212,9 @@ void DebugDrawSystem::Submit(Renderer& renderer, World& world, const FrameContex
 
     if (Active(DebugCategory::NavMesh))
         nav.EmitDebugLines(*dbg);
+
+    if (Active(DebugCategory::PostProcessVolumes))
+        EmitVolumeGizmos(world, *dbg);
 
     if (Active(DebugCategory::Collision))
     {

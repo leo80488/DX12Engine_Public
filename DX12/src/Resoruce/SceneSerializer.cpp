@@ -414,7 +414,8 @@ void WaitForHandlesReady(Resource::ResourceManager& rm,
 bool Resource::SaveScene(World& world, const std::string& path,
                           const std::string& sceneName,
                           const std::string& postProcessConfigPath,
-                          const std::string& navMeshPath)
+                          const std::string& navMeshPath,
+                          const std::string& sceneScript)
 {
     auto& reg = GetComponentRegistry();
 
@@ -474,6 +475,8 @@ bool Resource::SaveScene(World& world, const std::string& path,
         ss << " postProcessConfig=" << PercentEncode(postProcessConfigPath);
     if (!navMeshPath.empty())
         ss << " navMesh=" << PercentEncode(navMeshPath);
+    if (!sceneScript.empty())
+        ss << " sceneScript=" << PercentEncode(sceneScript);
     ss << "\n";
 
     char buf[512];
@@ -627,7 +630,8 @@ bool Resource::LoadScene(const std::string& path, World& world, AssetManager& as
                           Renderer* renderer, AnimationClipSystem* animClipSys,
                           std::string* outSceneName,
                           std::string* outPostProcessConfigPath,
-                          std::string* outNavMeshPath)
+                          std::string* outNavMeshPath,
+                          std::string* outSceneScript)
 {
     auto& reg = GetComponentRegistry();
 
@@ -652,6 +656,7 @@ bool Resource::LoadScene(const std::string& path, World& world, AssetManager& as
     std::string sceneName            = "Untitled";
     std::string postProcessConfigPath;
     std::string navMeshPath;
+    std::string sceneScript;
     std::vector<NodeRecord>     nodes;
     std::vector<ComponentBlock> compBlocks;
     int currentNodeIdx = -1;
@@ -690,6 +695,7 @@ bool Resource::LoadScene(const std::string& path, World& world, AssetManager& as
                 if      (key == "name")              sceneName             = PercentDecode(val);
                 else if (key == "postProcessConfig") postProcessConfigPath = PercentDecode(val);
                 else if (key == "navMesh")           navMeshPath           = PercentDecode(val);
+                else if (key == "sceneScript")       sceneScript           = PercentDecode(val);
             }
         }
         else if (line[0] == 'N' && line.size() > 1 && line[1] == ' ')
@@ -1059,6 +1065,7 @@ bool Resource::LoadScene(const std::string& path, World& world, AssetManager& as
     //    whatever state it was in before the load.
     if (outPostProcessConfigPath) *outPostProcessConfigPath = postProcessConfigPath;
     if (outNavMeshPath)            *outNavMeshPath           = navMeshPath;
+    if (outSceneScript)            *outSceneScript           = sceneScript;
     if (!postProcessConfigPath.empty() && renderer)
     {
         PostProcessConfig cfg;

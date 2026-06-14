@@ -8,10 +8,13 @@
 // PhysicsSystem is initialised but before any user scripts run.
 
 namespace sol { class state; }
+class World;
 
 namespace DX12Physics
 {
     class PhysicsSystem;
 
-    void RegisterLuaPhysicsBindings(sol::state& lua, PhysicsSystem& physics);
+    // `world` is needed by Physics.SpawnBall to create the ball entity +
+    // attach the rigidbody/collider components.
+    void RegisterLuaPhysicsBindings(sol::state& lua, PhysicsSystem& physics, World& world);
 }

@@ -215,21 +215,47 @@ namespace Resource
         }
         if (totalVerts == 0 || totalIdx == 0) return {};
 
-        std::vector<PackedVertex>    verts;   verts.reserve(totalVerts);
-        std::vector<uint32_t>        indices; indices.reserve(totalIdx);
+        // ---- Determine the library-wide vertex layout from the sources ------
+        // The shared VB has ONE interleaved layout, so a stream is included for
+        // the whole library if ANY source mesh carries it. Tangent is always
+        // present (aiProcess_CalcTangentSpace fills it, else a (1,0,0,1)
+        // sentinel). uv1 (2nd UV set) and per-vertex color are opt-in per the
+        // source content, preserved instead of silently dropped.
+        bool anyUV1 = false, anyColor = false;
+        for (const aiMesh* ai : sources)
+        {
+            if (!ai) continue;
+            if (ai->HasTextureCoords(1)) anyUV1   = true;
+            if (ai->HasVertexColors(0))  anyColor = true;
+        }
+
+        uint32_t libFlags = MESHLIB_FLAG_HAS_TANGENT;
+        if (anyUV1)   libFlags |= MESHLIB_FLAG_HAS_UV1;
+        if (anyColor) libFlags |= MESHLIB_FLAG_HAS_COLOR;
+        const MeshLibVertexLayout L = ComputeMeshLibVertexLayout(libFlags);
+
+        std::vector<uint8_t>          vbytes(size_t(totalVerts) * L.stride, 0u);
+        std::vector<uint32_t>         indices; indices.reserve(totalIdx);
         std::vector<MeshLibraryEntry> entries; entries.reserve(sources.size());
+
+        // Interleaved byte-writer into the shared VB.
+        auto wF = [](uint8_t* p, float f) { std::memcpy(p, &f, sizeof(float)); };
 
         uint32_t vOffset = 0;  // running base vertex for re-indexing into the
                                // library-wide pool
         uint32_t iOffset = 0;  // running index offset (= entries.back().indexStart)
+        uint32_t maxUVSets = 0;  // diagnostic only
         for (size_t s = 0; s < sources.size(); ++s)
         {
             const aiMesh* ai = sources[s];
             if (!ai || ai->mNumVertices == 0 || ai->mNumFaces == 0) continue;
 
-            const bool hasNor = ai->HasNormals();
-            const bool hasUV  = ai->HasTextureCoords(0);
-            const bool hasTan = ai->HasTangentsAndBitangents();
+            const bool hasNor   = ai->HasNormals();
+            const bool hasUV    = ai->HasTextureCoords(0);
+            const bool hasUV1   = ai->HasTextureCoords(1);
+            const bool hasTan   = ai->HasTangentsAndBitangents();
+            const bool hasColor = ai->HasVertexColors(0);
+            if (ai->GetNumUVChannels() > maxUVSets) maxUVSets = ai->GetNumUVChannels();
 
             const uint32_t vStart = vOffset;
             const uint32_t iStart = iOffset;
@@ -240,67 +266,84 @@ namespace Resource
 
             for (uint32_t i = 0; i < ai->mNumVertices; ++i)
             {
-                PackedVertex v{};
-                v.px = ai->mVertices[i].x;
-                v.py = ai->mVertices[i].y;
-                v.pz = ai->mVertices[i].z;
-                v.nx = hasNor ? ai->mNormals[i].x : 0.f;
-                v.ny = hasNor ? ai->mNormals[i].y : 1.f;
-                v.nz = hasNor ? ai->mNormals[i].z : 0.f;
-                v.u  = hasUV  ? ai->mTextureCoords[0][i].x : 0.f;
-                v.v  = hasUV  ? ai->mTextureCoords[0][i].y : 0.f;
+                uint8_t* vp = vbytes.data() + size_t(vOffset + i) * L.stride;
+
+                float px = ai->mVertices[i].x;
+                float py = ai->mVertices[i].y;
+                float pz = ai->mVertices[i].z;
+                float nx = hasNor ? ai->mNormals[i].x : 0.f;
+                float ny = hasNor ? ai->mNormals[i].y : 1.f;
+                float nz = hasNor ? ai->mNormals[i].z : 0.f;
+                float u  = hasUV  ? ai->mTextureCoords[0][i].x : 0.f;
+                float vt = hasUV  ? ai->mTextureCoords[0][i].y : 0.f;
 
                 // Tangent + handedness. Assimp gives us T and B as separate
                 // vectors; the engine stores T.xyz and a single sign for B
-                // recovery (B = cross(N, T) * sign). The sign is determined by
-                // whether the authored bitangent agrees with cross(N, T) or
-                // its negation — UV-space chirality.
-                //
-                // Defensive on three fronts: (1) hasTan guards against meshes
-                // with no UV / degenerate UV that Assimp couldn't compute
-                // tangents for; (2) hasNor guards because tangent without
-                // normal makes no sense and Assimp can in rare cases report
-                // hasTan=true with mNormals==nullptr; (3) we read N from the
-                // already-filled `v` rather than ai->mNormals[i], so the
-                // hasNor=false fallback path stays self-consistent.
+                // recovery (B = cross(N, T) * sign), derived from whether the
+                // authored bitangent agrees with cross(N, T) or its negation.
+                // (1,0,0,1) sentinel when absent — matches FETCH_TANGENT4's
+                // fallback so GBuffer.vs synthesises a basis from N.
+                float tx = 1.f, ty = 0.f, tz = 0.f, tw = 1.f;
                 if (hasTan && hasNor)
                 {
                     const aiVector3D& T = ai->mTangents[i];
                     const aiVector3D& B = ai->mBitangents[i];
-                    const float Nx = v.nx, Ny = v.ny, Nz = v.nz;
-                    const float NxT_x = Ny * T.z - Nz * T.y;
-                    const float NxT_y = Nz * T.x - Nx * T.z;
-                    const float NxT_z = Nx * T.y - Ny * T.x;
+                    const float NxT_x = ny * T.z - nz * T.y;
+                    const float NxT_y = nz * T.x - nx * T.z;
+                    const float NxT_z = nx * T.y - ny * T.x;
                     const float sign  = (NxT_x * B.x + NxT_y * B.y + NxT_z * B.z) < 0.f ? -1.f : 1.f;
-                    v.tx = T.x; v.ty = T.y; v.tz = T.z;
-                    v.tw = sign;
-                }
-                else
-                {
-                    // No authored tangent (or no normal to derive handedness
-                    // from). Use the (1,0,0,1) sentinel — matches the runtime
-                    // FETCH_TANGENT4 fallback, and GBuffer.vs's "synthesise
-                    // basis from N" branch will engage on these vertices.
-                    v.tx = 1.f; v.ty = 0.f; v.tz = 0.f; v.tw = 1.f;
+                    tx = T.x; ty = T.y; tz = T.z; tw = sign;
                 }
 
                 if (flipX)
                 {
-                    v.px = -v.px;
-                    v.nx = -v.nx;
-                    // Mirroring X also flips tangent X and inverts handedness
-                    // (UV chirality flips with the geometry).
-                    v.tx = -v.tx;
-                    v.tw = -v.tw;
+                    px = -px; nx = -nx;
+                    // Mirroring X flips tangent X and inverts handedness.
+                    tx = -tx; tw = -tw;
                 }
-                verts.push_back(v);
 
-                if (v.px < bmin[0]) bmin[0] = v.px;
-                if (v.py < bmin[1]) bmin[1] = v.py;
-                if (v.pz < bmin[2]) bmin[2] = v.pz;
-                if (v.px > bmax[0]) bmax[0] = v.px;
-                if (v.py > bmax[1]) bmax[1] = v.py;
-                if (v.pz > bmax[2]) bmax[2] = v.pz;
+                wF(vp + L.posOffset + 0, px);
+                wF(vp + L.posOffset + 4, py);
+                wF(vp + L.posOffset + 8, pz);
+                wF(vp + L.normalOffset + 0, nx);
+                wF(vp + L.normalOffset + 4, ny);
+                wF(vp + L.normalOffset + 8, nz);
+                wF(vp + L.uv0Offset + 0, u);
+                wF(vp + L.uv0Offset + 4, vt);
+
+                if (L.tangentOffset != 0xFFFFFFFFu)
+                {
+                    wF(vp + L.tangentOffset + 0,  tx);
+                    wF(vp + L.tangentOffset + 4,  ty);
+                    wF(vp + L.tangentOffset + 8,  tz);
+                    wF(vp + L.tangentOffset + 12, tw);
+                }
+                if (L.uv1Offset != 0xFFFFFFFFu)
+                {
+                    // Default to uv0 when this particular mesh lacks a 2nd set,
+                    // so a uv1-driven material still samples sane coordinates.
+                    float u1 = hasUV1 ? ai->mTextureCoords[1][i].x : u;
+                    float v1 = hasUV1 ? ai->mTextureCoords[1][i].y : vt;
+                    wF(vp + L.uv1Offset + 0, u1);
+                    wF(vp + L.uv1Offset + 4, v1);
+                }
+                if (L.colorOffset != 0xFFFFFFFFu)
+                {
+                    uint32_t packed = 0xFFFFFFFFu;  // opaque white default
+                    if (hasColor)
+                    {
+                        const aiColor4D& c = ai->mColors[0][i];
+                        packed = PackColorRGBA8(c.r, c.g, c.b, c.a);
+                    }
+                    std::memcpy(vp + L.colorOffset, &packed, sizeof(uint32_t));
+                }
+
+                if (px < bmin[0]) bmin[0] = px;
+                if (py < bmin[1]) bmin[1] = py;
+                if (pz < bmin[2]) bmin[2] = pz;
+                if (px > bmax[0]) bmax[0] = px;
+                if (py > bmax[1]) bmax[1] = py;
+                if (pz > bmax[2]) bmax[2] = pz;
             }
 
             for (uint32_t f = 0; f < ai->mNumFaces; ++f)
@@ -332,19 +375,36 @@ namespace Resource
             iOffset  = static_cast<uint32_t>(indices.size());
         }
 
-        if (verts.empty() || indices.empty() || entries.empty()) return {};
+        // Trim trailing capacity for any source that was skipped after the
+        // up-front totalVerts tally (callers pre-filter, so vOffset normally
+        // equals totalVerts — this keeps vertexCount, the VB byte length, and
+        // MeshLibrary::Load's index-blob offset mutually consistent regardless).
+        vbytes.resize(size_t(vOffset) * L.stride);
+
+        if (vbytes.empty() || indices.empty() || entries.empty()) return {};
+
+        LOG_INFO("SceneImporter: meshlib layout stride=%u flags=0x%X [tangent%s uv1%s color%s], "
+                 "max UV sets in source=%u",
+                 L.stride, libFlags,
+                 (libFlags & MESHLIB_FLAG_HAS_TANGENT) ? "+" : "-",
+                 (libFlags & MESHLIB_FLAG_HAS_UV1)     ? "+" : "-",
+                 (libFlags & MESHLIB_FLAG_HAS_COLOR)   ? "+" : "-",
+                 maxUVSets);
+        if (maxUVSets > 2)
+            LOG_WARNING("SceneImporter: source carries %u UV sets — only uv0 + uv1 are "
+                        "preserved (extra sets dropped)", maxUVSets);
 
         const uint32_t entryBytes  = static_cast<uint32_t>(entries.size() * sizeof(MeshLibraryEntry));
-        const uint32_t vbBytes     = static_cast<uint32_t>(verts.size()   * sizeof(PackedVertex));
+        const uint32_t vbBytes     = static_cast<uint32_t>(vbytes.size());
         const uint32_t ibBytes     = static_cast<uint32_t>(indices.size() * sizeof(uint32_t));
 
         MeshLibraryMetadata meta{};
         meta.meshCount    = static_cast<uint32_t>(entries.size());
-        meta.vertexCount  = static_cast<uint32_t>(verts.size());
+        meta.vertexCount  = vOffset;
         meta.indexCount   = static_cast<uint32_t>(indices.size());
-        meta.vertexStride = sizeof(PackedVertex);                // 48 bytes (with tangent)
+        meta.vertexStride = static_cast<uint16_t>(L.stride);
         meta.indexStride  = 4;
-        meta.flags        = MESHLIB_FLAG_HAS_TANGENT;            // signals 48-byte layout
+        meta.flags        = libFlags;
         meta.reserved     = 0;
 
         AssetHeader header{};
@@ -362,7 +422,7 @@ namespace Resource
         std::memcpy(dst, &header,        sizeof(AssetHeader));         dst += sizeof(AssetHeader);
         std::memcpy(dst, &meta,          sizeof(MeshLibraryMetadata)); dst += sizeof(MeshLibraryMetadata);
         std::memcpy(dst, entries.data(), entryBytes);                  dst += entryBytes;
-        std::memcpy(dst, verts.data(),   vbBytes);                      dst += vbBytes;
+        std::memcpy(dst, vbytes.data(),  vbBytes);                      dst += vbBytes;
         std::memcpy(dst, indices.data(), ibBytes);
         return blob;
     }

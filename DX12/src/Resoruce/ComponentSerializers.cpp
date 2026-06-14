@@ -7,6 +7,7 @@
 #include "ECS/HierarchyComponents.h"
 #include "ECS/AnimationComponents.h"
 #include "ECS/BillboardComponent.h"
+#include "ECS/BillboardFXComponent.h"
 #include "ECS/TrailComponent.h"
 #include "ECS/ParticleComponent.h"
 #include "ECS/NotifyTypes.h"
@@ -15,10 +16,15 @@
 #include "ECS/SkyboxComponent.h"
 #include "ECS/AtmosphereComponent.h"
 #include "ECS/CloudComponent.h"
+#include "ECS/HeightFogComponent.h"
+#include "ECS/TerrainComponent.h"
+#include "ECS/GrassComponent.h"
+#include "ECS/WaterComponent.h"
 #include "ECS/TODComponents.h"
 #include "ECS/ReflectionProbeComponent.h"
 #include "ECS/DDGIComponents.h"
-#include "ECS/VolumeComponent.h"
+#include "ECS/PostProcessVolumeComponent.h"
+#include "PostProcess/ProfileSystem.h"
 #include "UI/UIComponents.h"
 #include "UI/UICanvas.h"
 #include "UI/WorldSpaceUI.h"
@@ -280,9 +286,10 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             char buf[320];
             snprintf(buf, sizeof(buf),
                 "  ReflectionProbe: innerExtents=%.4f,%.4f,%.4f outerExtents=%.4f,%.4f,%.4f"
-                " realtime=%u tickIntervalFrames=%u",
+                " intensity=%.4f realtime=%u tickIntervalFrames=%u",
                 rp->innerExtents.x, rp->innerExtents.y, rp->innerExtents.z,
                 rp->outerExtents.x, rp->outerExtents.y, rp->outerExtents.z,
+                rp->intensity,
                 rp->realtime ? 1u : 0u, rp->tickIntervalFrames);
             ss << buf;
             // Path is percent-encoded so spaces / '%' survive the KV line.
@@ -303,6 +310,7 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             };
             parseVec3("innerExtents", rp.innerExtents);
             parseVec3("outerExtents", rp.outerExtents);
+            rp.intensity          = GetF(kv, "intensity", 1.0f);
             rp.realtime           = GetI(kv, "realtime", 0) != 0;
             rp.tickIntervalFrames = static_cast<uint32_t>(GetI(kv, "tickIntervalFrames", 60));
             auto bc = kv.find("bakedCubemap");
@@ -408,7 +416,7 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             snprintf(buf, sizeof(buf),
                 "  IndirectLighting: ddgi=%u ddgiScale=%.4f skyScale=%.4f"
                 " ddgiAONear=%.4f ssr=%u ssrCut=%.4f ssrEdge=%.4f"
-                " probePri=%u ddgiRoughSpec=%u\n",
+                " probePri=%u ddgiRoughSpec=%u probeBakeAmb=%.4f\n",
                 s->ddgiEnabled ? 1u : 0u,
                 s->ddgiDiffuseScale,
                 s->skyIBLDiffuseScale,
@@ -417,7 +425,8 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 s->ssrRoughnessCutoff,
                 s->ssrEdgeFadeRatio,
                 s->reflectionProbePriorityOverDDGI ? 1u : 0u,
-                s->useDDGIForRoughSpecularFallback ? 1u : 0u);
+                s->useDDGIForRoughSpecularFallback ? 1u : 0u,
+                s->reflectionProbeBakeAmbient);
             ss << buf;
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
@@ -433,182 +442,47 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 GetI(kv, "probePri",      s.reflectionProbePriorityOverDDGI ? 1 : 0) != 0;
             s.useDDGIForRoughSpecularFallback =
                 GetI(kv, "ddgiRoughSpec", s.useDDGIForRoughSpecularFallback ? 1 : 0) != 0;
+            s.reflectionProbeBakeAmbient = GetF(kv, "probeBakeAmb", s.reflectionProbeBakeAmbient);
             w.AddComponent<IndirectLightingSettingsComponent>(e, s);
         }
     });
 
-    // ==== ECS::VolumeComponent (INLINE) ====
-    // Post-process spatial volume. Persists every Volume field + per-stage
-    // override flag + override payload when present. Single-line key=value
-    // format like every other INLINE component. On read, each std::optional
-    // is populated only when its `hasXxx=1` flag is set.
-    reg.Register(std::type_index(typeid(ECS::VolumeComponent)), {
+    // ==== ECS::PostProcessVolumeComponent (INLINE) ====
+    // Post-process spatial volume. Bounds come from the entity's Transform, so
+    // only the volume's own knobs + the referenced .ppprofile asset path are
+    // serialized. On load the path is resolved to a ProfileHandle via
+    // ProfileSystem::Acquire (path-deduped, so many volumes share one profile).
+    reg.Register(std::type_index(typeid(ECS::PostProcessVolumeComponent)), {
         "PPVolume",
-        [](World& w, Entity e) { return w.GetComponent<ECS::VolumeComponent>(e) != nullptr; },
+        [](World& w, Entity e) { return w.GetComponent<ECS::PostProcessVolumeComponent>(e) != nullptr; },
         [](World& w, Entity e, std::ostringstream& ss) {
-            const auto* vc = w.GetComponent<ECS::VolumeComponent>(e);
+            const auto* vc = w.GetComponent<ECS::PostProcessVolumeComponent>(e);
             if (!vc) return;
-            const PostProcess::Volume& v = vc->volume;
 
             char buf[512];
-            ss << "  PPVolume:";
-
             snprintf(buf, sizeof(buf),
-                " enabled=%u shape=%u priority=%d blend=%.4f"
-                " cx=%.4f cy=%.4f cz=%.4f"
-                " ex=%.4f ey=%.4f ez=%.4f"
-                " label=%s"
-                " hasCAS=%u hasAE=%u hasBloom=%u hasTM=%u",
-                v.enabled ? 1u : 0u,
-                static_cast<unsigned>(v.shape),
-                v.priority, v.blendDistance,
-                v.center.x, v.center.y, v.center.z,
-                v.extents.x, v.extents.y, v.extents.z,
-                PercentEncode(std::string(v.label)).c_str(),
-                v.override.cas.has_value()          ? 1u : 0u,
-                v.override.autoExposure.has_value() ? 1u : 0u,
-                v.override.bloom.has_value()        ? 1u : 0u,
-                v.override.tonemapping.has_value()  ? 1u : 0u);
+                "  PPVolume: isGlobal=%u shape=%u priority=%.4f"
+                " blendWeight=%.4f blendDistance=%.4f layerMask=%u profile=%s\n",
+                vc->isGlobal ? 1u : 0u,
+                static_cast<unsigned>(vc->shape),
+                vc->priority, vc->blendWeight, vc->blendDistance,
+                vc->layerMask,
+                PercentEncode(vc->profilePath).c_str());
             ss << buf;
-
-            if (v.override.cas)
-            {
-                const auto& c = *v.override.cas;
-                snprintf(buf, sizeof(buf),
-                    " casEn=%u casSharp=%.4f",
-                    c.enabled ? 1u : 0u, c.sharpness);
-                ss << buf;
-            }
-
-            if (v.override.autoExposure)
-            {
-                const auto& ae = *v.override.autoExposure;
-                snprintf(buf, sizeof(buf),
-                    " aeEn=%u aeManual=%.4f aeTau=%.4f"
-                    " aeMinL=%.4f aeMaxL=%.4f aeLowP=%.4f aeHighP=%.4f"
-                    " aeMinE=%.4f aeMaxE=%.4f aeEV=%.4f aeKey=%.4f",
-                    ae.enabled ? 1u : 0u, ae.manualExposure, ae.adaptationTau,
-                    ae.minLogLuma, ae.maxLogLuma, ae.lowPercent, ae.highPercent,
-                    ae.minExposure, ae.maxExposure, ae.evBias, ae.keyValue);
-                ss << buf;
-            }
-
-            // Bloom has no user-facing fields yet — the flag alone is enough
-            // for round-trip (marks "override is enabled but empty").
-
-            if (v.override.tonemapping)
-            {
-                const auto& tm = *v.override.tonemapping;
-                const auto& g  = tm.grading;
-                // Two chunks to stay inside buf[512].
-                snprintf(buf, sizeof(buf),
-                    " tmBloom=%.4f tmGradEn=%u"
-                    " tmExp=%.4f tmCon=%.4f tmBri=%.4f"
-                    " tmLiftR=%.4f tmLiftG=%.4f tmLiftB=%.4f"
-                    " tmGamR=%.4f tmGamG=%.4f tmGamB=%.4f",
-                    tm.bloomStrength, tm.colorGradingEnabled ? 1u : 0u,
-                    g.exposure, g.contrast, g.brightness,
-                    g.lift.x, g.lift.y, g.lift.z,
-                    g.gamma.x, g.gamma.y, g.gamma.z);
-                ss << buf;
-                snprintf(buf, sizeof(buf),
-                    " tmGainR=%.4f tmGainG=%.4f tmGainB=%.4f"
-                    " tmHue=%.4f tmSat=%.4f tmVib=%.4f"
-                    " tmTemp=%.4f tmTint=%.4f tmVig=%.4f tmGrain=%.4f",
-                    g.gain.x, g.gain.y, g.gain.z,
-                    g.hueShift, g.saturation, g.vibrance,
-                    g.temperature, g.tint,
-                    g.vignetteStrength, g.filmGrain);
-                ss << buf;
-            }
-
-            ss << "\n";
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
-            ECS::VolumeComponent vc;
-            PostProcess::Volume& v = vc.volume;
+            ECS::PostProcessVolumeComponent vc;
+            vc.isGlobal      = GetI(kv, "isGlobal", 0) != 0;
+            vc.shape         = static_cast<ECS::PPVolumeShape>(GetI(kv, "shape", 0));
+            vc.priority      = GetF(kv, "priority", 0.0f);
+            vc.blendWeight   = GetF(kv, "blendWeight", 1.0f);
+            vc.blendDistance = GetF(kv, "blendDistance", 1.0f);
+            vc.layerMask     = GetU(kv, "layerMask", 0xFFFFFFFFu);
+            vc.profilePath   = GetS(kv, "profile", "");
+            if (!vc.profilePath.empty())
+                vc.profile = PostProcess::ProfileSystem::Get().Acquire(vc.profilePath);
 
-            v.enabled       = GetI(kv, "enabled",  1) != 0;
-            v.shape         = static_cast<PostProcess::VolumeShape>(
-                                  GetI(kv, "shape", 0));
-            v.priority      = GetI(kv, "priority", 0);
-            v.blendDistance = GetF(kv, "blend",    1.0f);
-            v.center.x      = GetF(kv, "cx",       0.0f);
-            v.center.y      = GetF(kv, "cy",       0.0f);
-            v.center.z      = GetF(kv, "cz",       0.0f);
-            v.extents.x     = GetF(kv, "ex",       1.0f);
-            v.extents.y     = GetF(kv, "ey",       1.0f);
-            v.extents.z     = GetF(kv, "ez",       1.0f);
-
-            const std::string label = GetS(kv, "label", "");
-            if (!label.empty())
-            {
-                // Null-terminated truncated copy — sizeof(v.label) includes
-                // the terminator.
-                const size_t n = std::min<size_t>(label.size(), sizeof(v.label) - 1);
-                std::memcpy(v.label, label.data(), n);
-                v.label[n] = '\0';
-            }
-
-            if (GetI(kv, "hasCAS", 0))
-            {
-                PostProcess::CASParams p;
-                p.enabled   = GetI(kv, "casEn",    1) != 0;
-                p.sharpness = GetF(kv, "casSharp", 0.6f);
-                v.override.cas = p;
-            }
-
-            if (GetI(kv, "hasAE", 0))
-            {
-                PostProcess::AutoExposureParams p;
-                p.enabled        = GetI(kv, "aeEn",    1) != 0;
-                p.manualExposure = GetF(kv, "aeManual", 1.0f);
-                p.adaptationTau  = GetF(kv, "aeTau",    1.5f);
-                p.minLogLuma     = GetF(kv, "aeMinL",  -5.0f);
-                p.maxLogLuma     = GetF(kv, "aeMaxL",   3.5f);
-                p.lowPercent     = GetF(kv, "aeLowP",   0.50f);
-                p.highPercent    = GetF(kv, "aeHighP",  0.85f);
-                p.minExposure    = GetF(kv, "aeMinE",   0.10f);
-                p.maxExposure    = GetF(kv, "aeMaxE",   8.00f);
-                p.evBias         = GetF(kv, "aeEV",     0.00f);
-                p.keyValue       = GetF(kv, "aeKey",    0.18f);
-                v.override.autoExposure = p;
-            }
-
-            if (GetI(kv, "hasBloom", 0))
-            {
-                v.override.bloom = PostProcess::BloomParams{};
-            }
-
-            if (GetI(kv, "hasTM", 0))
-            {
-                PostProcess::TonemappingParams p;
-                p.bloomStrength       = GetF(kv, "tmBloom",  0.04f);
-                p.colorGradingEnabled = GetI(kv, "tmGradEn", 1) != 0;
-                auto& g = p.grading;
-                g.exposure   = GetF(kv, "tmExp", 0.0f);
-                g.contrast   = GetF(kv, "tmCon", 1.0f);
-                g.brightness = GetF(kv, "tmBri", 0.0f);
-                g.lift.x     = GetF(kv, "tmLiftR", 0.0f);
-                g.lift.y     = GetF(kv, "tmLiftG", 0.0f);
-                g.lift.z     = GetF(kv, "tmLiftB", 0.0f);
-                g.gamma.x    = GetF(kv, "tmGamR",  1.0f);
-                g.gamma.y    = GetF(kv, "tmGamG",  1.0f);
-                g.gamma.z    = GetF(kv, "tmGamB",  1.0f);
-                g.gain.x     = GetF(kv, "tmGainR", 1.0f);
-                g.gain.y     = GetF(kv, "tmGainG", 1.0f);
-                g.gain.z     = GetF(kv, "tmGainB", 1.0f);
-                g.hueShift         = GetF(kv, "tmHue",  0.0f);
-                g.saturation       = GetF(kv, "tmSat",  1.0f);
-                g.vibrance         = GetF(kv, "tmVib",  0.0f);
-                g.temperature      = GetF(kv, "tmTemp", 0.0f);
-                g.tint             = GetF(kv, "tmTint", 0.0f);
-                g.vignetteStrength = GetF(kv, "tmVig",  0.0f);
-                g.filmGrain        = GetF(kv, "tmGrain", 0.0f);
-                v.override.tonemapping = p;
-            }
-
-            w.AddComponent<ECS::VolumeComponent>(e, vc);
+            w.AddComponent<ECS::PostProcessVolumeComponent>(e, vc);
         }
     });
 
@@ -629,6 +503,55 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             bb.mode      = static_cast<BillboardMode>(GetI(kv, "mode", 2));
             bb.worldSize = GetF(kv, "worldSize", 1.f);
             w.AddComponent<BillboardComponent>(e, bb);
+        }
+    });
+
+    // ==== BillboardFXComponent (INLINE — animated sprite-sheet billboard) ====
+    reg.Register(std::type_index(typeid(BillboardFXComponent)), {
+        "BillboardFX",
+        [](World& w, Entity e) { return w.GetComponent<BillboardFXComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* b = w.GetComponent<BillboardFXComponent>(e);
+            if (!b) return;
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                "  BillboardFX: cols=%d rows=%d frames=%d fps=%.4f size=%.4f"
+                " tint=%.4f_%.4f_%.4f_%.4f emissive=%.4f opacity=%.4f"
+                " face=%u blend=%u play=%u depthTest=%u playing=%u",
+                b->columns, b->rows, b->frameCount, b->fps, b->size,
+                b->tint.x, b->tint.y, b->tint.z, b->tint.w, b->emissive, b->opacity,
+                static_cast<uint32_t>(b->face), static_cast<uint32_t>(b->blend),
+                static_cast<uint32_t>(b->playback),
+                b->depthTest ? 1u : 0u, b->playing ? 1u : 0u);
+            ss << buf;
+            // Texture path percent-encoded so spaces / '%' survive the KV line.
+            if (!b->texturePath.empty())
+                ss << " texturePath=" << PercentEncode(b->texturePath);
+            ss << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            BillboardFXComponent b;
+            b.columns    = GetI(kv, "cols",   b.columns);
+            b.rows       = GetI(kv, "rows",   b.rows);
+            b.frameCount = GetI(kv, "frames", b.frameCount);
+            b.fps        = GetF(kv, "fps",    b.fps);
+            b.size       = GetF(kv, "size",   b.size);
+            if (auto it = kv.find("tint"); it != kv.end())
+                sscanf_s(it->second.c_str(), "%f_%f_%f_%f",
+                         &b.tint.x, &b.tint.y, &b.tint.z, &b.tint.w);
+            b.emissive   = GetF(kv, "emissive", b.emissive);
+            b.opacity    = GetF(kv, "opacity",  b.opacity);
+            b.face       = static_cast<BillboardFXFace>(GetI(kv, "face",  0));
+            b.blend      = static_cast<BillboardFXBlend>(GetI(kv, "blend", 1));
+            b.playback   = static_cast<BillboardFXPlayback>(GetI(kv, "play", 0));
+            b.depthTest  = GetI(kv, "depthTest", 1) != 0;
+            b.playing    = GetI(kv, "playing",   1) != 0;
+            // texturePath stays as a path; BillboardFXPass resolves the bindless
+            // slot + GPU handle on its next frame after the async load is ready.
+            b.texturePath        = GetS(kv, "texturePath");
+            b.textureBindlessIdx = -1;
+            b.textureGpuHandle   = 0;
+            w.AddComponent<BillboardFXComponent>(e, b);
         }
     });
 
@@ -1136,39 +1059,388 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                << " coverage=" << c->coverage
                << " density=" << c->density
                << " noiseScale=" << c->noiseScale
+               << " detailScale=" << c->detailNoiseScale
+               << " detailStrength=" << c->detailStrength
+               << " weatherScale=" << c->weatherScale
+               << " typeBias=" << c->cloudTypeBias
+               << " anvil=" << c->anvilBias
                << " windDir=" << c->windDirection.x << "_" << c->windDirection.y << "_" << c->windDirection.z
                << " windSpeed=" << c->windSpeed
                << " aniso=" << c->anisotropy
+               << " backG=" << c->phaseBackG
+               << " phaseBlend=" << c->phaseBlend
+               << " silverI=" << c->silverIntensity
+               << " silverS=" << c->silverSpread
                << " extinction=" << c->extinction
                << " ambient=" << c->ambientStrength
+               << " ambientTint=" << c->ambientTint.x << "_" << c->ambientTint.y << "_" << c->ambientTint.z
                << " color=" << c->cloudColor.x << "_" << c->cloudColor.y << "_" << c->cloudColor.z
+               << " maxSteps=" << c->maxSteps
                << "\n";
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            // Reader defaults mirror the CloudComponent struct defaults so
+            // scenes saved before a field existed pick up the same value the
+            // struct would.
             CloudComponent c;
-            c.enabled         = GetI(kv, "enabled", 0) != 0;
-            c.bottomAltitude  = GetF(kv, "bottom",     1500.f);
-            c.topAltitude     = GetF(kv, "top",        4000.f);
-            c.coverage        = GetF(kv, "coverage",   0.55f);
-            c.density         = GetF(kv, "density",    1.0f);
-            c.noiseScale      = GetF(kv, "noiseScale", 0.0008f);
+            c.enabled          = GetI(kv, "enabled", 0) != 0;
+            c.bottomAltitude   = GetF(kv, "bottom",         1500.f);
+            c.topAltitude      = GetF(kv, "top",            4000.f);
+            c.coverage         = GetF(kv, "coverage",       0.5f);
+            c.density          = GetF(kv, "density",        1.0f);
+            c.noiseScale       = GetF(kv, "noiseScale",     0.00025f);
+            c.detailNoiseScale = GetF(kv, "detailScale",    0.002f);
+            c.detailStrength   = GetF(kv, "detailStrength", 0.30f);
+            c.weatherScale     = GetF(kv, "weatherScale",   0.00002f);
+            c.cloudTypeBias    = GetF(kv, "typeBias",       0.f);
+            c.anvilBias        = GetF(kv, "anvil",          0.f);
             {
                 auto cit = kv.find("windDir");
                 if (cit != kv.end())
                     sscanf_s(cit->second.c_str(), "%f_%f_%f",
                              &c.windDirection.x, &c.windDirection.y, &c.windDirection.z);
             }
-            c.windSpeed       = GetF(kv, "windSpeed",  8.f);
-            c.anisotropy      = GetF(kv, "aniso",      0.55f);
-            c.extinction      = GetF(kv, "extinction", 0.08f);
-            c.ambientStrength = GetF(kv, "ambient",    0.35f);
+            c.windSpeed        = GetF(kv, "windSpeed",  8.f);
+            c.anisotropy       = GetF(kv, "aniso",      0.6f);
+            c.phaseBackG       = GetF(kv, "backG",      -0.2f);
+            c.phaseBlend       = GetF(kv, "phaseBlend", 0.3f);
+            c.silverIntensity  = GetF(kv, "silverI",    0.8f);
+            c.silverSpread     = GetF(kv, "silverS",    0.25f);
+            c.extinction       = GetF(kv, "extinction", 0.05f);
+            c.ambientStrength  = GetF(kv, "ambient",    0.5f);
+            {
+                auto cit = kv.find("ambientTint");
+                if (cit != kv.end())
+                    sscanf_s(cit->second.c_str(), "%f_%f_%f",
+                             &c.ambientTint.x, &c.ambientTint.y, &c.ambientTint.z);
+            }
             {
                 auto cit = kv.find("color");
                 if (cit != kv.end())
                     sscanf_s(cit->second.c_str(), "%f_%f_%f",
                              &c.cloudColor.x, &c.cloudColor.y, &c.cloudColor.z);
             }
+            c.maxSteps         = GetF(kv, "maxSteps",   96.f);
             w.AddComponent<CloudComponent>(e, c);
+        }
+    });
+
+    // ==== HeightFogComponent (INLINE — UE-style exponential height fog) ====
+    reg.Register(std::type_index(typeid(HeightFogComponent)), {
+        "HeightFog",
+        [](World& w, Entity e) { return w.GetComponent<HeightFogComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* f = w.GetComponent<HeightFogComponent>(e);
+            if (!f) return;
+            ss << "  HeightFog: enabled=" << (f->enabled ? 1 : 0)
+               << " density="    << f->fogDensity
+               << " falloff="    << f->fogHeightFalloff
+               << " height="     << f->fogHeight
+               << " start="      << f->startDistance
+               << " maxOpacity=" << f->maxOpacity
+               << " color=" << f->fogColor.x << "_" << f->fogColor.y << "_" << f->fogColor.z
+               << " sun="        << f->sunInscatterIntensity
+               << " aniso="      << f->anisotropy
+               << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            // Reader defaults mirror the HeightFogComponent struct defaults.
+            HeightFogComponent f;
+            f.enabled               = GetI(kv, "enabled", 0) != 0;
+            f.fogDensity            = GetF(kv, "density",    0.002f);
+            f.fogHeightFalloff      = GetF(kv, "falloff",    0.02f);
+            f.fogHeight             = GetF(kv, "height",     0.f);
+            f.startDistance         = GetF(kv, "start",      0.f);
+            f.maxOpacity            = GetF(kv, "maxOpacity", 1.f);
+            {
+                auto cit = kv.find("color");
+                if (cit != kv.end())
+                    sscanf_s(cit->second.c_str(), "%f_%f_%f",
+                             &f.fogColor.x, &f.fogColor.y, &f.fogColor.z);
+            }
+            f.sunInscatterIntensity = GetF(kv, "sun",        1.f);
+            f.anisotropy            = GetF(kv, "aniso",      0.7f);
+            w.AddComponent<HeightFogComponent>(e, f);
+        }
+    });
+
+    // ==== TerrainComponent (heightmap tile + 4 PBR layers) ====
+    // Closes the long-standing gap where terrain authored in the editor
+    // vanished on save/load (it only existed in code scenes before).
+    reg.Register(std::type_index(typeid(TerrainComponent)), {
+        "Terrain",
+        [](World& w, Entity e) { return w.GetComponent<TerrainComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* t = w.GetComponent<TerrainComponent>(e);
+            if (!t) return;
+            ss << "  Terrain: heightmap=" << PercentEncode(t->heightmapPath)
+               << " center=" << t->worldCenter.x << "_" << t->worldCenter.y << "_" << t->worldCenter.z
+               << " size=" << t->worldSize
+               << " heightScale=" << t->heightScale
+               << " tiles=" << t->tilesPerSide
+               << " uvOff=" << t->heightmapUVOffset.x << "_" << t->heightmapUVOffset.y
+               << " uvScale=" << t->heightmapUVScale.x << "_" << t->heightmapUVScale.y
+               << " splatmap=" << PercentEncode(t->splatmapPath)
+               << " layerCount=" << t->layers.size()
+               << " hbOn=" << (t->heightBlendEnabled ? 1 : 0)
+               << " hbStr=" << t->heightBlendStrength
+               << " hbRng=" << t->heightBlendRange;
+            for (size_t li = 0; li < t->layers.size(); ++li)
+            {
+                const auto& l = t->layers[li];
+                ss << " l" << li << "a=" << PercentEncode(l.albedoPath)
+                   << " l" << li << "n=" << PercentEncode(l.normalPath)
+                   << " l" << li << "r=" << PercentEncode(l.armPath)
+                   << " l" << li << "d=" << PercentEncode(l.dispPath)
+                   << " l" << li << "t=" << l.tilingScale
+                   << " l" << li << "h=" << l.minHeight << "_" << l.maxHeight << "_" << l.fadeHeight
+                   << " l" << li << "s=" << l.minSlopeDeg << "_" << l.maxSlopeDeg << "_" << l.fadeSlopeDeg;
+            }
+            ss << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            TerrainComponent t;
+            auto getS = [&kv](const std::string& key) -> std::string {
+                auto it = kv.find(key);
+                return (it != kv.end()) ? PercentDecode(it->second) : std::string();
+            };
+            t.heightmapPath = getS("heightmap");
+            t.splatmapPath  = getS("splatmap");
+            {
+                auto it = kv.find("center");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &t.worldCenter.x, &t.worldCenter.y, &t.worldCenter.z);
+            }
+            t.worldSize    = GetF(kv, "size",        1024.f);
+            t.heightScale  = GetF(kv, "heightScale", 100.f);
+            t.tilesPerSide = GetU(kv, "tiles",       128u);
+            {
+                auto it = kv.find("uvOff");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f",
+                             &t.heightmapUVOffset.x, &t.heightmapUVOffset.y);
+            }
+            {
+                auto it = kv.find("uvScale");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f",
+                             &t.heightmapUVScale.x, &t.heightmapUVScale.y);
+            }
+            // Height-correlated blend (global). Absent in old scenes → defaults
+            // (disabled), so they load identical to the plain linear blend.
+            t.heightBlendEnabled  = GetU(kv, "hbOn", 0u) != 0u;
+            t.heightBlendStrength = GetF(kv, "hbStr", t.heightBlendStrength);
+            t.heightBlendRange    = GetF(kv, "hbRng", t.heightBlendRange);
+
+            // Layer count is data-driven; old scenes (no layerCount key) had
+            // exactly 4 layers → default to 4 so they load byte-identically.
+            uint32_t layerCount = GetU(kv, "layerCount", 4u);
+            if (layerCount > 64u) layerCount = 64u;   // guard against a corrupt file
+            t.layers.assign(layerCount, TerrainLayer{});
+            for (uint32_t li = 0; li < layerCount; ++li)
+            {
+                auto& l = t.layers[li];
+                const std::string p = "l" + std::to_string(li);
+                l.albedoPath  = getS(p + "a");
+                l.normalPath  = getS(p + "n");
+                l.armPath     = getS(p + "r");
+                l.dispPath    = getS(p + "d");
+                l.tilingScale = GetF(kv, (p + "t").c_str(), l.tilingScale);
+                auto it = kv.find(p + "h");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &l.minHeight, &l.maxHeight, &l.fadeHeight);
+                it = kv.find(p + "s");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &l.minSlopeDeg, &l.maxSlopeDeg, &l.fadeSlopeDeg);
+            }
+            w.AddComponent<TerrainComponent>(e, std::move(t));
+        }
+    });
+
+    // ==== GrassComponent (procedural GoT-style grass field) ====
+    reg.Register(std::type_index(typeid(GrassComponent)), {
+        "Grass",
+        [](World& w, Entity e) { return w.GetComponent<GrassComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* g = w.GetComponent<GrassComponent>(e);
+            if (!g) return;
+            ss << "  Grass: enabled=" << (g->enabled ? 1 : 0)
+               << " center=" << g->worldCenter.x << "_" << g->worldCenter.y << "_" << g->worldCenter.z
+               << " size=" << g->worldSize
+               << " patches=" << g->patchesPerSide
+               << " density=" << g->density
+               << " lod=" << g->lod0Dist << "_" << g->lod1Dist << "_" << g->cullDist
+               << " blade=" << g->bladeHeight << "_" << g->bladeHeightVar << "_"
+                            << g->bladeWidth << "_" << g->tiltMaxDeg << "_" << g->bendAmount
+               << " windDir=" << g->windDir.x << "_" << g->windDir.y
+               << " wind=" << g->windStrength << "_" << g->windSpeed << "_" << g->windScale
+               << " clump=" << g->clumpCellSize << "_" << g->clumpBlend
+               << " gateY=" << g->minWorldY << "_" << g->maxWorldY
+               << " maxSlope=" << g->maxSlopeDeg
+               << " baseColor=" << g->baseColor.x << "_" << g->baseColor.y << "_" << g->baseColor.z
+               << " tipColor=" << g->tipColor.x << "_" << g->tipColor.y << "_" << g->tipColor.z
+               << " cnoise=" << g->colorNoiseScale << "_" << g->colorNoiseAmount
+               << " look=" << g->rootAO << "_" << g->normalBlend << "_" << g->viewThicken
+                           << "_" << g->farWidthMul << "_" << g->roughness
+               << " seed=" << g->seed
+               << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            GrassComponent g;
+            g.enabled = GetI(kv, "enabled", 1) != 0;
+            {
+                auto it = kv.find("center");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &g.worldCenter.x, &g.worldCenter.y, &g.worldCenter.z);
+            }
+            g.worldSize      = GetF(kv, "size",    1024.f);
+            g.patchesPerSide = GetU(kv, "patches", 256u);
+            g.density        = GetF(kv, "density", 8.f);
+            {
+                auto it = kv.find("lod");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &g.lod0Dist, &g.lod1Dist, &g.cullDist);
+            }
+            {
+                auto it = kv.find("blade");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f_%f_%f",
+                             &g.bladeHeight, &g.bladeHeightVar, &g.bladeWidth,
+                             &g.tiltMaxDeg, &g.bendAmount);
+            }
+            {
+                auto it = kv.find("windDir");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f", &g.windDir.x, &g.windDir.y);
+            }
+            {
+                auto it = kv.find("wind");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &g.windStrength, &g.windSpeed, &g.windScale);
+            }
+            {
+                auto it = kv.find("clump");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f",
+                             &g.clumpCellSize, &g.clumpBlend);
+            }
+            {
+                auto it = kv.find("gateY");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f", &g.minWorldY, &g.maxWorldY);
+            }
+            g.maxSlopeDeg = GetF(kv, "maxSlope", 38.f);
+            {
+                auto it = kv.find("baseColor");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &g.baseColor.x, &g.baseColor.y, &g.baseColor.z);
+            }
+            {
+                auto it = kv.find("tipColor");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &g.tipColor.x, &g.tipColor.y, &g.tipColor.z);
+            }
+            {
+                auto it = kv.find("cnoise");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f",
+                             &g.colorNoiseScale, &g.colorNoiseAmount);
+            }
+            {
+                auto it = kv.find("look");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f_%f_%f",
+                             &g.rootAO, &g.normalBlend, &g.viewThicken,
+                             &g.farWidthMul, &g.roughness);
+            }
+            g.seed = GetU(kv, "seed", 1337u);
+            w.AddComponent<GrassComponent>(e, g);
+        }
+    });
+
+    // ==== WaterComponent (flat water tile — Fresnel + flow normals) ====
+    reg.Register(std::type_index(typeid(WaterComponent)), {
+        "Water",
+        [](World& w, Entity e) { return w.GetComponent<WaterComponent>(e) != nullptr; },
+        [](World& w, Entity e, std::ostringstream& ss) {
+            const auto* c = w.GetComponent<WaterComponent>(e);
+            if (!c) return;
+            ss << "  Water: enabled=" << (c->enabled ? 1 : 0)
+               << " center=" << c->worldCenter.x << "_" << c->worldCenter.y << "_" << c->worldCenter.z
+               << " size=" << c->worldSize
+               << " deep=" << c->deepColor.x << "_" << c->deepColor.y << "_" << c->deepColor.z
+               << " shallow=" << c->shallowColor.x << "_" << c->shallowColor.y << "_" << c->shallowColor.z
+               << " absorb=" << c->absorbDist
+               << " shore=" << c->shoreFade
+               << " flowDir=" << c->flowDir.x << "_" << c->flowDir.y
+               << " flow=" << c->flowSpeed << "_" << c->normalTiling << "_" << c->normalStrength
+               << " nmapA=" << PercentEncode(c->normalMapAPath)
+               << " nmapB=" << PercentEncode(c->normalMapBPath)
+               << " shade=" << c->fresnelF0 << "_" << c->reflStrength << "_" << c->specPower
+               << " grid=" << c->gridQuads
+               << "\n";
+        },
+        [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
+            WaterComponent c;
+            c.enabled = GetI(kv, "enabled", 1) != 0;
+            {
+                auto it = kv.find("center");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &c.worldCenter.x, &c.worldCenter.y, &c.worldCenter.z);
+            }
+            c.worldSize = GetF(kv, "size", 1024.f);
+            {
+                auto it = kv.find("deep");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &c.deepColor.x, &c.deepColor.y, &c.deepColor.z);
+            }
+            {
+                auto it = kv.find("shallow");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &c.shallowColor.x, &c.shallowColor.y, &c.shallowColor.z);
+            }
+            c.absorbDist = GetF(kv, "absorb", 6.f);
+            c.shoreFade  = GetF(kv, "shore",  1.2f);
+            {
+                auto it = kv.find("flowDir");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f", &c.flowDir.x, &c.flowDir.y);
+            }
+            {
+                auto it = kv.find("flow");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &c.flowSpeed, &c.normalTiling, &c.normalStrength);
+            }
+            // Only overwrite when the key exists so old saves keep the
+            // component's default flow-map paths.
+            {
+                auto it = kv.find("nmapA");
+                if (it != kv.end()) c.normalMapAPath = PercentDecode(it->second);
+            }
+            {
+                auto it = kv.find("nmapB");
+                if (it != kv.end()) c.normalMapBPath = PercentDecode(it->second);
+            }
+            {
+                auto it = kv.find("shade");
+                if (it != kv.end())
+                    sscanf_s(it->second.c_str(), "%f_%f_%f",
+                             &c.fresnelF0, &c.reflStrength, &c.specPower);
+            }
+            c.gridQuads = GetU(kv, "grid", 128u);
+            w.AddComponent<WaterComponent>(e, c);
         }
     });
 
@@ -1399,7 +1671,7 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 " springStiffness=%.4f springDamping=%.4f springMass=%.4f"
                 " springGravity=%.4f springMaxDisp=%.4f"
                 " springChildStiffness=%.4f springChildDamping=%.4f"
-                " springChildMass=%.4f springChildGravity=%.4f springChildMaxDisp=%.4f\n",
+                " springChildMass=%.4f springChildGravity=%.4f springChildMaxDisp=%.4f",
                 cp->damping, cp->gravity, cp->stiffness,
                 cp->iterations, cp->substeps, cp->maxVelocity, cp->localStiffness,
                 cp->skirtDamping, cp->skirtGravity, cp->skirtStiffness,
@@ -1409,6 +1681,41 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
                 cp->springChildStiffness, cp->springChildDamping,
                 cp->springChildMass, cp->springChildGravity, cp->springChildMaxDisp);
             ss << buf;
+
+            // Authored chain groups (KawaiiPhysics-style) — streamed onto the
+            // SAME line so the read path sees them in this component's flat
+            // KVMap. Emitted only when present, so untouched legacy scenes
+            // serialize byte-identically (no diff churn).
+            if (!cp->groups.empty())
+            {
+                ss << " groups=" << cp->groups.size();
+                for (int i = 0; i < static_cast<int>(cp->groups.size()); ++i)
+                {
+                    const auto& g = cp->groups[i];
+                    ss << " g" << i << "_name=" << PercentEncode(g.name)
+                       << " g" << i << "_root=" << PercentEncode(g.rootBone)
+                       << " g" << i << "_type=" << static_cast<int>(g.type)
+                       << " g" << i << "_en="   << (g.enabled ? 1 : 0)
+                       << " g" << i << "_rg="   << g.ringGroup
+                       << " g" << i << "_ri="   << g.ringIndex
+                       << " g" << i << "_pg="   << g.pairGroupId
+                       << " g" << i << "_es="    << (g.excludeSubtree ? 1 : 0)
+                       << " g" << i << "_ovrEn=" << (g.ovrEnabled ? 1 : 0)
+                       << " g" << i << "_ovrD="  << g.ovrDamping
+                       << " g" << i << "_ovrG="  << g.ovrGravity
+                       << " g" << i << "_ovrS="  << g.ovrStiffness
+                       << " g" << i << "_ovrL="  << g.ovrLocalStiffness
+                       << " g" << i << "_ovrTH=" << g.ovrTipHold
+                       << " g" << i << "_ovrSk=" << g.ovrSpringStiffness
+                       << " g" << i << "_ovrSd=" << g.ovrSpringDamping
+                       << " g" << i << "_ovrSm=" << g.ovrSpringMass
+                       << " g" << i << "_ovrSg=" << g.ovrSpringGravity
+                       << " g" << i << "_exc="   << g.excludeCount;
+                    for (int j = 0; j < g.excludeCount && j < ChainGroupDef::MAX_EXCLUDE; ++j)
+                        ss << " g" << i << "_e" << j << "=" << PercentEncode(g.excludeBones[j]);
+                }
+            }
+            ss << "\n";
         },
         [](World& w, Entity e, const KVMap& kv, Resource::AssetManager*) {
             ChainPhysicsComponent cp;
@@ -1435,6 +1742,50 @@ void RegisterAllComponentSerializers(ComponentSerializerRegistry& reg)
             cp.springChildMass      = GetF(kv, "springChildMass",      cp.springChildMass);
             cp.springChildGravity   = GetF(kv, "springChildGravity",   cp.springChildGravity);
             cp.springChildMaxDisp   = GetF(kv, "springChildMaxDisp",   cp.springChildMaxDisp);
+
+            // Authored chain groups (absent in legacy scenes -> groupCount stays
+            // 0 -> runtime keeps using the legacy bone-name keyword path).
+            int gc = GetI(kv, "groups", 0);
+            if (gc < 0) gc = 0;
+            if (gc > ChainPhysicsComponent::MAX_GROUPS) gc = ChainPhysicsComponent::MAX_GROUPS;
+            cp.groups.resize(static_cast<size_t>(gc));
+            for (int i = 0; i < gc; ++i)
+            {
+                ChainGroupDef& g = cp.groups[i];
+                char key[32];
+                snprintf(key, sizeof(key), "g%d_name", i);
+                snprintf(g.name, sizeof(g.name), "%s", GetS(kv, key).c_str());
+                snprintf(key, sizeof(key), "g%d_root", i);
+                snprintf(g.rootBone, sizeof(g.rootBone), "%s", GetS(kv, key).c_str());
+                snprintf(key, sizeof(key), "g%d_type", i);
+                g.type = static_cast<ChainGroupType>(GetI(kv, key, 0));
+                snprintf(key, sizeof(key), "g%d_en", i);   g.enabled        = GetI(kv, key, 1) != 0;
+                snprintf(key, sizeof(key), "g%d_rg", i);   g.ringGroup      = GetI(kv, key, 0);
+                snprintf(key, sizeof(key), "g%d_ri", i);   g.ringIndex      = GetI(kv, key, -1);
+                snprintf(key, sizeof(key), "g%d_pg", i);   g.pairGroupId    = GetI(kv, key, -1);
+                snprintf(key, sizeof(key), "g%d_es", i);    g.excludeSubtree     = GetI(kv, key, 1) != 0;
+                snprintf(key, sizeof(key), "g%d_ovrEn", i); g.ovrEnabled         = GetI(kv, key, 0) != 0;
+                snprintf(key, sizeof(key), "g%d_ovrD", i);  g.ovrDamping         = GetF(kv, key, g.ovrDamping);
+                snprintf(key, sizeof(key), "g%d_ovrG", i);  g.ovrGravity         = GetF(kv, key, g.ovrGravity);
+                snprintf(key, sizeof(key), "g%d_ovrS", i);  g.ovrStiffness       = GetF(kv, key, g.ovrStiffness);
+                snprintf(key, sizeof(key), "g%d_ovrL", i);  g.ovrLocalStiffness  = GetF(kv, key, g.ovrLocalStiffness);
+                snprintf(key, sizeof(key), "g%d_ovrTH", i); g.ovrTipHold         = GetF(kv, key, g.ovrTipHold);
+                snprintf(key, sizeof(key), "g%d_ovrSk", i); g.ovrSpringStiffness = GetF(kv, key, g.ovrSpringStiffness);
+                snprintf(key, sizeof(key), "g%d_ovrSd", i); g.ovrSpringDamping   = GetF(kv, key, g.ovrSpringDamping);
+                snprintf(key, sizeof(key), "g%d_ovrSm", i); g.ovrSpringMass      = GetF(kv, key, g.ovrSpringMass);
+                snprintf(key, sizeof(key), "g%d_ovrSg", i); g.ovrSpringGravity   = GetF(kv, key, g.ovrSpringGravity);
+                snprintf(key, sizeof(key), "g%d_exc", i);
+                int exc = GetI(kv, key, 0);
+                if (exc < 0) exc = 0;
+                if (exc > ChainGroupDef::MAX_EXCLUDE) exc = ChainGroupDef::MAX_EXCLUDE;
+                g.excludeCount = exc;
+                for (int j = 0; j < exc; ++j)
+                {
+                    snprintf(key, sizeof(key), "g%d_e%d", i, j);
+                    snprintf(g.excludeBones[j], sizeof(g.excludeBones[j]), "%s", GetS(kv, key).c_str());
+                }
+            }
+
             w.AddComponent<ChainPhysicsComponent>(e, cp);
         }
     });

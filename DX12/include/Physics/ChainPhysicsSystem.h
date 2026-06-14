@@ -27,6 +27,76 @@
 #include <cstdint>
 
 // ---------------------------------------------------------------------------
+// Explicit chain-group authoring model (Unreal "KawaiiPhysics" style).
+//
+// Pick a root bone -> physics propagates to its WHOLE descendant subtree; list
+// bones to exclude (optionally together with their subtree). This replaces the
+// legacy bone-NAME keyword classification (ClassifyBone) as the RUNTIME source
+// of "which bones simulate". When ChainPhysicsComponent.groupCount == 0 the
+// legacy keyword path still runs verbatim (back-compat for existing scenes).
+//
+// Bone identity is stored as a NAME (resolved to an index at InitEntity via a
+// skeleton lookup) so re-importing the asset with shifted bone indices does not
+// silently corrupt authored chains.
+// ---------------------------------------------------------------------------
+// Physics-type classification (independent of use-case naming): a Chain is an
+// independent verlet strand (hair / rope / antenna / tail); Cloth is a ring of
+// chains tied by horizontal+shear constraints (skirt / cape / coat / dress);
+// Spring is a single spring-damper jiggle bone (chest / belly / ...).
+// Integer values are serialized — keep the order stable.
+enum class ChainGroupType : uint8_t
+{
+    Chain  = 0,  // independent verlet chain  (solver StrandType::Hair)
+    Cloth  = 1,  // ring-constrained cloth     (solver StrandType::Skirt)
+    Spring = 2,  // single spring-damper jiggle bone
+};
+
+struct ChainGroupDef
+{
+    char           name[48]     = {};   // editor label, free text
+    char           rootBone[64] = {};   // SERIALIZED IDENTITY = bone NAME (matches boneNames[i][64])
+    ChainGroupType type         = ChainGroupType::Chain;
+    bool           enabled      = true;
+
+    // ---- Exclusion (KawaiiPhysics ExcludeBones) ----
+    static constexpr int MAX_EXCLUDE = 16;
+    char  excludeBones[MAX_EXCLUDE][64] = {}; // bone NAMES dropped from this group's descent
+    int   excludeCount   = 0;
+    bool  excludeSubtree = true;  // true: drop the bone AND its descendants; false: only the bone
+
+    // ---- Skirt ring identity (reproduces ParseSkirtID grouping) ----
+    int   ringGroup = 0;    // shared horizontal/shear constraint set id
+    int   ringIndex = -1;   // position around the ring; -1 = append order
+
+    // ---- Spring pairing (replaces the "Chest"+shared-parent heuristic) ----
+    int   pairGroupId = -1; // >=0: Spring groups sharing this id get a virtual midpoint root
+
+    // ---- Per-group physics override (KawaiiPhysics per-chain material) ----
+    // ovrEnabled == false: this group inherits the type-global params on
+    // ChainPhysicsComponent (chains of one type share one preset — the original
+    // behavior). true: these values replace the globals for THIS group only, so
+    // e.g. a stiff scarf and floppy hair can both be Hair-type. The automatic
+    // root→tip stiffness falloff still applies on top, so per-bone tuning is
+    // rarely needed.
+    bool  ovrEnabled = false;
+    // Hair / Skirt (Verlet+PBD) overrides:
+    float ovrDamping        = 0.15f; // velocity retention (lower = settles faster)
+    float ovrGravity        = -10.f;
+    float ovrStiffness      = 1.5f;  // constraint stiffness (higher = more rigid)
+    float ovrLocalStiffness = 0.05f; // pull toward rest pose (higher = holds shape)
+    // Floor for the root->tip "hold shape" falloff. The pull blend is
+    // localStiffness * max((1-t)^2, ovrTipHold), so 0 = tip fully free (classic
+    // floppy chain), 1 = whole chain held uniformly. Raise it for short bang
+    // chains that must keep their silhouette (avoids the gravity=-1000 hack).
+    float ovrTipHold        = 0.f;
+    // Spring (jiggle) overrides:
+    float ovrSpringStiffness = 120.f;
+    float ovrSpringDamping   = 12.f;
+    float ovrSpringMass      = 1.f;
+    float ovrSpringGravity   = -2.f;
+};
+
+// ---------------------------------------------------------------------------
 // ECS component: tag an entity for chain physics simulation
 // ---------------------------------------------------------------------------
 struct ChainPhysicsComponent
@@ -63,6 +133,17 @@ struct ChainPhysicsComponent
     float springChildMass      = 0.5f;    // low mass — fast response
     float springChildGravity   = -0.5f;
     float springChildMaxDisp   = 0.5f;    // small displacement from root
+
+    // ---- Explicit authored chains (KawaiiPhysics-style) ----
+    // When non-empty, these groups — NOT the legacy bone-name keyword
+    // classification — are the runtime source of truth for which bones simulate.
+    // Empty => fall back to the legacy ClassifyBone path (back-compat).
+    //
+    // Heap-backed (std::vector), NOT an inline array: ChainGroupDef is ~1 KB
+    // (exclude-name table), so a fixed groups[64] would make this component ~76 KB
+    // and World::AddComponent's by-value parameter blew the stack on scene load.
+    static constexpr int MAX_GROUPS = 64;  // soft cap enforced by the editor UI
+    std::vector<ChainGroupDef> groups;
 };
 
 // ---------------------------------------------------------------------------
@@ -114,6 +195,19 @@ public:
     // Clear all cached entity data (call before World::Clear).
     void ClearAll() { m_entityData.clear(); }
 
+    // Editor overlay query: this frame's bone world matrices (skeleton space)
+    // for an initialized entity, or nullptr if no simulation data exists yet
+    // (e.g. the frame right after Invalidate, before the next Update). World
+    // position of bone b = (m._41, m._42, m._43) of the returned matrices[b].
+    const std::vector<DirectX::XMFLOAT4X4>* GetBoneWorldMatrices(Entity e) const;
+
+    // Editor "Auto-detect from bone names": run the legacy keyword
+    // classification (ClassifyBone / ParseSkirtID) once and populate cfg.groups
+    // with explicit, editable ChainGroupDef entries. Shared by the editor button
+    // so the keyword logic lives in exactly one place.
+    static void BuildGroupsFromNames(const SkeletonAsset& skel,
+                                     ChainPhysicsComponent& cfg);
+
 private:
     // ----- Internal data structures ------------------------------------------
 
@@ -133,6 +227,7 @@ private:
         float    restLength;
         float    stiffness;
         float    segmentT = 0.f; // 0=root, 1=tip — used for horizontal stiffness decay
+        uint8_t  groupIdx = 0xFF; // source ChainGroupDef index (0xFF = none -> globals)
     };
 
     enum class StrandType { Hair, Skirt };
@@ -143,6 +238,7 @@ private:
         uint32_t   particleOffset; // into m_particles[]
         uint32_t   particleCount;
         int        ringIndex;      // skirt: ring position (0..N-1); hair: -1
+        uint8_t    groupIdx = 0xFF; // source ChainGroupDef index (0xFF = none -> globals)
     };
 
     // SpringBone — single jiggle bone (Chest, Butt, etc.)
@@ -165,6 +261,8 @@ private:
         uint32_t parentBoneIndex = ~0u;   // for virtual: skeleton parent bone for world xform
         // Child offset from virtual root's goal (set at init, used each frame)
         DirectX::XMFLOAT3 offsetFromRoot = { 0.f, 0.f, 0.f };
+
+        uint8_t  groupIdx = 0xFF;   // source ChainGroupDef index (0xFF = none -> globals)
     };
 
     // Per-entity physics data (initialized once, simulated each frame).
@@ -190,7 +288,8 @@ private:
     };
 
     // ----- Chain detection ---------------------------------------------------
-    void InitEntity(Entity e, const SkeletonAsset& skel,
+    void InitEntity(Entity e, const ChainPhysicsComponent& cfg,
+                    const SkeletonAsset& skel,
                     const AnimationSystem::LocalPose* poses);
 
     // DFS from 'root' through physics children. At forks, each branch becomes

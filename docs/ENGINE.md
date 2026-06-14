@@ -15,7 +15,8 @@ are O(1) via swap-with-back.
   can finalize; listeners survive `World::Clear()`.
 - Components include scene-graph (`Parent`, `Children`, `LocalTransform`, `GlobalTransform`, `Visibility`,
   `RenderLayer`, `WorldAabb`), animation / morph / socket / follow, physics + character-controller, AI / nav /
-  intent, audio, video, UI, decal, terrain, beam / particle / trail, reflection-probe / DDGI / cloud / TOD.
+  intent, audio, video, UI, decal, terrain / grass / water, beam / particle / trail / billboard-FX,
+  reflection-probe / DDGI / cloud / height-fog / TOD, post-process volume.
 
 ## System Scheduler
 
@@ -63,10 +64,19 @@ dependency-aware parallel batching model. Systems are registered once in `App::R
 
 ## Scene Graph & Game Flow
 
-- **`GameModeStack`** (`IGameMode`) is the active scene-flow model: Title → Game → End (plus Test, ShaderLab),
-  each `Clear()`-ing the world and `LoadScene`-ing an `.iscn` (or spawning fallback camera / light / skybox);
-  transitions via `requestReplaceMode`. `GameScene` resolves `startup_scene` from `game.json`. (The older
-  `SceneManager` / `IScene` stack is a parallel legacy abstraction, not on the active path.)
+- **`GameModeStack`** (`IGameMode`) is the active scene-flow model, now built on a single **data-driven `DataScene`**
+  mode that replaces the old hardcoded Title / Game / End classes. Scenes are declared in a `game.json` registry
+  (`name → .iscn` path + optional Lua scene script; `.iscn` may also carry its own `sceneScript`); the `startup_scene`
+  boots a `DataScene` wrapping it, and transitions go through `requestReplaceMode`. Editor / ShaderLab keep their
+  dedicated `TestScene` / `ShaderLabScene` tool modes.
+- **`SceneManager`** coordinates the blocking world-reload pipeline (used by `DataScene::Init` and the Lua `Scene.Load`
+  path): `WaitIdle` + GPU deferred release → `Renderer::OnWorldClear` (stash caches) → `PhysicsSystem::OnWorldClear`
+  (destroy Jolt bodies before `World::Clear` to avoid recycled-entity-ID orphans) → `LoadScene` (`.iscn` + companion
+  navmesh) → queue the scene-script swap. Unresolved names/paths fall back to `SpawnDefaultWorld`
+  (camera + directional light + IBL skybox).
+- **Scene scripts** — each scene may name a Lua script with deferred `OnSceneEnter` / `OnSceneUpdate` / `OnSceneExit`
+  callbacks, serviced by `ScriptSystem` on the next tick while the world is valid (so they respect editor play/pause
+  gating). Driven from Lua via `Scene.Load / LoadInstant / Reload / Current / List`.
 - **`SceneInstanceLoader`** — runtime, Assimp-free `.iscn` instancer (`SceneLoader` runtime path is retired).
 - **`TransformSystem::Propagate`** — BFS hierarchy update, propagates `Visibility::inherited_hidden`,
   recomputes `WorldAabb`; allocation-free in steady state.
@@ -152,7 +162,8 @@ queries, and `Axis(pos, neg)`; resets on focus loss. (Mouse remains in `System/M
 - Time-scale (`SetTimeScale`) for hit-stop / bullet-time; `Engine.AfterDelay` timers tick on real (unscaled) dt.
 - **Editor-exposed script variables** (schema + per-entity overrides injected before `OnSpawn`).
 - Binding modules: math types, `Input`, `Time`, `Camera`, `Animation`, `Physics.Raycast`, `Nav.*`,
-  `Character.*` / `Player.*`, `Intent.*` / `AI.*`, BT actions, `ui` widgets, ECS commands.
+  `Character.*` / `Player.*`, `Intent.*` / `AI.*`, BT actions, `ui` widgets, ECS commands,
+  `Scene.*` (data-driven scene flow), `PostProcess.*` (volume spawn / per-property override / transient envelopes).
 
 ## Audio
 

@@ -41,9 +41,14 @@ This project was developed with the assistance of [Claude Code](https://claude.c
 | **Bloom**                  | "Sledgehammer" 13-tap downsample + 3×3 tent upsample, Karis-average for first downsample (Jorge Jiménez / Call of Duty Advanced Warfare 2014) |
 | **Atmosphere**             | Hillaire 2020 — *"A Scalable and Production Ready Sky and Atmosphere Rendering Technique"*                                                   |
 | **Volumetric Fog**         | Bart Wronski 2014 (*"Volumetric Fog: Unified Compute Shader Based Solution"*) — froxel grid + temporal reprojection                          |
+| **Volumetric Clouds**      | Schneider 2015 / 2017 (*"The Real-time Volumetric Cloudscapes of Horizon Zero Dawn"* / Nubis) — Perlin-Worley + weather map; Hillaire/Frostbite energy-conserving multi-scatter; Wrenninge multi-scatter approximation |
+| **Height Fog**             | Analytic exponential height fog (Unreal-style) — closed-form view-ray optical-depth integration + Henyey-Greenstein sun inscatter            |
 | **Clustered Shading**      | Olsson / Billeter / Assarsson 2012, Doom 2016 implementation                                                                                 |
 | **Outline**                | Inverted-hull (Genshin / NPR style) + screen-space Roberts edge on object-ID/normal/depth                                                    |
 | **Glass Shatter**          | Voronoi shard pre-cut + per-shard 2D rigid-body sim                                                                                          |
+| **Procedural Grass**       | GPU mesh-shader quadratic-Bézier ribbon blades, *Ghost of Tsushima* clumping / wind model (Wohllaib, GDC 2021)                              |
+| **Depth of Field**         | Focus-distance circle-of-confusion, scatter-as-gather two-ring gather                                                                        |
+| **NPR Stylize**            | Kuwahara filter (Kuwahara 1976; anisotropic Kyprianidis et al. 2009), ordered 4×4 Bayer dither, luminance halftone, multi-angle crosshatch   |
 | **Decals**                 | Volume-projected (cube) clustered decals, similar to Doom 2016 / Wicked Engine decal cluster path
 | **Tracer (cyl. billboard)** | `cross(beamAxis, toCamera)` cylindrical billboard with parallel-degenerate fallback                                                         |
 | **TAA Velocity Dilation**  | Drobot / Lottes nearest-depth dilation                                                                                                       |
@@ -65,5 +70,3 @@ Bundled under `DX12/asset/`:
 
 - **Sponza** (Crytek / Frank Meinl / Intel) — classic GI / lighting reference scene.
 - **Bistro** (Amazon Lumberyard) — DDGI verification scene.
-- **PMX/VMD test rig** — MMD pipeline verification.
-- **IBL** — multiple HDRI cubemaps with pre-baked irradiance + radiance.

@@ -37,6 +37,7 @@ static std::string BuildText(const MaterialComponent& mat)
     s << "outline = "       << (mat.IsOutlineEnabled() ? "1" : "0") << "\n";
     s << "excludeFromSsao = "
         << ((mat._flags & MaterialComponent::EXCLUDE_FROM_SSAO) ? "1" : "0") << "\n";
+    s << "useVertexColor = " << (mat.IsUsingVertexColors() ? "1" : "0") << "\n";
 
     // outlinePixels lives outside the param schema (it's tied to the OUTLINE
     // flag UI, not surfaced as a generic field).
@@ -273,6 +274,11 @@ bool LoadMaterial(const std::string& path, MaterialComponent& mat)
             {
                 if (val == "1") mat._flags |=  MaterialComponent::EXCLUDE_FROM_SSAO;
                 else            mat._flags &= ~MaterialComponent::EXCLUDE_FROM_SSAO;
+            }
+            else if (key == "useVertexColor")
+            {
+                if (val == "1") mat._flags |=  MaterialComponent::USE_VERTEXCOLORS;
+                else            mat._flags &= ~MaterialComponent::USE_VERTEXCOLORS;
             }
             else if (key == "outlinePixels") mat.outlinePixels = std::stof(val);
             // ---- UV tiling / offset ------------------------------------------

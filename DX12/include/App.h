@@ -7,6 +7,7 @@
 #endif
 #include "Scene/GameModeStack.h"
 #include "Scene/SceneTransitionManager.h"
+#include "Scene/SceneManager.h"
 
 // ---- Resource systems --------------------------------------------------
 #include "Resource/ResourceManager.h"
@@ -88,6 +89,10 @@ private:
     GameModeStack m_gameModeStack;
     // Drives the fade-out -> loading screen -> fade-in around scene switches.
     SceneTransitionManager m_transition;
+    // Data-driven scene registry + unified loader (replaces the hardcoded
+    // TitleScene/GameScene/EndScene classes). Routes Scene.Load() through the
+    // same transition + GameModeStack machinery via DataScene.
+    SceneManager m_sceneManager;
 
     // ---- Engine state (shared across game modes; survives level switches) ----
     // IGameModes operate on this World rather than owning their own; systems
